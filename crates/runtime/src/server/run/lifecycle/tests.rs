@@ -489,32 +489,6 @@ fn completed_run_with_closed_empty_ledger_remains_completed() {
 }
 
 #[test]
-fn active_personal_skill_is_installed_as_exact_runtime_content() {
-    let svc = test_service();
-    let request = test_request("use the active skill");
-    let mut state =
-        svc.build_initial_state("owner-a", &request, "session-a", "run-a", None, None, None);
-    install_active_personal_skills(
-        &mut state,
-        vec![astra_services::ActivePersonalSkillRecord {
-            skill_name: "review-exact".to_string(),
-            version_id: "version-exact".to_string(),
-            version: "1.0.0".to_string(),
-            content_markdown: "EXACT PERSONAL SKILL CONTENT".to_string(),
-        }],
-    );
-
-    let invoked = state
-        .skills
-        .execution
-        .invoked
-        .get("review-exact")
-        .expect("active personal skill must be in runtime prompt attachments");
-    assert_eq!(invoked.content, "EXACT PERSONAL SKILL CONTENT");
-    assert!(state.skills.execution.pinned.contains("review-exact"));
-}
-
-#[test]
 fn typed_subrun_workspace_intent_and_completion_profile_cannot_contradict() {
     use astra_config::user_profile::WorkspaceMutationIntent;
 
@@ -784,16 +758,20 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
             "execution_work_deadline_unix_ms",
         ] {
             let mut incomplete = durable.clone();
-            incomplete.events[0]["data"]["execution_restrictions"]
-                .as_object_mut()
-                .unwrap()
-                .remove(field);
+            crate::server::run::mutate_run_opening_fixture(&mut incomplete, |opening| {
+                opening["events"][0]["data"]["execution_restrictions"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+            });
             assert!(
                 incomplete.execution_restrictions().is_err(),
                 "missing field {field} must not become unrestricted"
             );
         }
-        unknown.events[0]["data"]["execution_restrictions"]["version"] = json!("future");
+        crate::server::run::mutate_run_opening_fixture(&mut unknown, |opening| {
+            opening["events"][0]["data"]["execution_restrictions"]["version"] = json!("future");
+        });
         assert!(unknown.execution_restrictions().is_err());
         for (work, total) in [
             (json!(null), json!(10)),
@@ -801,20 +779,26 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
             (json!(11), json!(10)),
         ] {
             let mut invalid = durable.clone();
-            invalid.events[0]["data"]["execution_restrictions"]["execution_work_deadline_unix_ms"] =
-                work;
-            invalid.events[0]["data"]["execution_restrictions"]["execution_deadline_unix_ms"] =
-                total;
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"][0]["data"]["execution_restrictions"]["execution_work_deadline_unix_ms"] =
+                    work;
+            });
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"][0]["data"]["execution_restrictions"]["execution_deadline_unix_ms"] =
+                    total;
+            });
             assert!(
                 invalid.execution_restrictions().is_err(),
                 "invalid phase cutoffs must not authorize reconstruction"
             );
         }
         let mut missing = durable;
-        missing.events[0]["data"]
-            .as_object_mut()
-            .unwrap()
-            .remove("execution_restrictions");
+        crate::server::run::mutate_run_opening_fixture(&mut missing, |opening| {
+            opening["events"][0]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("execution_restrictions");
+        });
         assert_eq!(missing.execution_restrictions().unwrap(), None);
     }
 }
@@ -902,27 +886,28 @@ async fn run_admission_records_trusted_catalog_source_without_execution_material
             capability_source: RuntimeCapabilitySource::ServerManaged,
         })
     );
-    let started_index = durable
-        .events
-        .iter()
-        .position(|event| event["event_type"] == "run_started")
-        .unwrap();
     for field in ["version", "model_source", "capability_source"] {
         let mut incomplete = durable.clone();
-        incomplete.events[started_index]["data"]["admission_source"]
-            .as_object_mut()
-            .unwrap()
-            .remove(field);
+        crate::server::run::mutate_run_opening_fixture(&mut incomplete, |opening| {
+            opening["events"][0]["data"]["admission_source"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        });
         assert!(incomplete.admission_source().is_err(), "missing {field}");
     }
     let mut unknown = durable.clone();
-    unknown.events[started_index]["data"]["admission_source"]["version"] = json!("future");
+    crate::server::run::mutate_run_opening_fixture(&mut unknown, |opening| {
+        opening["events"][0]["data"]["admission_source"]["version"] = json!("future");
+    });
     assert!(unknown.admission_source().is_err());
     let mut missing = durable;
-    missing.events[started_index]["data"]
-        .as_object_mut()
-        .unwrap()
-        .remove("admission_source");
+    crate::server::run::mutate_run_opening_fixture(&mut missing, |opening| {
+        opening["events"][0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("admission_source");
+    });
     assert_eq!(missing.admission_source().unwrap(), None);
 }
 
@@ -5618,7 +5603,7 @@ async fn rejected_root_wiring_fails_before_installing_the_agent_provider() {
         let expected_error = if invalid_constraints {
             "delegated model handoff is malformed"
         } else {
-            "no longer has runnable durable"
+            "no live execution authority"
         };
         assert!(error.contains(expected_error), "{error}");
 
@@ -5797,7 +5782,7 @@ async fn stale_root_wiring_preserves_the_current_owner_publication() {
         )
         .await;
     let error = result.err().expect("stale owner published");
-    assert!(error.contains("execution owner changed"), "{error}");
+    assert!(error.contains("no live execution authority"), "{error}");
     assert!(!capability.is_closed());
     assert!(!token.is_cancelled());
     let registry = entry.executor.runtime_context_registry.read().await;
@@ -9272,8 +9257,6 @@ pub(crate) struct FaultInjectedRunStateStore {
     terminal_transition_release: Option<Arc<tokio::sync::Semaphore>>,
     terminal_transition_entries: AtomicUsize,
     appended_batches: StdMutex<Vec<Vec<Value>>>,
-    guarded_transition_entered: Option<Arc<tokio::sync::Notify>>,
-    guarded_transition_release: Option<Arc<tokio::sync::Notify>>,
     activation_renewal_entered: Option<Arc<tokio::sync::Notify>>,
     activation_renewal_refused: bool,
     live_owner_lease: bool,
@@ -9329,8 +9312,6 @@ impl FaultInjectedRunStateStore {
             terminal_transition_release: None,
             terminal_transition_entries: AtomicUsize::new(0),
             appended_batches: StdMutex::new(Vec::new()),
-            guarded_transition_entered: None,
-            guarded_transition_release: None,
             activation_renewal_entered: None,
             activation_renewal_refused: false,
             live_owner_lease: false,
@@ -9398,16 +9379,6 @@ impl FaultInjectedRunStateStore {
 
     fn with_terminal_transition_delay(mut self, terminal_transition_delay: Duration) -> Self {
         self.terminal_transition_delay = terminal_transition_delay;
-        self
-    }
-
-    fn with_guarded_transition_barrier(
-        mut self,
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-    ) -> Self {
-        self.guarded_transition_entered = Some(entered);
-        self.guarded_transition_release = Some(release);
         self
     }
 
@@ -9658,6 +9629,7 @@ impl RunStateStore for FaultInjectedRunStateStore {
         record: DurableRunRecord,
     ) -> Result<crate::server::run::engine::RunExecutionAuthority, String> {
         let authority = crate::server::run::engine::RunExecutionAuthority {
+            opening_control_tail: None,
             owner_generation: record.run_generation,
             owner_lease_expires_at: self
                 .owner_lease_duration()
@@ -9727,7 +9699,7 @@ impl RunStateStore for FaultInjectedRunStateStore {
         anchor_run_id: &str,
     ) -> Result<
         Option<astra_services::runs::DurableCollaboratorAssociation>,
-        astra_services::runs::CollaboratorStoreError,
+        astra_services::runs::RunAdmissionError,
     > {
         if let Some((user, session, association)) = &self.collaborator_association_reply {
             return Ok((user == user_id
@@ -9747,10 +9719,10 @@ impl RunStateStore for FaultInjectedRunStateStore {
         stage_run_id: &str,
     ) -> Result<
         Option<astra_services::runs::DurableCollaboratorAssociation>,
-        astra_services::runs::CollaboratorStoreError,
+        astra_services::runs::RunAdmissionError,
     > {
         if self.fail_collaborator_stage_lookup {
-            return Err(astra_services::runs::CollaboratorStoreError::Persistence(
+            return Err(astra_services::runs::RunAdmissionError::Persistence(
                 "injected collaborator stage lookup failure".into(),
             ));
         }
@@ -9783,6 +9755,7 @@ impl RunStateStore for FaultInjectedRunStateStore {
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String> {
         let authority = crate::server::run::engine::RunExecutionAuthority {
+            opening_control_tail: None,
             owner_generation: record.run_generation,
             owner_lease_expires_at: self
                 .owner_lease_duration()
@@ -9955,12 +9928,6 @@ impl RunStateStore for FaultInjectedRunStateStore {
         &self,
         request: astra_services::runs::GuardedRunStatusTransitionRequest<'_>,
     ) -> Result<astra_services::runs::GuardedRunStatusTransition, String> {
-        if let Some(entered) = self.guarded_transition_entered.as_ref() {
-            entered.notify_one();
-        }
-        if let Some(release) = self.guarded_transition_release.as_ref() {
-            release.notified().await;
-        }
         let call = self.next_status_call();
         self.apply_status_mutation_before_call(call).await?;
         if self.fail_status_calls.contains(&call) {
@@ -11751,7 +11718,7 @@ async fn setup_lifecycle_run_db_it() -> SharedPool {
     SharedPool::new(settings).await.expect("SharedPool::new")
 }
 
-fn db_backed_test_service(
+pub(super) fn db_backed_test_service(
     shared_pool: &SharedPool,
     owner_pod_id: &str,
 ) -> AgenticRunLifecycleService {
@@ -11833,6 +11800,7 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
             assert!(
                 result
                     .unwrap_err()
+                    .to_string()
                     .contains("injected failure after canonical input")
             );
         } else {
@@ -11879,7 +11847,10 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
                 )
                 .await
                 .unwrap_err();
-            assert!(blocked.contains("session already has an active run"));
+            assert!(matches!(
+                blocked,
+                astra_services::runs::RunAdmissionError::SessionBusy
+            ));
             drop(loser);
             assert_eq!(
                 service.weighted_admission.usage(&user).1.provider_slots,
@@ -11955,7 +11926,6 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
         for (table, column) in [
             ("session_context_authority_events", "owner_user_id"),
             ("session_context_heads", "owner_user_id"),
-            ("agent_session_execution_slots", "user_id"),
             ("session_transcript_items", "user_id"),
             ("agent_events", "user_id"),
             ("agent_run_events", "user_id"),
@@ -12108,7 +12078,7 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
     assert_eq!(same_session.0, StatusCode::CONFLICT);
     assert_eq!(
         same_session.1.0.error_code.as_deref(),
-        Some("session_execution_slot_occupied")
+        Some("session_execution_occupied")
     );
     assert_eq!(same_session.1.0.detail, "session already has an active run");
     assert_eq!(
@@ -12403,7 +12373,6 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
 
 async fn cleanup_lifecycle_run_fixture(pool: &SharedPool, user_id: &str, run_id: &str) {
     for sql in [
-        "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND run_id = ?",
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
@@ -13329,7 +13298,7 @@ async fn work_subject_is_exact_after_git_observation_and_absent_when_observation
     crate::server::work_test_support::cleanup_work_owner(&pool, &owner_id).await;
 }
 
-fn prepared_test_request(message: &str) -> ChatRequestData {
+pub(super) fn prepared_test_request(message: &str) -> ChatRequestData {
     let mut request = test_request(message);
     request.model = Some("test-model".to_string());
     request.resolved_model_selection = Some(ResolvedModelSelection {
@@ -14641,6 +14610,7 @@ fn subrun_authority_binding_rejects_missing_mismatched_and_wrong_domain_capabili
             case.durable,
             case.admitted.map(|owner_generation| {
                 crate::server::run::engine::RunExecutionAuthority {
+                    opening_control_tail: None,
                     owner_generation,
                     owner_lease_expires_at: None,
                 }
@@ -15973,7 +15943,7 @@ async fn server_subrun_completion_commits_result_with_terminal_status() {
 }
 
 #[tokio::test]
-async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused() {
+async fn delegated_subrun_retains_control_and_host_facts_while_paused() {
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     let authority = run_engine
         .start_run("paused-child", "user-1", "session-1")
@@ -16017,15 +15987,15 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         (0..=MAX_DURABLE_RUN_EVENT_BATCH_ROWS)
             .map(|index| explain_turn_fact("paused-child", &format!("paused-fact-{index}"))),
     );
-    let terminals = durable_subrun_host_terminal_events(
+    let terminals = durable_subrun_host_facts(
         host_events,
         Some(authority.owner_generation),
         "paused-child",
     );
-    let mut progress = terminals[1].clone();
+    let mut progress = terminals[0].clone();
     progress["payload_kind"] = json!("progress");
     assert!(
-        durable_subrun_host_terminal_events(
+        durable_subrun_host_facts(
             vec![progress, json!({"type": "agent_communication"})],
             Some(authority.owner_generation),
             "child-run",
@@ -16035,7 +16005,7 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
 
     for _ in 0..2 {
         assert_eq!(
-            ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
+            ServerSubRunExecutor::persist_durable_subrun_host_facts(
                 &run_engine,
                 "user-1",
                 "session-1",
@@ -16045,9 +16015,8 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
             )
             .await
             .expect("persist paused child terminal"),
-            DurableSubrunToolTerminalCommit {
+            DurableSubrunHostFactCommit {
                 authority: Some(DurableSubrunControlAuthority::Paused),
-                committed: true,
                 committed_frontier: Some(
                     crate::orchestration::spawner::SpawnRunFrontier::from_durable(
                         &run_engine
@@ -16098,7 +16067,7 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         .iter()
         .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(event).ok())
         .collect::<Vec<_>>();
-    assert_eq!(facts.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS - 3);
+    assert_eq!(facts.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS - 2);
     assert!(facts.iter().all(|fact| fact.run_id == "paused-child"));
     assert_eq!(
         facts
@@ -16114,11 +16083,11 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         .collect::<Vec<_>>();
     assert_eq!(gaps.len(), 1, "settlement retry must not duplicate the gap");
     assert_eq!(gaps[0]["explain_analyze_recovered"], false);
-    assert_eq!(gaps[0]["dropped_event_count"], 4);
+    assert_eq!(gaps[0]["dropped_event_count"], 3);
     assert_eq!(gaps[0]["run_id"], "paused-child");
     assert_eq!(gaps[0]["repair"], "refresh_run_snapshot");
     assert!(
-        ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
+        ServerSubRunExecutor::persist_durable_subrun_host_facts(
             &run_engine,
             "user-1",
             "session-1",
@@ -16135,22 +16104,14 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         .iter()
         .filter(|event| durable_event_type(event) == Some("tool_call_end"))
         .collect();
-    assert_eq!(
-        stored.len(),
-        1,
-        "retry must not duplicate the tool terminal"
-    );
-    assert_eq!(stored[0]["call_id"], "edge-child-call");
     assert!(
-        stored[0]
-            .as_object()
-            .is_some_and(|event| event.keys().all(|key| !key.starts_with("_astra_"))),
-        "internal delivery watermarks must never become replay data"
+        stored.is_empty(),
+        "tool presentation must never enter durable host facts"
     );
 }
 
 #[tokio::test]
-async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial_text() {
+async fn delegated_subrun_waiting_retains_host_fact_before_partial_text() {
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     let authority = run_engine
         .start_run("waiting-child", "user-1", "session-1")
@@ -16172,18 +16133,13 @@ async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial
             .await
             .expect("enter durable wait")
     );
-    let terminals = durable_subrun_host_terminal_events(
-        vec![json!({
-            "type": "tool_call_end",
-            "call_id": "completed-before-wait",
-            "status": "failed",
-            "transport": "edge_ledger",
-        })],
+    let terminals = durable_subrun_host_facts(
+        vec![explain_turn_fact("waiting-child", "completed-before-wait")],
         Some(authority.owner_generation),
-        "child-run",
+        "waiting-child",
     );
     assert_eq!(
-        ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
+        ServerSubRunExecutor::persist_durable_subrun_host_facts(
             &run_engine,
             "user-1",
             "session-1",
@@ -16193,9 +16149,8 @@ async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial
         )
         .await
         .expect("persist terminal while waiting"),
-        DurableSubrunToolTerminalCommit {
+        DurableSubrunHostFactCommit {
             authority: None,
-            committed: true,
             committed_frontier: Some(
                 crate::orchestration::spawner::SpawnRunFrontier::from_durable(
                     &run_engine
@@ -16240,7 +16195,7 @@ async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial
     let terminal_index = durable
         .events
         .iter()
-        .position(|event| durable_event_type(event) == Some("tool_call_end"))
+        .position(|event| durable_event_type(event) == Some("explain_analyze"))
         .expect("durable tool terminal");
     let text_index = durable
         .events
@@ -16251,7 +16206,7 @@ async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial
 }
 
 #[tokio::test]
-async fn delegated_subrun_retries_active_event_index_cas_loss_without_dropping_terminal() {
+async fn delegated_subrun_retries_host_fact_after_event_index_cas_loss() {
     let store =
         Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_generation_append_cas_loss(1));
     let run_engine = RunEngine::new(store);
@@ -16259,19 +16214,17 @@ async fn delegated_subrun_retries_active_event_index_cas_loss_without_dropping_t
         .start_run("cas-loss-child", "user-1", "session-1")
         .await
         .expect("start child");
-    let terminals = durable_subrun_host_terminal_events(
-        vec![json!({
-            "type": "tool_call_end",
-            "call_id": "terminal-after-cas-loss",
-            "status": "completed",
-            "transport": "edge_ledger",
-        })],
+    let terminals = durable_subrun_host_facts(
+        vec![explain_turn_fact(
+            "cas-loss-child",
+            "terminal-after-cas-loss",
+        )],
         Some(authority.owner_generation),
-        "child-run",
+        "cas-loss-child",
     );
 
     assert_eq!(
-        ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
+        ServerSubRunExecutor::persist_durable_subrun_host_facts(
             &run_engine,
             "user-1",
             "session-1",
@@ -16281,9 +16234,8 @@ async fn delegated_subrun_retries_active_event_index_cas_loss_without_dropping_t
         )
         .await
         .expect("retry active CAS loss"),
-        DurableSubrunToolTerminalCommit {
+        DurableSubrunHostFactCommit {
             authority: None,
-            committed: true,
             committed_frontier: Some(
                 crate::orchestration::spawner::SpawnRunFrontier::from_durable(
                     &run_engine
@@ -16305,14 +16257,14 @@ async fn delegated_subrun_retries_active_event_index_cas_loss_without_dropping_t
         durable
             .events
             .iter()
-            .filter(|event| event["call_id"] == "terminal-after-cas-loss")
+            .filter(|event| event["data"]["event_id"] == "terminal-after-cas-loss")
             .count(),
         1
     );
 }
 
 #[tokio::test]
-async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
+async fn delegated_subrun_cancel_wins_generation_fenced_host_fact_append() {
     let run_id = "paused-child-cancel-race";
     let store = Arc::new(
         FaultInjectedRunStateStore::new(&[], &[]).with_generation_append_status_mutation(
@@ -16342,19 +16294,14 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
             .await
             .expect("pause child")
     );
-    let terminals = durable_subrun_host_terminal_events(
-        vec![json!({
-            "type": "tool_call_end",
-            "call_id": "losing-terminal",
-            "status": "completed",
-            "transport": "edge_ledger",
-        })],
+    let terminals = durable_subrun_host_facts(
+        vec![explain_turn_fact(run_id, "losing-terminal")],
         Some(authority.owner_generation),
-        "child-run",
+        run_id,
     );
 
     assert_eq!(
-        ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
+        ServerSubRunExecutor::persist_durable_subrun_host_facts(
             &run_engine,
             "user-1",
             "session-1",
@@ -16364,9 +16311,8 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
         )
         .await
         .expect("classify concurrent cancellation"),
-        DurableSubrunToolTerminalCommit {
+        DurableSubrunHostFactCommit {
             authority: Some(DurableSubrunControlAuthority::Cancelled),
-            committed: true,
             committed_frontier: Some(
                 crate::orchestration::spawner::SpawnRunFrontier::from_durable(
                     &run_engine
@@ -16387,7 +16333,7 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
     let retained: Vec<_> = durable
         .events
         .iter()
-        .filter(|event| event["call_id"] == "losing-terminal")
+        .filter(|event| event["data"]["event_id"] == "losing-terminal")
         .collect();
     assert_eq!(
         retained.len(),
@@ -19294,7 +19240,7 @@ impl SkillService for MockSkillService {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn build_initial_state_includes_database_skill_provider_when_wired() {
+async fn server_skills_are_discovered_only_for_explicit_selection() {
     let skill_service = Arc::new(MockSkillService::default());
     let svc = test_service().with_skill_service(skill_service.clone());
 
@@ -19315,13 +19261,13 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
     let default_capabilities = svc
         .prepare_runtime_capabilities("test-user", &default_request, &default_constraints)
         .await
-        .expect("server skill fallback should prepare asynchronously");
+        .expect("ordinary capabilities require no skill catalog");
     assert_eq!(
         skill_service
             .list_calls
             .load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "runtime capability preparation should discover the database catalog once"
+        0,
+        "ordinary capability preparation must not discover a skill catalog"
     );
     let default_edge =
         AgenticRunLifecycleService::extract_edge_context(&default_request).expect("edge context");
@@ -19347,27 +19293,11 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         skill_service
             .list_calls
             .load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "loop assembly must consume prepared server capabilities without rediscovery"
+        0,
+        "ordinary loop assembly must not discover a skill catalog"
     );
-    let default_resolver = default_state
-        .skills
-        .resolver
-        .as_ref()
-        .expect("default server resolver should include visible catalog");
-    let default_names: Vec<String> = default_resolver
-        .available_skills()
-        .into_iter()
-        .map(|skill| skill.name)
-        .collect();
-    assert!(
-        default_names.iter().any(|name| name == "remote-db"),
-        "expected database skill without request allow_skills filter: {default_names:?}"
-    );
-    assert!(
-        default_state.skills.registry_for_activation.is_some(),
-        "unfiltered server catalog should be available for conditional activation"
-    );
+    assert!(default_state.skills.resolver.is_none());
+    assert!(default_state.skills.registry_for_activation.is_none());
 
     let mut filtered_request = prepared_test_request("hello");
     filtered_request.allow_skills = Some(vec!["remote-db".to_string()]);
@@ -20117,519 +20047,6 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
     );
 }
 
-#[test]
-fn owner_finalized_accounting_preserves_all_disjoint_token_buckets() {
-    let svc = test_service();
-    let request = test_request("cancel accounting");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-accounting",
-        "run-accounting",
-        None,
-        None,
-        None,
-    );
-    state.total_prompt = 101;
-    state.total_cache_read = 202;
-    state.total_cache_creation = 303;
-    state.total_completion = 404;
-    state.total_tool_calls = 5;
-
-    let event = AgenticRunLifecycleService::finalized_accounting_event(&state, 7);
-    assert_eq!(event["event_type"], "run_accounting_finalized");
-    assert_eq!(event["idempotency_key"], "run-accounting-finalized:7");
-    assert_eq!(event["data"]["prompt_tokens"], 101);
-    assert_eq!(event["data"]["cache_read_tokens"], 202);
-    assert_eq!(event["data"]["cache_creation_tokens"], 303);
-    assert_eq!(event["data"]["completion_tokens"], 404);
-    assert_eq!(event["data"]["tool_call_count"], 5);
-}
-
-#[tokio::test]
-async fn cancelled_terminal_is_completed_by_exact_owner_accounting_without_second_terminal() {
-    let svc = test_service();
-    let authority = svc
-        .run_engine
-        .start_run(
-            "run-cancel-accounting",
-            "test-user",
-            "session-cancel-accounting",
-        )
-        .await
-        .expect("start durable run");
-    assert_eq!(
-        svc.run_engine
-            .cancel_if_exact_live_owner(
-                "test-user",
-                "session-cancel-accounting",
-                "run-cancel-accounting",
-                authority.owner_generation,
-                &[STATUS_RUNNING],
-                CancellationOrigin::Runtime,
-                "test runtime cancellation",
-            )
-            .await
-            .expect("commit exact-owner cancellation"),
-        astra_services::runs::AtomicExecutionOwnerCancellation::Committed
-    );
-    let (control_terminal, status) =
-        AgenticRunLifecycleService::load_exact_preexisting_control_terminal(
-            &svc.run_engine,
-            "test-user",
-            "run-cancel-accounting",
-            authority.owner_generation,
-        )
-        .await
-        .expect("remote cancellation must be classified as a same-generation control stop");
-    assert_eq!(status, RunStatus::Cancelled);
-    assert_eq!(control_terminal, None);
-
-    let request = test_request("cancel accounting");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-cancel-accounting",
-        "run-cancel-accounting",
-        None,
-        None,
-        None,
-    );
-    state.total_prompt = 17;
-    state.total_cache_read = 23;
-    state.total_cache_creation = 29;
-    state.total_completion = 31;
-    let losing_executor_terminal_events = [
-        json!({"event_type":"text_done","data":{"full_text":"too late"}}),
-        json!({"event_type":"run_finished","data":{"prompt_tokens":17}}),
-    ];
-
-    assert!(
-        AgenticRunLifecycleService::persist_finalized_accounting_after_preexisting_terminal(
-            &svc.run_engine,
-            "test-user",
-            "session-cancel-accounting",
-            "run-cancel-accounting",
-            RunStatus::Cancelled,
-            authority.owner_generation,
-            &state,
-            &losing_executor_terminal_events,
-        )
-        .await
-    );
-
-    let run = svc
-        .run_engine
-        .load_run("test-user", "run-cancel-accounting")
-        .await
-        .expect("load run")
-        .expect("durable run");
-    assert_eq!(run.status, STATUS_CANCELLED);
-    assert_eq!(
-        run.events
-            .iter()
-            .filter(|event| event["event_type"] == "run_finished")
-            .count(),
-        1,
-        "accounting repair must not project a second lifecycle terminal"
-    );
-    assert!(
-        run.events
-            .iter()
-            .all(|event| event["event_type"] != "text_done"),
-        "the losing executor must not publish assistant completion after cancellation"
-    );
-    let status = AgenticRunLifecycleService::durable_status_record(&run);
-    let accounting = status.accounting.expect("final accounting");
-    assert_eq!(accounting["prompt_tokens"], 17);
-    assert_eq!(accounting["cache_read_tokens"], 23);
-    assert_eq!(accounting["cache_creation_tokens"], 29);
-    assert_eq!(accounting["completion_tokens"], 31);
-}
-
-#[tokio::test]
-async fn paused_terminal_repair_persists_accounting_without_reintroducing_resume_slot() {
-    let svc = test_service();
-    let authority = svc
-        .run_engine
-        .start_run(
-            "run-paused-accounting",
-            "test-user",
-            "session-paused-accounting",
-        )
-        .await
-        .expect("start durable run");
-    assert!(
-        svc.run_engine
-            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                user_id: "test-user",
-                expected_session_id: "session-paused-accounting",
-                run_id: "run-paused-accounting",
-                status: STATUS_PAUSED,
-                waiting_for: Some("user_resume"),
-                error_message: None,
-                expected_statuses: &["running"],
-            })
-            .await
-            .expect("pause durable run")
-    );
-    assert!(
-        svc.run_engine
-            .persist_status_if_current(RunStatusCasRequest {
-                user_id: "test-user",
-                expected_session_id: "session-paused-accounting",
-                run_id: "run-paused-accounting",
-                expected_statuses: &[STATUS_PAUSED],
-                status: STATUS_PAUSED,
-                waiting_for: None,
-                error_message: None,
-            },)
-            .await
-            .expect("persist continuation checkpoint")
-    );
-
-    let request = test_request("paused accounting");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-paused-accounting",
-        "run-paused-accounting",
-        None,
-        None,
-        None,
-    );
-    state.total_prompt = 101;
-    state.total_cache_read = 202;
-    state.total_cache_creation = 303;
-    state.total_completion = 404;
-    state.total_tool_calls = 5;
-    state.last_request_usage =
-        Some(astra_turn_types::RequestTokenUsage::try_new(11, 22, 33, 44).unwrap());
-    state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
-        qualified_usage: None,
-        purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-        turn: 1,
-        round: 2,
-        provider: "test".into(),
-        model: "test-model".into(),
-        prompt_tokens: 11,
-        cache_read_tokens: 22,
-        cache_creation_tokens: 33,
-        completion_tokens: 44,
-        tool_calls_returned: 1,
-        tool_call_names: vec!["read_file".into()],
-        start_offset_ms: 10,
-        duration_ms: 20,
-        finish_reason: Some("tool_calls".into()),
-    });
-    state.stall.tool_call_records.push(ToolCallRecord {
-        name: "read_file".into(),
-        ok: true,
-        ms: 7,
-        ..Default::default()
-    });
-    assert!(
-        AgenticRunLifecycleService::persist_finalized_accounting_after_preexisting_terminal(
-            &svc.run_engine,
-            "test-user",
-            "session-paused-accounting",
-            "run-paused-accounting",
-            RunStatus::Paused,
-            authority.owner_generation,
-            &state,
-            &[],
-        )
-        .await
-    );
-
-    let run = svc
-        .run_engine
-        .load_run("test-user", "run-paused-accounting")
-        .await
-        .expect("load run")
-        .expect("durable run");
-    assert_eq!(run.status, STATUS_PAUSED);
-    assert!(run.waiting_for.is_none());
-    assert!(
-        run.events
-            .iter()
-            .any(|event| event["event_type"] == "run_accounting_finalized")
-    );
-    let status = AgenticRunLifecycleService::durable_status_record(&run);
-    let accounting = status.accounting.expect("paused final accounting");
-    assert_eq!(accounting["prompt_tokens"], 101);
-    assert_eq!(accounting["cache_read_tokens"], 202);
-    assert_eq!(accounting["cache_creation_tokens"], 303);
-    assert_eq!(accounting["completion_tokens"], 404);
-    assert_eq!(accounting["tool_call_count"], 5);
-    assert_eq!(accounting["last_request_usage"]["prompt_tokens"], 11);
-    assert_eq!(accounting["last_request_usage"]["cache_read_tokens"], 22);
-    assert_eq!(
-        accounting["last_request_usage"]["cache_creation_tokens"],
-        33
-    );
-    assert_eq!(accounting["last_request_usage"]["completion_tokens"], 44);
-    assert_eq!(accounting["tool_outcomes"]["requested"], 1);
-    assert_eq!(accounting["tool_outcomes"]["executed"], 1);
-    assert_eq!(accounting["tool_outcomes"]["succeeded"], 1);
-
-    assert!(
-        AgenticRunLifecycleService::persist_finalized_accounting_after_preexisting_terminal(
-            &svc.run_engine,
-            "test-user",
-            "session-paused-accounting",
-            "run-paused-accounting",
-            RunStatus::Paused,
-            authority.owner_generation,
-            &state,
-            &[],
-        )
-        .await,
-        "same-generation retry must reconcile idempotently"
-    );
-    assert!(
-        !AgenticRunLifecycleService::persist_finalized_accounting_after_preexisting_terminal(
-            &svc.run_engine,
-            "test-user",
-            "session-paused-accounting",
-            "run-paused-accounting",
-            RunStatus::Paused,
-            authority.owner_generation.saturating_add(1),
-            &state,
-            &[],
-        )
-        .await,
-        "a stale generation must not overwrite finalized accounting"
-    );
-    let run = svc
-        .run_engine
-        .load_run("test-user", "run-paused-accounting")
-        .await
-        .expect("reload paused run")
-        .expect("paused run");
-    assert_eq!(
-        run.events
-            .iter()
-            .filter(|event| event["event_type"] == "run_accounting_finalized")
-            .count(),
-        1,
-        "accounting retry must not append a duplicate fact"
-    );
-    let mut conflicting =
-        AgenticRunLifecycleService::finalized_accounting_event(&state, authority.owner_generation);
-    conflicting["data"]["prompt_tokens"] = json!(999);
-    svc.run_engine
-        .append_events_if_current_generation_and_status(
-            "test-user",
-            "session-paused-accounting",
-            "run-paused-accounting",
-            authority.owner_generation,
-            &[STATUS_PAUSED],
-            &[conflicting],
-        )
-        .await
-        .expect_err("one idempotency key cannot name conflicting accounting");
-    svc.run_engine
-        .append_events_if_current_generation_and_status(
-            "test-user",
-            "session-paused-accounting",
-            "run-paused-accounting",
-            authority.owner_generation,
-            &[STATUS_PAUSED],
-            &[json!({"event_type": "unkeyed_accounting"})],
-        )
-        .await
-        .expect_err("generation-fenced append must reject unkeyed events");
-    svc.run_engine
-        .start_run(
-            "run-after-paused-accounting",
-            "test-user",
-            "session-paused-accounting",
-        )
-        .await
-        .expect("paused accounting repair must not reclaim the released session slot");
-}
-
-#[tokio::test]
-async fn paused_terminal_accounting_retries_transient_append_failures_and_fails_closed() {
-    for (suffix, failed_calls, expected_persisted) in [
-        ("recovers", vec![1, 2], true),
-        ("exhausted", vec![1, 2, 3], false),
-    ] {
-        let store = Arc::new(FaultInjectedRunStateStore::new(&[], &failed_calls));
-        let svc = test_service_with_store(store);
-        let run_id = format!("run-paused-accounting-{suffix}");
-        let session_id = format!("session-paused-accounting-{suffix}");
-        let authority = svc
-            .run_engine
-            .start_run(&run_id, "test-user", &session_id)
-            .await
-            .expect("start durable run");
-        assert!(
-            svc.run_engine
-                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                    user_id: "test-user",
-                    expected_session_id: &session_id,
-                    run_id: &run_id,
-                    status: STATUS_PAUSED,
-                    waiting_for: None,
-                    error_message: None,
-                    expected_statuses: &["running"],
-                })
-                .await
-                .expect("pause durable run")
-        );
-        let request = test_request("retry paused accounting");
-        let mut state = svc.build_initial_state(
-            "test-user",
-            &request,
-            &session_id,
-            &run_id,
-            None,
-            None,
-            None,
-        );
-        state.total_prompt = 13;
-        let terminal_events = [json!({
-            "event_type": "run_finished",
-            "data": {"prompt_tokens": 13, "completion_tokens": 0}
-        })];
-
-        assert_eq!(
-            AgenticRunLifecycleService::persist_finalized_accounting_after_preexisting_terminal(
-                &svc.run_engine,
-                "test-user",
-                &session_id,
-                &run_id,
-                RunStatus::Paused,
-                authority.owner_generation,
-                &state,
-                &terminal_events,
-            )
-            .await,
-            expected_persisted,
-            "{suffix}"
-        );
-        let durable = svc
-            .run_engine
-            .load_run("test-user", &run_id)
-            .await
-            .expect("load durable run")
-            .expect("durable run");
-        assert_eq!(durable.status, STATUS_PAUSED, "{suffix}");
-        assert_eq!(
-            durable
-                .events
-                .iter()
-                .filter(|event| event["event_type"] == "run_accounting_finalized")
-                .count(),
-            usize::from(expected_persisted),
-            "{suffix}"
-        );
-        assert_eq!(
-            durable
-                .events
-                .iter()
-                .filter(|event| event["event_type"] == "run_finished")
-                .count(),
-            usize::from(expected_persisted),
-            "terminal facts and accounting must commit atomically: {suffix}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn paused_accounting_settlement_reclassifies_same_generation_cancellation() {
-    let run_id = "run-paused-then-cancelled-accounting";
-    let store = Arc::new(
-        FaultInjectedRunStateStore::new(&[], &[]).with_generation_append_status_mutation(
-            1,
-            "test-user",
-            "session-paused-then-cancelled",
-            run_id,
-            STATUS_CANCELLED,
-        ),
-    );
-    let svc = test_service_with_store(store);
-    let authority = svc
-        .run_engine
-        .start_run(run_id, "test-user", "session-paused-then-cancelled")
-        .await
-        .expect("start durable run");
-    assert!(
-        svc.run_engine
-            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                user_id: "test-user",
-                expected_session_id: "session-paused-then-cancelled",
-                run_id,
-                status: STATUS_PAUSED,
-                waiting_for: None,
-                error_message: None,
-                expected_statuses: &["running"],
-            })
-            .await
-            .expect("pause durable run")
-    );
-    let request = test_request("pause then cancel during settlement");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-paused-then-cancelled",
-        run_id,
-        None,
-        None,
-        None,
-    );
-    state.total_prompt = 19;
-    let losing_paused_terminal = [
-        json!({"event_type":"text_done","data":{"full_text":"late"}}),
-        json!({"event_type":"run_finished","data":{"prompt_tokens":19}}),
-    ];
-
-    assert!(
-        AgenticRunLifecycleService::persist_finalized_accounting_after_preexisting_terminal(
-            &svc.run_engine,
-            "test-user",
-            "session-paused-then-cancelled",
-            run_id,
-            RunStatus::Paused,
-            authority.owner_generation,
-            &state,
-            &losing_paused_terminal,
-        )
-        .await
-    );
-    let durable = svc
-        .run_engine
-        .load_run("test-user", run_id)
-        .await
-        .expect("load durable run")
-        .expect("durable run");
-    assert_eq!(durable.status, STATUS_CANCELLED);
-    assert_eq!(
-        durable
-            .events
-            .iter()
-            .filter(|event| event["event_type"] == "run_finished")
-            .count(),
-        1
-    );
-    assert!(
-        durable
-            .events
-            .iter()
-            .all(|event| event["event_type"] != "text_done")
-    );
-    assert_eq!(
-        durable
-            .events
-            .iter()
-            .filter(|event| event["event_type"] == "run_accounting_finalized")
-            .count(),
-        1
-    );
-}
-
 #[tokio::test]
 async fn only_same_generation_control_terminals_authorize_post_terminal_repair() {
     let svc = test_service();
@@ -21102,7 +20519,7 @@ fn streaming_terminal_convergence_replays_tool_outcomes_but_not_transient_progre
 }
 
 #[test]
-fn streaming_durable_persistence_keeps_semantic_events_before_terminal() {
+fn streaming_durable_persistence_excludes_optional_tool_cards() {
     let events = vec![
         json!({"type": "reasoning_delta", "content": "thinking"}),
         json!({"type": "tool_call", "tool_call": {"id": "call-1"}}),
@@ -21117,10 +20534,9 @@ fn streaming_durable_persistence_keeps_semantic_events_before_terminal() {
         .cloned()
         .collect();
 
-    assert_eq!(persisted.len(), 3);
-    assert_eq!(persisted[0]["type"], "tool_call_end");
-    assert_eq!(persisted[1]["event_type"], "text_done");
-    assert_eq!(persisted[2]["event_type"], "run_finished");
+    assert_eq!(persisted.len(), 2);
+    assert_eq!(persisted[0]["event_type"], "text_done");
+    assert_eq!(persisted[1]["event_type"], "run_finished");
 }
 
 #[test]
@@ -21265,7 +20681,6 @@ fn active_run_live_event_projection_excludes_transient_agent_activity() {
         attached_event_tx: None,
         waiting_for: None,
         execution_live: true,
-        settlement_in_progress: false,
     };
 
     for idx in 0..(MAX_ACTIVE_RUN_LIVE_EVENTS + 5) {
@@ -21648,7 +21063,6 @@ fn merge_cancelled_run_events_preserves_order_and_usage() {
         attached_event_tx: None,
         waiting_for: None,
         execution_live: false,
-        settlement_in_progress: false,
     };
 
     merge_cancelled_run_events(
@@ -23470,19 +22884,18 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
         600,
         "critical lifecycle evidence must be retained exactly once"
     );
-    let run_finished_index = observed
-        .iter()
-        .position(|event| event.get("event_type").and_then(Value::as_str) == Some("run_finished"))
-        .expect("durable replay must contain the lifecycle terminal");
-    let settlement_index = observed
-        .iter()
-        .position(|event| {
-            event.get("event_type").and_then(Value::as_str) == Some("run_settlement_finished")
-        })
-        .expect("durable replay must contain the post-terminal settlement fact");
     assert!(
-        run_finished_index < settlement_index,
-        "settlement must follow the lifecycle terminal without replacing it"
+        observed.iter().any(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("run_finished")
+        }),
+        "durable replay must contain its canonical terminal"
+    );
+    assert!(
+        !observed.iter().any(|event| matches!(
+            event.get("event_type").and_then(Value::as_str),
+            Some("run_settlement_started" | "run_settlement_finished" | "run_accounting_finalized")
+        )),
+        "retired settlement protocol must not reappear"
     );
     let appended_batches = store.appended_batches();
     assert!(
@@ -23807,12 +23220,10 @@ async fn tool_progress_and_outcomes_stream_without_a_durable_run() {
     tracker.mark_emitted_retained_copies(&mut retained);
     assert!(!tool_terminal_requires_live_repair(&retained[0]));
     let durable = terminal_events_for_persistence(&retained);
-    assert_eq!(
-        durable.len(),
-        1,
-        "live delivery does not replace final persistence"
+    assert!(
+        durable.is_empty(),
+        "optional live tool endings have no duplicate durable owner"
     );
-    assert!(durable[0].get(TOOL_TERMINAL_LIVE_EMITTED_FIELD).is_none());
 }
 
 #[tokio::test]
@@ -24208,8 +23619,8 @@ fn emitted_tool_terminal_tracker_matches_exact_occurrences_not_only_call_ids() {
 }
 
 #[test]
-fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
-    let durable = durable_subrun_host_terminal_events(
+fn delegated_subrun_excludes_tool_presentation_and_bounds_host_facts() {
+    let durable = durable_subrun_host_facts(
         vec![
             json!({"type": "text_delta", "content": "transient"}),
             json!({
@@ -24225,62 +23636,9 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
         "child-run",
     );
 
-    assert_eq!(durable.len(), 1);
-    assert_eq!(durable[0]["type"], "tool_call_end");
-    assert_eq!(durable[0]["call_id"], "child-call-1");
-    let idempotency_key = durable[0]["idempotency_key"]
-        .as_str()
-        .expect("stable terminal identity");
-    assert_eq!(idempotency_key, "subrun-tool-terminal:7:child-call-1");
-    let oversized_identity = json!({
-        "type":"tool_call_end", "run_id":"child-run",
-        "call_id":"x".repeat(8192), "result":"observed"
-    });
-    let gap =
-        durable_subrun_host_terminal_events(vec![oversized_identity.clone()], Some(7), "child-run");
-    assert_eq!(gap[0]["type"], "stream_gap");
-    assert_eq!(gap[0]["run_id"], "child-run");
     assert!(
-        gap[0]["idempotency_key"]
-            .as_str()
-            .unwrap()
-            .starts_with("subrun-gap:7:")
-    );
-    assert!(
-        serde_json::to_vec(&gap[0]).unwrap().len()
-            <= astra_services::runs::MAX_TOOL_TERMINAL_PRESENTATION_BYTES
-    );
-    assert_eq!(
-        durable_subrun_host_terminal_events(vec![oversized_identity], Some(7), "child-run"),
-        gap
-    );
-    let distinct = durable_subrun_host_terminal_events(
-        vec![json!({
-            "type":"tool_call_end", "run_id":"child-run",
-            "call_id":"y".repeat(8192), "result":"another observation"
-        })],
-        Some(7),
-        "child-run",
-    );
-    assert_ne!(distinct[0]["event_sha256"], gap[0]["event_sha256"]);
-    assert_ne!(distinct[0]["idempotency_key"], gap[0]["idempotency_key"]);
-    assert!(
-        durable[0]
-            .as_object()
-            .is_some_and(|event| event.keys().all(|key| !key.starts_with("_astra_")))
-    );
-
-    let reordered = durable_subrun_host_terminal_events(
-        vec![
-            json!({"type":"tool_call_end","call_id":"another-call","status":"failed"}),
-            json!({"type":"tool_call_end","call_id":"child-call-1","status":"completed"}),
-        ],
-        Some(7),
-        "child-run",
-    );
-    assert_eq!(
-        reordered[1]["idempotency_key"], durable[0]["idempotency_key"],
-        "terminal identity must not depend on retained subset position"
+        durable.is_empty(),
+        "tool cards and progress are live presentation"
     );
 
     let fact = explain_turn_fact("child-run", "finished");
@@ -24291,16 +23649,12 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
     for field in ["start_elapsed_ms", "duration_ms", "outcome"] {
         started.as_object_mut().unwrap().remove(field);
     }
-    let explain = durable_subrun_host_terminal_events(
-        vec![fact.clone(), started.clone()],
-        Some(7),
-        "child-run",
-    );
+    let explain =
+        durable_subrun_host_facts(vec![fact.clone(), started.clone()], Some(7), "child-run");
     assert_eq!(explain.len(), 2);
     assert_eq!(explain[0]["idempotency_key"], "subrun-explain:7:finished");
     assert_eq!(explain[1]["idempotency_key"], "subrun-explain:7:started");
-    let reversed =
-        durable_subrun_host_terminal_events(vec![started, fact.clone()], Some(7), "child-run");
+    let reversed = durable_subrun_host_facts(vec![started, fact.clone()], Some(7), "child-run");
     assert_eq!(reversed[0], explain[1]);
     assert_eq!(reversed[1], explain[0]);
     let public =
@@ -24310,12 +23664,12 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
     assert_eq!(decoded.event_id, "finished");
     assert!(astra_turn_types::decode_explain_analyze_wire(&public[1]).is_ok());
     assert!(public[0].get("idempotency_key").is_none());
-    assert!(durable_subrun_host_terminal_events(vec![fact], Some(7), "other-child").is_empty());
+    assert!(durable_subrun_host_facts(vec![fact], Some(7), "other-child").is_empty());
 
     let facts = (0..=MAX_DURABLE_RUN_EVENT_BATCH_ROWS)
         .map(|index| explain_turn_fact("child-run", &format!("finished-{index}")))
         .collect::<Vec<_>>();
-    let budgeted = durable_subrun_host_terminal_events(facts.clone(), Some(7), "child-run");
+    let budgeted = durable_subrun_host_facts(facts.clone(), Some(7), "child-run");
     assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
     let gap = budgeted
         .iter()
@@ -24324,19 +23678,19 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
     assert_eq!(gap["data"]["dropped_event_count"], 2);
     assert_eq!(gap["data"]["explain_analyze_recovered"], false);
     assert_eq!(
-        durable_subrun_host_terminal_events(facts.clone(), Some(7), "child-run"),
+        durable_subrun_host_facts(facts.clone(), Some(7), "child-run"),
         budgeted,
     );
     let mut changed = facts.clone();
     changed[0]["event_id"] = json!("different-fact");
-    let other = durable_subrun_host_terminal_events(changed, Some(7), "child-run");
+    let other = durable_subrun_host_facts(changed, Some(7), "child-run");
     let other_gap = other
         .iter()
         .find(|event| durable_event_type(event) == Some("stream_gap"))
         .unwrap();
     assert_ne!(gap["idempotency_key"], other_gap["idempotency_key"]);
     assert!(
-        durable_subrun_host_terminal_events(facts, None, "child-run")
+        durable_subrun_host_facts(facts, None, "child-run")
             .iter()
             .all(|event| event.get("idempotency_key").is_none())
     );
@@ -24359,45 +23713,17 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
 }
 
 #[test]
-fn delegated_subrun_same_call_id_conflicting_terminal_fails_exact_reconciliation() {
-    let committed = durable_subrun_host_terminal_events(
-        vec![json!({
-            "type": "tool_call_end",
-            "call_id": "child-call-conflict",
-            "status": "completed",
-            "result": "first outcome",
-        })],
-        Some(11),
-        "child-run",
-    );
-    let conflicting = durable_subrun_host_terminal_events(
-        vec![json!({
-            "type": "tool_call_end",
-            "call_id": "child-call-conflict",
-            "status": "failed",
-            "result": "different outcome",
-        })],
-        Some(11),
-        "child-run",
-    );
-
-    assert_eq!(
-        committed[0]["idempotency_key"], conflicting[0]["idempotency_key"],
-        "one logical child call must have one stable terminal identity"
-    );
-    let error = durable_subrun_terminal_events_match(&committed, &conflicting)
-        .expect_err("conflicting payload under one terminal identity must fail closed");
-    assert!(error.contains("conflicting durable facts"), "{error}");
+fn delegated_subrun_conflicting_host_fact_fails_exact_reconciliation() {
     let fact = explain_turn_fact("child-run", "same-fact");
-    let committed = durable_subrun_host_terminal_events(vec![fact.clone()], Some(11), "child-run");
+    let committed = durable_subrun_host_facts(vec![fact.clone()], Some(11), "child-run");
     let mut changed = fact;
     changed["outcome"] = json!("failed");
-    let conflicting = durable_subrun_host_terminal_events(vec![changed], Some(11), "child-run");
+    let conflicting = durable_subrun_host_facts(vec![changed], Some(11), "child-run");
     assert_eq!(
         committed[0]["idempotency_key"],
         conflicting[0]["idempotency_key"]
     );
-    assert!(durable_subrun_terminal_events_match(&committed, &conflicting).is_err());
+    assert!(durable_subrun_host_facts_match(&committed, &conflicting).is_err());
 }
 
 #[tokio::test]
@@ -24519,7 +23845,7 @@ async fn create_run_conflicts_when_same_session_already_has_active_run() {
     assert_eq!(err.1.0.detail, "session already has an active run");
     assert_eq!(
         err.1.0.error_code.as_deref(),
-        Some("session_execution_slot_occupied")
+        Some("session_execution_occupied")
     );
     // No run was admitted for the second request, so this must flow through
     // the client's pre-admission-rejection contract (restore the draft, no
@@ -24579,7 +23905,7 @@ async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
     assert_eq!(err.1.0.detail, "session already has an active run");
     assert_eq!(
         err.1.0.error_code.as_deref(),
-        Some("session_execution_slot_occupied")
+        Some("session_execution_occupied")
     );
     assert_eq!(
         err.1
@@ -28219,15 +27545,18 @@ async fn cancel_session_runs_cancels_active_run_for_that_session_only() {
 #[tokio::test]
 async fn cancel_session_runs_includes_nonblocking_paused_history() {
     let svc = test_service();
-    let mut request = test_request("paused work");
-    request.session_id = Some("session-paused".to_string());
-    let run = ok(svc.create_run("user-1".into(), request).await);
+    // This is parked history, not a live executor racing provider cleanup.
+    let run_id = "nonblocking-paused-history".to_string();
+    svc.run_engine
+        .start_run(&run_id, "user-1", "session-paused")
+        .await
+        .unwrap();
     assert!(
         svc.run_engine
             .transition_status_with_event_if_current(
                 "user-1",
                 "session-paused",
-                &run.run_id,
+                &run_id,
                 &[STATUS_RUNNING],
                 STATUS_PAUSED,
                 None,
@@ -28250,7 +27579,7 @@ async fn cancel_session_runs_includes_nonblocking_paused_history() {
         .cancel_session_runs("session-paused".to_string(), "user-1".to_string())
         .await);
     assert_eq!(cancelled.runs.len(), 1);
-    assert_eq!(cancelled.runs[0].run_id, run.run_id);
+    assert_eq!(cancelled.runs[0].run_id, run_id);
     assert_eq!(cancelled.runs[0].status, STATUS_CANCELLED);
     assert!(cancelled.execution_settled);
 }
@@ -28296,7 +27625,7 @@ async fn cancel_session_runs_retry_keeps_terminal_local_execution_pending() {
         let mut runs = svc.runs.write().await;
         let run = runs.get_mut("terminal-live").unwrap();
         run.execution_live = false;
-        run.settlement_in_progress = true;
+        run.execution_live = true;
     }
     let pending = ok(svc
         .cancel_session_runs("session-terminal-live".into(), "user-1".into())
@@ -28310,7 +27639,7 @@ async fn cancel_session_runs_retry_keeps_terminal_local_execution_pending() {
         .await
         .get_mut("terminal-live")
         .unwrap()
-        .settlement_in_progress = false;
+        .execution_live = false;
     let settled = ok(svc
         .cancel_session_runs("session-terminal-live".into(), "user-1".into())
         .await);
@@ -28767,10 +28096,6 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
 
     run.events.push(json!({
         "event_type": "run_finished",
-        "data": {"cancelled": true}
-    }));
-    run.events.push(json!({
-        "event_type": "run_accounting_finalized",
         "data": {
             "prompt_tokens": 11,
             "cache_read_tokens": 12,
@@ -28783,7 +28108,7 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
     let status = AgenticRunLifecycleService::durable_status_record(&run);
     let accounting = status
         .accounting
-        .expect("owner-finalized accounting must supersede the preliminary cancel marker");
+        .expect("the canonical terminal owns final accounting");
     assert_eq!(accounting["prompt_tokens"], 11);
     assert_eq!(accounting["cache_read_tokens"], 12);
     assert_eq!(accounting["cache_creation_tokens"], 13);
@@ -31081,42 +30406,6 @@ fn run_status_as_str() {
 }
 
 #[test]
-fn has_buffered_terminal_completion_ignores_cancelled_and_interrupted_finishes() {
-    assert!(has_buffered_terminal_completion(&[json!({
-        "event_type": "run_finished",
-        "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
-    })]));
-    assert!(!has_buffered_terminal_completion(&[json!({
-        "event_type": "run_finished",
-        "data": {"cancelled": true}
-    })]));
-    assert!(!has_buffered_terminal_completion(&[json!({
-        "event_type": "run_finished",
-        "data": {"interrupted": true}
-    })]));
-    assert!(!has_buffered_terminal_completion(&[
-        json!({
-            "event_type": "run_finished",
-            "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
-        }),
-        json!({
-            "event_type": "run_finished",
-            "data": {"cancelled": true}
-        }),
-    ]));
-}
-
-#[test]
-fn finalized_accounting_requires_confirmed_terminal_batch_settlement() {
-    assert!(terminal_batch_settlement_ready(0, false));
-    assert!(terminal_batch_settlement_ready(1, true));
-    assert!(
-        !terminal_batch_settlement_ready(1, false),
-        "a failed terminal append must not publish a settlement-ready accounting marker"
-    );
-}
-
-#[test]
 fn preexisting_control_terminal_never_uses_ambiguous_generic_event_append() {
     assert!(!should_append_generic_terminal_batch(
         true, true, 2, false, true
@@ -31124,21 +30413,6 @@ fn preexisting_control_terminal_never_uses_ambiguous_generic_event_append() {
     assert!(should_append_generic_terminal_batch(
         true, true, 2, false, false
     ));
-}
-
-#[test]
-fn settlement_fence_closes_only_after_all_authoritative_facts_commit() {
-    assert!(!settlement_facts_committed(Some(false), true, 2, true));
-    assert!(settlement_facts_committed(Some(true), false, 2, false));
-    assert!(!settlement_facts_committed(None, false, 2, true));
-    assert!(!settlement_facts_committed(None, true, 2, false));
-    assert!(settlement_facts_committed(None, true, 2, true));
-    assert!(settlement_facts_committed(None, true, 0, false));
-
-    assert!(durable_settlement_fence_closed(Some(true), false));
-    assert!(!durable_settlement_fence_closed(Some(false), false));
-    assert!(!durable_settlement_fence_closed(None, false));
-    assert!(durable_settlement_fence_closed(None, true));
 }
 
 #[test]
@@ -31163,70 +30437,6 @@ fn preserve_manual_pause_wins_over_late_completed_status() {
         None,
         &RunStatus::Completed
     ));
-}
-
-#[tokio::test]
-async fn durable_paused_state_wins_over_late_completed_status() {
-    let svc = test_service();
-    let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-    assert!(
-        svc.run_engine
-            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                user_id: "user-1",
-                expected_session_id: &run.session_id,
-                run_id: &run.run_id,
-                status: STATUS_PAUSED,
-                waiting_for: Some("user_resume"),
-                error_message: None,
-                expected_statuses: &["running"],
-            })
-            .await
-            .unwrap()
-    );
-
-    assert!(
-        should_preserve_manual_pause_from_durable(
-            &svc.run_engine,
-            "user-1",
-            &run.run_id,
-            &RunStatus::Completed,
-        )
-        .await
-    );
-    assert!(
-        !should_preserve_manual_pause_from_durable(
-            &svc.run_engine,
-            "user-1",
-            &run.run_id,
-            &RunStatus::Failed,
-        )
-        .await
-    );
-
-    assert!(
-        svc.run_engine
-            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                user_id: "user-1",
-                expected_session_id: &run.session_id,
-                run_id: &run.run_id,
-                status: STATUS_PAUSED,
-                waiting_for: None,
-                error_message: None,
-                expected_statuses: &["paused"],
-            })
-            .await
-            .unwrap()
-    );
-    assert!(
-        !should_preserve_manual_pause_from_durable(
-            &svc.run_engine,
-            "user-1",
-            &run.run_id,
-            &RunStatus::Completed,
-        )
-        .await,
-        "a session-continuation pause without a wait reason must not be restored as a manual pause"
-    );
 }
 
 #[tokio::test]
@@ -31324,7 +30534,7 @@ async fn resume_run_transitions_paused_to_running() {
 }
 
 #[tokio::test]
-async fn resume_run_promotes_buffered_completed_pause_to_completed() {
+async fn resume_run_does_not_treat_buffered_answer_as_terminal_authority() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
     ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
@@ -31342,10 +30552,11 @@ async fn resume_run_promotes_buffered_completed_pause_to_completed() {
         .unwrap();
 
     let result = ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-    assert_eq!(result.status, "completed");
+    assert_eq!(result.status, "running");
+    assert!(result.artifact_publication.is_none());
     assert_eq!(result.previous_status, "paused");
     let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
-    assert_eq!(status.status, "completed");
+    assert_eq!(status.status, "running");
 }
 
 #[tokio::test]
@@ -32012,7 +31223,7 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publication() {
+async fn db_pause_resume_cannot_publish_buffered_success_as_completed() {
     let pool = setup_lifecycle_run_db_it().await;
     let svc = db_backed_test_service(&pool, "pause-resume-it-pod-completed");
     let user_id = "user-1";
@@ -32099,63 +31310,23 @@ async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publicatio
         .expect("append buffered completed terminal event");
 
     let result = ok(svc.resume_run(run_id.clone(), user_id.to_string()).await);
-    assert_eq!(result.status, STATUS_COMPLETED);
     assert_eq!(result.previous_status, STATUS_PAUSED);
-
+    assert_ne!(result.status, STATUS_COMPLETED);
+    assert!(result.artifact_publication.is_none());
     let durable = svc
         .run_engine
         .load_run(user_id, &run_id)
         .await
-        .expect("load durable run")
-        .expect("durable run exists");
-    assert_eq!(durable.status, STATUS_COMPLETED);
-    assert!(durable.waiting_for.is_none());
-    let handle = result.artifact_publication.as_ref().unwrap()["handle"]
-        .as_str()
-        .expect("resume published the exact completed capture");
-    let (read, fetches) =
-        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(executor.execute(
-            "introspect",
-            &json!({"explain": {"target": "run", "run_id": run_id}}),
-        ))
-        .await;
-    let summary: Value = serde_json::from_str(&read).expect("structured Explain summary");
-    assert_eq!(summary["artifact"], handle);
-    assert_eq!(summary["capture_status"], "complete");
-    assert_eq!(fetches.recovery, 0, "resume must already have published");
-    let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
-        .with_pool(pool.clone());
-    let read = crate::server::explain_analyze_artifact::resolve_request(
-        Some(&store),
-        user_id,
-        &session_id,
-        &json!({"artifact":handle, "max_bytes":65536}),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(read.contains(&run_id));
-
+        .unwrap()
+        .unwrap();
+    assert_ne!(durable.status, STATUS_COMPLETED);
     assert!(
-        durable
-            .events
-            .iter()
-            .any(|event| event["event_type"] == "run_finished")
+        crate::server::explain_analyze_artifact::recover_completed_snapshot(Some(&pool), &durable)
+            .await
+            .unwrap()
+            .is_none(),
+        "cached success cannot manufacture a completed Explain report"
     );
-    assert_eq!(
-        result.artifact_publication.as_ref().unwrap()["status"],
-        "published"
-    );
-    assert_eq!(
-        durable.events.last().unwrap()["event_type"],
-        "artifact_publication"
-    );
-
-    {
-        let runs = svc.runs.read().await;
-        let live = runs.get(&run_id).expect("live run should still be tracked");
-        assert!(matches!(&live.status, RunStatus::Completed));
-    }
     cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
     crate::server::run::cleanup_run_session_fixture(&pool, user_id, &session_id).await;
 }
@@ -32646,13 +31817,6 @@ async fn db_long_running_fanout_survives_observer_restart_and_partial_completion
     {
         cleanup_lifecycle_run_fixture(&pool, &user_id, run_id).await;
     }
-    let _ = sqlx::query(
-        "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .execute(pool.get())
-    .await;
     crate::server::run::cleanup_run_session_fixture(&pool, &user_id, &session_id).await;
 }
 
@@ -34249,7 +33413,7 @@ async fn durable_resume_rejects_blocking_sibling_after_cache_miss() {
     assert_eq!(error.1.0.detail, "session already has an active run");
     assert_eq!(
         error.1.0.error_code.as_deref(),
-        Some("session_execution_slot_occupied")
+        Some("session_execution_occupied")
     );
     // Deliberately different from the create_run/stream_chat start-rejection
     // sites: a resume conflict is not a new-turn admission, so it must not
@@ -34279,7 +33443,7 @@ async fn durable_resume_rejects_blocking_sibling_after_cache_miss() {
 }
 
 #[tokio::test]
-async fn durable_resume_promotes_buffered_completion_even_when_session_has_blocker() {
+async fn durable_resume_checks_slot_despite_buffered_completion() {
     let svc = test_service();
     let engine = &svc.run_engine;
 
@@ -34318,222 +33482,23 @@ async fn durable_resume_promotes_buffered_completion_even_when_session_has_block
         .await
         .unwrap();
 
-    let result = ok(svc
+    let error = err(svc
         .resume_run("run-buffered-complete".into(), "user-1".into())
         .await);
 
-    assert_eq!(result.status, STATUS_COMPLETED);
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("session_execution_occupied")
+    );
     let durable = engine
         .load_run("user-1", "run-buffered-complete")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(durable.status, STATUS_COMPLETED);
+    assert_eq!(durable.status, STATUS_PAUSED);
     assert!(durable.waiting_for.is_none());
     assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
-}
-
-#[tokio::test]
-async fn cross_pod_resume_waits_for_durable_settlement_fence() {
-    let store: Arc<dyn RunStateStore> = Arc::new(InMemoryRunStateStore::new());
-    let owner = test_service_with_store(store.clone());
-    let observer = test_service_with_store(store);
-    let run_id = "run-cross-pod-settlement";
-    let authority = owner
-        .run_engine
-        .start_run(run_id, "user-1", "session-cross-pod-settlement")
-        .await
-        .expect("start durable run");
-    assert!(
-        owner
-            .run_engine
-            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                user_id: "user-1",
-                expected_session_id: "session-cross-pod-settlement",
-                run_id,
-                status: STATUS_PAUSED,
-                waiting_for: Some("user_resume"),
-                error_message: None,
-                expected_statuses: &["running"],
-            })
-            .await
-            .expect("pause durable run")
-    );
-    assert!(
-        AgenticRunLifecycleService::persist_settlement_started(
-            &owner.run_engine,
-            "user-1",
-            "session-cross-pod-settlement",
-            run_id,
-            authority.owner_generation,
-        )
-        .await
-    );
-
-    let settlement_engine = owner.run_engine.clone();
-    let settlement = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        settlement_engine
-            .append_events_if_current_generation_and_status(
-                "user-1",
-                "session-cross-pod-settlement",
-                run_id,
-                authority.owner_generation,
-                &[STATUS_PAUSED],
-                &[
-                    json!({
-                        "event_type":"run_finished",
-                        "idempotency_key":format!(
-                            "run-terminal-settlement:{}:0",
-                            authority.owner_generation
-                        ),
-                        "data":{"prompt_tokens":7,"completion_tokens":3}
-                    }),
-                    json!({
-                        "event_type":"run_accounting_finalized",
-                        "idempotency_key":format!(
-                            "run-accounting-finalized:{}",
-                            authority.owner_generation
-                        ),
-                        "data":{"prompt_tokens":7,"completion_tokens":3}
-                    }),
-                ],
-            )
-            .await
-            .expect("persist fenced settlement")
-    });
-
-    let resumed = ok(observer
-        .resume_run(run_id.to_string(), "user-1".to_string())
-        .await);
-    assert!(settlement.await.expect("settlement task"));
-    assert_eq!(resumed.disposition, RunMutationDisposition::Applied);
-    assert_eq!(resumed.status, STATUS_COMPLETED);
-    assert!(resumed.continuation.is_none());
-    let durable = observer
-        .run_engine
-        .load_run("user-1", run_id)
-        .await
-        .expect("load durable run")
-        .expect("durable run");
-    assert_eq!(durable.status, STATUS_COMPLETED);
-    assert!(durable.waiting_for.is_none());
-}
-
-#[tokio::test]
-async fn cross_pod_settlement_fence_linearizes_with_resume_cas() {
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let store: Arc<dyn RunStateStore> = Arc::new(
-        FaultInjectedRunStateStore::new(&[], &[])
-            .with_guarded_transition_barrier(entered.clone(), release.clone()),
-    );
-    let owner = test_service_with_store(store.clone());
-    let observer = test_service_with_store(store);
-    let run_id = "run-cross-pod-settlement-cas";
-    let authority = owner
-        .run_engine
-        .start_run(run_id, "user-1", "session-cross-pod-settlement-cas")
-        .await
-        .expect("start durable run");
-    assert!(
-        owner
-            .run_engine
-            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                user_id: "user-1",
-                expected_session_id: "session-cross-pod-settlement-cas",
-                run_id,
-                status: STATUS_PAUSED,
-                waiting_for: Some("user_resume"),
-                error_message: None,
-                expected_statuses: &["running"],
-            })
-            .await
-            .expect("pause durable run")
-    );
-    let (mut observer_live, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
-        run_id.to_string(),
-        "session-cross-pod-settlement-cas".to_string(),
-        "user-1".to_string(),
-    );
-    observer_live.status = RunStatus::Paused;
-    observer_live.waiting_for = Some("user_resume".to_string());
-    observer
-        .runs
-        .write()
-        .await
-        .insert(run_id.to_string(), observer_live);
-
-    let resume = tokio::spawn(async move {
-        observer
-            .resume_run(run_id.to_string(), "user-1".to_string())
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(1), entered.notified())
-        .await
-        .expect("resume reached guarded transition barrier");
-    assert!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            AgenticRunLifecycleService::persist_settlement_started(
-                &owner.run_engine,
-                "user-1",
-                "session-cross-pod-settlement-cas",
-                run_id,
-                authority.owner_generation,
-            ),
-        )
-        .await
-        .expect("persist settlement fence")
-    );
-    release.notify_one();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        owner
-            .run_engine
-            .append_events_if_current_generation_and_status(
-                "user-1",
-                "session-cross-pod-settlement-cas",
-                run_id,
-                authority.owner_generation,
-                &[STATUS_PAUSED],
-                &[
-                    json!({
-                        "event_type":"run_finished",
-                        "idempotency_key":format!(
-                            "run-terminal-settlement:{}:0",
-                            authority.owner_generation
-                        ),
-                        "data":{"prompt_tokens":5,"completion_tokens":2}
-                    }),
-                    json!({
-                        "event_type":"run_accounting_finalized",
-                        "idempotency_key":format!(
-                            "run-accounting-finalized:{}",
-                            authority.owner_generation
-                        ),
-                        "data":{"prompt_tokens":5,"completion_tokens":2}
-                    }),
-                ],
-            )
-            .await
-            .expect("persist fenced settlement")
-    );
-    let resumed = ok(tokio::time::timeout(Duration::from_secs(2), resume)
-        .await
-        .expect("resume completed after settlement")
-        .expect("resume task"));
-    assert_eq!(resumed.status, STATUS_COMPLETED);
-    assert_eq!(resumed.disposition, RunMutationDisposition::Applied);
-    assert!(resumed.continuation.is_none());
-    let durable = owner
-        .run_engine
-        .load_run("user-1", run_id)
-        .await
-        .expect("load durable run")
-        .expect("durable run");
-    assert_eq!(durable.status, STATUS_COMPLETED);
-    assert!(durable.waiting_for.is_none());
 }
 
 /// Concurrent mutation of two durable-only runs in the same session must
@@ -37044,6 +36009,7 @@ async fn parked_execution_releases_capacity_and_reenters_fair_admission() {
 
 #[tokio::test]
 async fn server_root_mailbox_survives_profile_change_between_turns() {
+    let background_tasks = Arc::new(AtomicUsize::new(0));
     let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
         Arc::new(astra_messaging::InProcessTransport::new()),
         Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
@@ -37055,14 +36021,10 @@ async fn server_root_mailbox_survives_profile_change_between_turns() {
         "turn-plan".into(),
         "planner".into(),
     );
-    first
-        .messaging
-        .ensure_mailbox_for_tools(&[json!({"function":{"name":"agent"}})])
-        .await
-        .unwrap();
+    first.messaging.ensure_mailbox().await.unwrap();
     let stable = first.messaging.mailbox.as_ref().unwrap().address.clone();
     assert_eq!(stable.agent_id, "root-agent");
-    park_server_root_mailbox(&mut first).await;
+    park_server_root_mailbox(&mut first, &background_tasks);
     let late_message = astra_messaging::AgentMessage::new(
         astra_messaging::AgentAddress::new("child-run", "worker"),
         astra_messaging::MessageTarget::Direct {
@@ -37082,11 +36044,7 @@ async fn server_root_mailbox_survives_profile_change_between_turns() {
         "turn-review".into(),
         "reviewer".into(),
     );
-    second
-        .messaging
-        .ensure_mailbox_for_tools(&[json!({"function":{"name":"agent"}})])
-        .await
-        .unwrap();
+    second.messaging.ensure_mailbox().await.unwrap();
     assert_eq!(second.messaging.mailbox.as_ref().unwrap().address, stable);
     assert_eq!(
         router.sender_address("turn-plan", "planner").await,
@@ -37102,40 +36060,14 @@ async fn server_root_mailbox_survives_profile_change_between_turns() {
         .expect("deferred activation must retain the late result");
     assert_eq!(delivered.id, late_message.id);
     mailbox.acknowledge_received(&[delivered]).await.unwrap();
-    park_server_root_mailbox(&mut second).await;
-}
-
-#[tokio::test]
-async fn ordinary_root_reads_do_not_register_a_mailbox() {
-    let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
-        Arc::new(astra_messaging::InProcessTransport::new()),
-        Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
-    ));
-    let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-    state.messaging.configure_root_mailbox(
-        Arc::clone(&router),
-        astra_messaging::AgentAddress::new("quiet-session", "root-agent"),
-        "quiet-run".into(),
-        "root".into(),
-    );
-    state
-        .messaging
-        .ensure_mailbox_for_tools(&[
-            json!({"function":{"name":"read_file"}}),
-            json!({"function":{"name":"web_fetch"}}),
-        ])
-        .await
-        .unwrap();
-    assert!(state.messaging.mailbox.is_none());
-    assert!(router.registered_address("quiet-session").await.is_none());
-    state
-        .messaging
-        .ensure_mailbox_for_tools(&[json!({"function":{"name":"agent_fanout"}})])
-        .await
-        .unwrap();
-    assert!(state.messaging.mailbox.is_some());
-    assert!(router.sender_address("quiet-run", "root").await.is_some());
-    park_server_root_mailbox(&mut state).await;
+    park_server_root_mailbox(&mut second, &background_tasks);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while background_tasks.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late-message custody release must complete through its drain owner");
 }
 
 /// Admission with timeout: `acquire_owned` + `timeout` rejects after

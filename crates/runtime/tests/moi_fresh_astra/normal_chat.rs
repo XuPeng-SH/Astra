@@ -347,7 +347,7 @@ pub(super) async fn exercise(
     assert_eq!(rejected["retryable"], false);
     assert!(rejected.get("run_id").is_none());
     assert_eq!(
-        rejected["error_code"], "session_execution_slot_occupied",
+        rejected["error_code"], "session_execution_occupied",
         "{body}"
     );
     let (status, body) = cancel(app, &run).await;

@@ -1247,6 +1247,14 @@ mod tests {
             crate::server::tool_execution_binding::WorkspaceBinding::server_sandbox(workspace),
             crate::server::tool_execution_binding::ExecutorBinding::server_local(),
         );
+        executor.set_current_selected_tool_offers(HashMap::from([(
+            "read_file".into(),
+            crate::server::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
+                "read_file",
+                "server-sandbox",
+                crate::server::tool_route_selection::ToolExecutionRouteKind::ServerLocal,
+            ),
+        )]));
         executor.enable_durable_invocations();
         executor
     }

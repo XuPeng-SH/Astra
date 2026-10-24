@@ -822,7 +822,6 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
     for table in [
         "agent_run_events",
         "agent_runs",
-        "agent_session_execution_slots",
         "agent_session_lifecycle_fences",
         "agent_sessions",
     ] {
@@ -1349,8 +1348,7 @@ async fn concurrent_run_inserts_share_one_session_slot() {
     );
 
     let slot_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_session_execution_slots
-         WHERE user_id = ? AND session_id = ?",
+        "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
     )
     .bind(&user_id)
     .bind(&session_id)
@@ -1372,7 +1370,6 @@ async fn concurrent_run_inserts_share_one_session_slot() {
 
     for table in [
         "agent_run_events",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_session_lifecycle_fences",
         "agent_sessions",
@@ -1502,10 +1499,7 @@ async fn session_deletion_competes_safely_with_run_admission() {
     .expect("count deleted session root");
     assert_eq!(session_count, 0, "session deletion must remove the root");
 
-    for table in [
-        "agent_session_execution_slots",
-        "agent_session_lifecycle_fences",
-    ] {
+    for table in ["agent_session_lifecycle_fences"] {
         let statement = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(&user_id)
@@ -2208,7 +2202,6 @@ async fn batched_probe_conflicts_collation_and_overlapping_writers_preserve_atom
     }
     for table in [
         "agent_run_events",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
         "agent_session_lifecycle_fences",

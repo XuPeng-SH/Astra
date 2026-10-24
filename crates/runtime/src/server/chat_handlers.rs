@@ -53,6 +53,16 @@ pub(super) async fn resolve_or_create_chat_session(
     match requested_session_id {
         Some(session_id) => {
             validate_requested_chat_session_id(&session_id)?;
+            if !provider_authorized && state.shared_pool.is_some() {
+                // This supplied ID is not an ownership proof. The canonical
+                // Run admission checks current ownership/status under its
+                // mutation fence, before any provider or tool dispatch.
+                return Ok(ResolvedChatSession {
+                    session_id: Some(session_id),
+                    full_llm_capture: false,
+                    session_admission_facts: None,
+                });
+            }
 
             let session = if provider_authorized {
                 state

@@ -1,4 +1,5 @@
 mod permission_control;
+mod terminal;
 use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
     STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
@@ -20,6 +21,11 @@ use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
+};
+pub use terminal::{
+    CanonicalRunTerminalReceipt, CanonicalRunTerminalRequest, CanonicalTerminalClaim,
+    CanonicalTerminalContext, CanonicalTerminalOutcome, CanonicalTerminalTranscript,
+    CommittedRunTerminalReceipt,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -2647,12 +2653,6 @@ pub(crate) async fn activate_execution_resume_tx(
     if run.status != STATUS_PAUSED || run.waiting_for.is_some() {
         return Err(Rejected("execution checkpoint is not parked"));
     }
-    if run_has_open_settlement_in_tx(tx, &run.user_id, &run.run_id, run.run_generation)
-        .await
-        .map_err(|error| Unavailable(error.to_string()))?
-    {
-        return Err(Rejected("execution settlement remains open"));
-    }
     let tail: Option<String> = sqlx::query_scalar(
         "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ?
          AND event_idx = ? FOR UPDATE",
@@ -2696,19 +2696,18 @@ pub(crate) async fn activate_execution_resume_tx(
     if affected.rows_affected() != 1 {
         return Err(Rejected("execution owner remains live or changed"));
     }
-    if run_requires_session_execution_slot(run)
-        && !DatabaseRunStateStore::acquire_session_execution_slot_in_tx(
+    if run_requires_independent_admission(run)
+        && !crate::storage::session_execution_activity(
             tx,
             &run.user_id,
             &run.session_id,
-            &run.run_id,
-            None,
-            DatabaseRunStateStore::DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER,
+            Some(&run.run_id),
         )
         .await
         .map_err(|error| Unavailable(error.to_string()))?
+        .is_idle()
     {
-        return Err(Rejected("session execution slot is occupied"));
+        return Err(Rejected("session has unsettled execution"));
     }
     let row = build_run_event_insert_row(
         &run.user_id,
@@ -2999,13 +2998,20 @@ impl DurableRunRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DurableRunStartAuthority {
     pub owner_generation: u64,
+    /// Exact immutable opening tail of this newly inserted Run. Existing claims
+    /// and reconstructed executions never manufacture this empty-control ACK.
+    pub opening_control_tail: Option<i64>,
     pub owner_lease_expires_at: Option<tokio::time::Instant>,
 }
 
 impl DurableRunStartAuthority {
-    fn before_creation(owner_generation: u64, lease_duration: Option<Duration>) -> Self {
+    fn before_creation(record: &DurableRunRecord, lease_duration: Option<Duration>) -> Self {
         Self {
-            owner_generation,
+            owner_generation: record.run_generation,
+            opening_control_tail: record
+                .opening
+                .as_ref()
+                .and_then(|opening| i64::try_from(opening.events.len().checked_sub(1)?).ok()),
             owner_lease_expires_at: lease_duration.map(|ttl| tokio::time::Instant::now() + ttl),
         }
     }
@@ -3310,7 +3316,8 @@ pub enum ExecutionOwnerCancellationOrigin {
 /// This type intentionally lives in the durable store layer so lineage
 /// control reads do not need to hydrate a run's complete event history or
 /// depend on runtime orchestration types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DurableCancellationOrigin {
     User,
     Runtime,
@@ -3900,7 +3907,6 @@ pub enum GuardedRunStatusTransition {
     Updated,
     StatusConflict,
     SessionBlocked,
-    SettlementInProgress,
 }
 
 /// Request to durably admit one externally-visible action.
@@ -5218,7 +5224,7 @@ pub struct GuardedRunStatusTransitionRequest<'a> {
     pub status: &'a str,
     pub waiting_for: Option<&'a str>,
     pub error_message: Option<&'a str>,
-    pub forbid_open_settlement_generation: Option<u64>,
+    pub expected_run_generation: Option<u64>,
     pub event: serde_json::Value,
 }
 
@@ -5273,45 +5279,6 @@ pub struct RunUsageOwnerUpdateRequest<'a> {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub tool_calls: u32,
-}
-
-fn run_events_have_open_settlement(events: &[serde_json::Value], generation: u64) -> bool {
-    let started = format!("run-settlement-started:{generation}");
-    let finished = format!("run-settlement-finished:{generation}");
-    let accounting = format!("run-accounting-finalized:{generation}");
-    let has_started = events.iter().any(|event| {
-        extract_optional_string(event, "idempotency_key").as_deref() == Some(started.as_str())
-    });
-    let has_closed = events.iter().any(|event| {
-        extract_optional_string(event, "idempotency_key")
-            .is_some_and(|key| key == finished || key == accounting)
-    });
-    has_started && !has_closed
-}
-
-/// The caller holds the current Run generation lock. Read the same durable
-/// settlement keys used by resume admission, not the executor lease or status.
-pub(crate) async fn run_has_open_settlement_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    run_id: &str,
-    generation: u64,
-) -> Result<bool, sqlx::Error> {
-    let started = format!("run-settlement-started:{generation}");
-    let finished = format!("run-settlement-finished:{generation}");
-    let accounting = format!("run-accounting-finalized:{generation}");
-    let keys: Vec<String> = sqlx::query_scalar(
-        "SELECT idempotency_key FROM agent_run_events WHERE user_id = ? AND run_id = ?
-         AND idempotency_key IN (?, ?, ?) FOR UPDATE",
-    )
-    .bind(user_id)
-    .bind(run_id)
-    .bind(&started)
-    .bind(&finished)
-    .bind(&accounting)
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(keys.contains(&started) && !keys.contains(&finished) && !keys.contains(&accounting))
 }
 
 /// Exact execution-owner settlement appended by a caller that already owns a
@@ -5424,6 +5391,20 @@ impl RunMutationAdmission {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Only a freshly claimed terminal can skip raw-history membership reads.
+    /// The caller consumes this proof in that same transaction; it is never
+    /// serialized or accepted from a client.
+    pub fn authorizes_terminal_transcript(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> bool {
+        self.operation == RunMutationOperation::Terminal
+            && self.owns_session(user_id, session_id)
+            && self.run_id == run_id
     }
 
     pub(crate) fn owns_session(&self, user_id: &str, session_id: &str) -> bool {
@@ -5743,15 +5724,17 @@ pub struct DurableCollaboratorAssociation {
 }
 
 #[derive(Debug, Error)]
-pub enum CollaboratorStoreError {
-    #[error("collaborator admission is unsupported by this store")]
+pub enum RunAdmissionError {
+    #[error("Run admission is unsupported by this store")]
     Unsupported,
     #[error("collaborator admission deadline expired before creation")]
     DeadlineExpired,
     #[error("invalid collaborator admission field: {field}")]
     InvalidAdmission { field: &'static str },
-    #[error("collaborator session is unavailable or not owned by this tenant")]
+    #[error("Session is unavailable or not owned by this tenant")]
     SessionUnavailable,
+    #[error("session already has an active run")]
+    SessionBusy,
     #[error("collaborator run is unavailable in the authorized session: {run_id}")]
     RunUnavailable { run_id: String },
     #[error("collaborator association conflicts: {anchor_run_id}")]
@@ -5785,13 +5768,13 @@ pub enum CollaboratorStoreError {
     Persistence(String),
 }
 
-impl From<String> for CollaboratorStoreError {
+impl From<String> for RunAdmissionError {
     fn from(error: String) -> Self {
         Self::Persistence(error)
     }
 }
 
-impl CollaboratorStoreError {
+impl RunAdmissionError {
     /// Binding records settled history. Typed persistence uncertainty must not
     /// discard that history; decoding/authority failures still fail closed.
     pub fn native_binding_persistence_reason(&self) -> Option<&'static str> {
@@ -5883,7 +5866,7 @@ where
 fn validate_collaborator_admission(
     record: &DurableRunRecord,
     admission: &CollaboratorStageAdmission,
-) -> Result<(), CollaboratorStoreError> {
+) -> Result<(), RunAdmissionError> {
     let locator = &admission.native_execution;
     let valid = |value: &str| {
         !value.is_empty()
@@ -5898,7 +5881,7 @@ fn validate_collaborator_admission(
             .as_deref()
             .is_some_and(|model| !valid(model))
     {
-        return Err(CollaboratorStoreError::InvalidAdmission {
+        return Err(RunAdmissionError::InvalidAdmission {
             field: "native_execution",
         });
     }
@@ -5915,7 +5898,7 @@ fn validate_collaborator_admission(
         ),
     ] {
         if value.trim().is_empty() || value.len() > 512 {
-            return Err(CollaboratorStoreError::InvalidAdmission { field });
+            return Err(RunAdmissionError::InvalidAdmission { field });
         }
     }
     if record.parent_run_id.is_none()
@@ -5924,13 +5907,13 @@ fn validate_collaborator_admission(
         || record.run_generation > i64::MAX as u64
         || admission.expected_parent_generation > i64::MAX as u64
     {
-        return Err(CollaboratorStoreError::InvalidAdmission { field: "child_run" });
+        return Err(RunAdmissionError::InvalidAdmission { field: "child_run" });
     }
     match &admission.association.execution_boundary {
         CollaboratorExecutionBoundary::UserRunner { runner_id }
             if runner_id.trim().is_empty() || runner_id.len() > 512 =>
         {
-            return Err(CollaboratorStoreError::InvalidAdmission { field: "runner_id" });
+            return Err(RunAdmissionError::InvalidAdmission { field: "runner_id" });
         }
         _ => {}
     }
@@ -5947,7 +5930,7 @@ fn collaborator_source_key(source_message_id: &str) -> String {
 fn collaborator_replay_receipt(
     event: &serde_json::Value,
     admission: &CollaboratorStageAdmission,
-) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+) -> Result<CollaboratorStageReceipt, RunAdmissionError> {
     let original: CollaboratorStageAdmission = decode_collaborator_fact(event, "admission")?;
     if original.anchor_run_id != admission.anchor_run_id
         || original.association != admission.association
@@ -5957,7 +5940,7 @@ fn collaborator_replay_receipt(
         || original.native_execution != admission.native_execution
         || original.expected_previous_stage_run_id != admission.expected_previous_stage_run_id
     {
-        return Err(CollaboratorStoreError::SourceMessageConflict {
+        return Err(RunAdmissionError::SourceMessageConflict {
             source_message_id: admission.source_message_id.clone(),
         });
     }
@@ -5965,7 +5948,7 @@ fn collaborator_replay_receipt(
     if receipt.anchor_run_id != admission.anchor_run_id
         || receipt.source_message_id != admission.source_message_id
     {
-        return Err(CollaboratorStoreError::AssociationConflict {
+        return Err(RunAdmissionError::AssociationConflict {
             anchor_run_id: admission.anchor_run_id.clone(),
         });
     }
@@ -5977,12 +5960,12 @@ async fn admit_collaborator_session_tx(
     tx: &mut Transaction<'_, MySql>,
     user_id: &str,
     session_id: &str,
-) -> Result<(), CollaboratorStoreError> {
+) -> Result<(), RunAdmissionError> {
     crate::storage::admit_session_execution_write_with_facts(tx, session_id, user_id)
         .await
         .map(|_| ())
         .map_err(|source| match source {
-            sqlx::Error::RowNotFound => CollaboratorStoreError::SessionUnavailable,
+            sqlx::Error::RowNotFound => RunAdmissionError::SessionUnavailable,
             source => db_error("admit_collaborator_session", session_id, source).into(),
         })
 }
@@ -5994,7 +5977,7 @@ async fn read_collaborator_session_tx(
     tx: &mut Transaction<'_, MySql>,
     user_id: &str,
     session_id: &str,
-) -> Result<(), CollaboratorStoreError> {
+) -> Result<(), RunAdmissionError> {
     let available: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM agent_sessions sessions
          LEFT JOIN agent_session_lifecycle_fences fences
@@ -6011,10 +5994,10 @@ async fn read_collaborator_session_tx(
     .map_err(|source| db_error("read_collaborator_session", session_id, source))?;
     available
         .map(|_| ())
-        .ok_or(CollaboratorStoreError::SessionUnavailable)
+        .ok_or(RunAdmissionError::SessionUnavailable)
 }
 
-fn collaborator_json<T: Serialize>(value: &T) -> Result<serde_json::Value, CollaboratorStoreError> {
+fn collaborator_json<T: Serialize>(value: &T) -> Result<serde_json::Value, RunAdmissionError> {
     serde_json::to_value(value).map_err(|source| {
         DatabaseRunStateStoreError::Json {
             operation: "encode_collaborator_fact",
@@ -6028,7 +6011,7 @@ fn collaborator_json<T: Serialize>(value: &T) -> Result<serde_json::Value, Colla
 fn decode_collaborator_fact<T: serde::de::DeserializeOwned>(
     event: &serde_json::Value,
     field: &str,
-) -> Result<T, CollaboratorStoreError> {
+) -> Result<T, RunAdmissionError> {
     serde_json::from_value(event.get(field).cloned().unwrap_or(serde_json::Value::Null)).map_err(
         |source| {
             DatabaseRunStateStoreError::Json {
@@ -6093,8 +6076,8 @@ pub trait RunStateStore: Send + Sync {
         _claim_existing: bool,
         _requested_session_id: Option<&str>,
         _participant: &mut dyn RunStartTransactionParticipant,
-    ) -> Result<DurableRunStartClaim, String> {
-        Err("this run store does not support database admission participants".into())
+    ) -> Result<DurableRunStartClaim, RunAdmissionError> {
+        Err(RunAdmissionError::Unsupported)
     }
 
     /// Derive correlation from the real dispatched invocation and original
@@ -6116,8 +6099,8 @@ pub trait RunStateStore: Send + Sync {
         _record: DurableRunRecord,
         _admission: CollaboratorStageAdmission,
         _deadline: Option<tokio::time::Instant>,
-    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
-        Err(CollaboratorStoreError::Unsupported)
+    ) -> Result<CollaboratorStageReceipt, RunAdmissionError> {
+        Err(RunAdmissionError::Unsupported)
     }
 
     async fn load_collaborator_association(
@@ -6125,8 +6108,8 @@ pub trait RunStateStore: Send + Sync {
         _user_id: &str,
         _session_id: &str,
         _anchor_run_id: &str,
-    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
-        Err(CollaboratorStoreError::Unsupported)
+    ) -> Result<Option<DurableCollaboratorAssociation>, RunAdmissionError> {
+        Err(RunAdmissionError::Unsupported)
     }
 
     /// Resolve the stable association for its current stage run. The
@@ -6138,8 +6121,8 @@ pub trait RunStateStore: Send + Sync {
         _user_id: &str,
         _session_id: &str,
         _stage_run_id: &str,
-    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
-        Err(CollaboratorStoreError::Unsupported)
+    ) -> Result<Option<DurableCollaboratorAssociation>, RunAdmissionError> {
+        Err(RunAdmissionError::Unsupported)
     }
 
     async fn confirm_collaborator_native_session(
@@ -6147,8 +6130,8 @@ pub trait RunStateStore: Send + Sync {
         _identity: &astra_turn_types::ToolInvocationIdentity,
         _native_session: &CollaboratorNativeSession,
         _expected_owner_generation: u64,
-    ) -> Result<(), CollaboratorStoreError> {
-        Err(CollaboratorStoreError::Unsupported)
+    ) -> Result<(), RunAdmissionError> {
+        Err(RunAdmissionError::Unsupported)
     }
 
     /// Repair only a missing association from an existing settled receipt.
@@ -6160,8 +6143,8 @@ pub trait RunStateStore: Send + Sync {
         _anchor_run_id: &str,
         _expected_predecessor_run_id: &str,
         _expected_owner_generation: u64,
-    ) -> Result<Option<CollaboratorNativeSession>, CollaboratorStoreError> {
-        Err(CollaboratorStoreError::Unsupported)
+    ) -> Result<Option<CollaboratorNativeSession>, RunAdmissionError> {
+        Err(RunAdmissionError::Unsupported)
     }
 
     /// Insert a run without allowing durable admission to exceed the caller's
@@ -6339,19 +6322,6 @@ pub trait RunStateStore: Send + Sync {
             };
             cursor = Some(next);
         }
-    }
-
-    /// Bounded stores override with the three exact generation-scoped keys.
-    async fn has_open_run_settlement(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        generation: u64,
-    ) -> Result<bool, String> {
-        Ok(self
-            .load_run(user_id, run_id)
-            .await?
-            .is_some_and(|run| run_events_have_open_settlement(&run.events, generation)))
     }
 
     /// Atomically terminalize an active run only when its exact execution
@@ -6990,12 +6960,11 @@ pub trait RunStateStore: Send + Sync {
 /// In-memory run state store for tests and single-process deployments.
 pub struct InMemoryRunStateStore {
     // Lock-order invariant for operations that need both maps:
-    // `action_fence` -> `execution_slots` -> `runs`. Invocation dispatch may
+    // `action_fence` -> `runs`. Invocation dispatch may
     // additionally acquire its ledger after `action_fence` and before `runs`.
     // No run-store path acquires the invocation ledger, so the order cannot
     // cycle. Keeping it adjacent to the fields makes transitions auditable.
     action_fences: std::sync::Mutex<RunActionFenceMap>,
-    execution_slots: tokio::sync::RwLock<std::collections::HashMap<(String, String), String>>,
     cancellation_requests: tokio::sync::RwLock<std::collections::HashSet<(String, String)>>,
     runs: tokio::sync::RwLock<std::collections::HashMap<String, DurableRunRecord>>,
     execution_owner_pod_id: Option<String>,
@@ -7034,7 +7003,6 @@ impl InMemoryRunStateStore {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
             let cancellation_requests = self.cancellation_requests.read().await;
-            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             let lineage_markers = in_memory_lineage_cancellation_markers(
                 &runs,
@@ -7100,14 +7068,18 @@ impl InMemoryRunStateStore {
                         && cancellation_markers_admit_transition(terminal_origin, lineage_markers)
                 })
                 .map(|run| run.session_id.clone());
-            if let Some(session_id) = admitted_session_id.as_deref() {
-                reconcile_in_memory_execution_slot_for_session(
-                    &mut slots,
-                    &runs,
-                    user_id,
-                    session_id,
-                    durable_run_status_blocks_session(status, waiting_for),
-                )?;
+            if let Some(session_id) = admitted_session_id.as_deref()
+                && durable_run_status_blocks_session(status, waiting_for)
+                && runs.get(run_id).is_some_and(|run| {
+                    run_requires_independent_admission(run)
+                        && !durable_run_status_blocks_session(
+                            &run.status,
+                            run.waiting_for.as_deref(),
+                        )
+                })
+                && in_memory_session_has_other_execution(&runs, user_id, session_id, run_id)?
+            {
+                return Ok(StatusTransitionCommit::default());
             }
             if admitted_session_id.is_some() {
                 if let Some(run) = runs.get_mut(run_id) {
@@ -7130,7 +7102,6 @@ impl InMemoryRunStateStore {
                         return Ok(StatusTransitionCommit::default());
                     }
                     apply_in_memory_status_transition(
-                        &mut slots,
                         run,
                         status,
                         waiting_for,
@@ -7175,7 +7146,6 @@ impl InMemoryRunStateStore {
     pub fn new() -> Self {
         Self {
             action_fences: std::sync::Mutex::new(std::collections::HashMap::new()),
-            execution_slots: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             cancellation_requests: tokio::sync::RwLock::new(std::collections::HashSet::new()),
             runs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             execution_owner_pod_id: None,
@@ -7239,10 +7209,8 @@ impl InMemoryRunStateStore {
             record.opening_hash = Some(opening.encode()?.hash);
             record.context_admission_hash = opening.context_fingerprint();
         }
-        let authority = DurableRunStartAuthority::before_creation(
-            record.run_generation,
-            self.owner_lease_duration(),
-        );
+        let authority =
+            DurableRunStartAuthority::before_creation(&record, self.owner_lease_duration());
         if let Some(owner_pod_id) = self.execution_owner_pod_id.as_ref() {
             record.owner_pod_id = Some(owner_pod_id.clone());
             record.owner_lease_expires_at = Some(
@@ -7259,7 +7227,6 @@ impl InMemoryRunStateStore {
         }
         let action_fence = self.action_fence_for(&record.user_id, &record.run_id);
         let _action_fence = action_fence.lock_owned().await;
-        let mut slots = self.execution_slots.write().await;
         let mut runs = self.runs.write().await;
         let run_id = record.run_id.clone();
         if claim_existing && let Some(existing) = runs.get(&run_id) {
@@ -7272,20 +7239,17 @@ impl InMemoryRunStateStore {
         if !claim_existing && runs.contains_key(&run_id) {
             return Err(format!("run identity {run_id} is already bound"));
         }
-        reconcile_in_memory_execution_slot_for_session(
-            &mut slots,
-            &runs,
-            &record.user_id,
-            &record.session_id,
-            run_requires_session_execution_slot(&record)
-                && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref()),
-        )?;
-        sync_in_memory_execution_slot(
-            &mut slots,
-            &record,
-            &record.status,
-            record.waiting_for.as_deref(),
-        )?;
+        if run_requires_independent_admission(&record)
+            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref())
+            && in_memory_session_has_other_execution(
+                &runs,
+                &record.user_id,
+                &record.session_id,
+                &record.run_id,
+            )?
+        {
+            return Err("session already has an active run".into());
+        }
         runs.insert(run_id.clone(), record);
         // Evict oldest completed/failed runs when over capacity.
         let mut evicted_ids = Vec::new();
@@ -7302,11 +7266,7 @@ impl InMemoryRunStateStore {
                 evicted_ids.push(id);
             }
         }
-        for id in &evicted_ids {
-            slots.retain(|_, owner| owner != id);
-        }
         drop(runs);
-        drop(slots);
         if !evicted_ids.is_empty() {
             {
                 let mut checkpoints = self.checkpoints.write().await;
@@ -7326,95 +7286,32 @@ impl Default for InMemoryRunStateStore {
     }
 }
 
-fn run_requires_session_execution_slot(record: &DurableRunRecord) -> bool {
+fn run_requires_independent_admission(record: &DurableRunRecord) -> bool {
     record.parent_run_id.is_none()
         && record.retry_of.is_none()
         && record.delegation_id.is_none()
         && record.agent_id.is_none()
 }
 
-fn sync_in_memory_execution_slot(
-    slots: &mut std::collections::HashMap<(String, String), String>,
-    run: &DurableRunRecord,
-    status: &str,
-    waiting_for: Option<&str>,
-) -> Result<(), String> {
-    if !run_requires_session_execution_slot(run) {
-        return Ok(());
-    }
-    let key = (run.user_id.clone(), run.session_id.clone());
-    if durable_run_status_blocks_session(status, waiting_for) {
-        match slots.get(&key) {
-            Some(owner) if owner != &run.run_id => Err("session already has an active run".into()),
-            _ => {
-                slots.insert(key, run.run_id.clone());
-                Ok(())
-            }
-        }
-    } else {
-        if slots.get(&key).is_some_and(|owner| owner == &run.run_id) {
-            slots.remove(&key);
-        }
-        Ok(())
-    }
-}
-
-fn reconcile_in_memory_execution_slot_for_session(
-    slots: &mut std::collections::HashMap<(String, String), String>,
+fn in_memory_session_has_other_execution(
     runs: &std::collections::HashMap<String, DurableRunRecord>,
     user_id: &str,
     session_id: &str,
-    scan_if_missing: bool,
-) -> Result<(), String> {
-    let key = (user_id.to_string(), session_id.to_string());
-
-    // `execution_slots` is maintained under the same lock order as `runs`, so
-    // an absent slot is authoritative for non-blocking mutations. A blocking
-    // acquisition may request a defensive scan, while a present invalid owner
-    // always triggers repair. Scanning on every completed-history insert made
-    // bounded in-memory retention O(n²).
-    match slots.get(&key) {
-        None if !scan_if_missing => return Ok(()),
-        None => {}
-        Some(owner)
-            if runs.get(owner).is_some_and(|run| {
-                run.user_id == user_id
-                    && run.session_id == session_id
-                    && run_requires_session_execution_slot(run)
-                    && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
-            }) =>
-        {
-            return Ok(());
-        }
-        Some(_) => {}
-    }
-
-    let mut owner: Option<&str> = None;
+    run_id: &str,
+) -> Result<bool, String> {
     for run in runs.values().filter(|run| {
-        run.user_id == user_id
-            && run.session_id == session_id
-            && run_requires_session_execution_slot(run)
-            && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
+        run.user_id == user_id && run.session_id == session_id && run.run_id != run_id
     }) {
-        if let Some(existing) = owner {
-            return Err(format!(
-                "in-memory session execution invariant violated: session {session_id} has multiple blocking root runs ({existing}, {})",
-                run.run_id
-            ));
+        if durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
+            || (run.owner_pod_id.is_some() && in_memory_action_owner_lease_is_active(run)?)
+        {
+            return Ok(true);
         }
-        owner = Some(run.run_id.as_str());
     }
-
-    if let Some(owner) = owner {
-        slots.insert(key, owner.to_string());
-    } else {
-        slots.remove(&key);
-    }
-    Ok(())
+    Ok(false)
 }
 
 fn apply_in_memory_status_transition(
-    slots: &mut std::collections::HashMap<(String, String), String>,
     run: &mut DurableRunRecord,
     status: &str,
     waiting_for: Option<&str>,
@@ -7427,7 +7324,6 @@ fn apply_in_memory_status_transition(
         close_unresolved_interactions_in_memory(run, status);
     }
 
-    sync_in_memory_execution_slot(slots, run, status, waiting_for)?;
     run.status = status.to_string();
     run.waiting_for = waiting_for.map(ToString::to_string);
     if let Some(msg) = error_message {
@@ -7980,23 +7876,6 @@ fn in_memory_transition_changes_state(
         || error_message.is_some_and(|message| run.error_message.as_deref() != Some(message))
 }
 
-fn session_execution_slot_owner_reclaimable(
-    status: &str,
-    waiting_for: Option<&str>,
-    owner_lease_expired: bool,
-    slot_is_stale: bool,
-) -> bool {
-    let blocks = durable_run_status_blocks_session(status, waiting_for);
-    if !blocks {
-        return true;
-    }
-    matches!(
-        durable_run_status_kind(status),
-        DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
-    ) && owner_lease_expired
-        && slot_is_stale
-}
-
 /// Whole-checkpoint budget; no individual section may bypass the cumulative
 /// bound. Oversized state must retain its execution owner, never be truncated.
 pub const MAX_RUN_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
@@ -8358,7 +8237,6 @@ impl RunStateStore for InMemoryRunStateStore {
         );
         {
             let mut cancellation_requests = self.cancellation_requests.write().await;
-            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             let Some(candidate) = runs.get(request.run_id).filter(|run| {
                 run.user_id == request.user_id
@@ -8400,7 +8278,7 @@ impl RunStateStore for InMemoryRunStateStore {
             let mut events_to_commit = terminal_user_intent_return_events(&run.events, true, false);
             events_to_commit.push(terminal_event);
             let new_events = new_idempotent_events(&run.events, &events_to_commit);
-            apply_in_memory_status_transition(&mut slots, run, STATUS_CANCELLED, None, None, None)?;
+            apply_in_memory_status_transition(run, STATUS_CANCELLED, None, None, None)?;
             // The exact orphan generation is now terminal. Clearing its stale
             // lease makes the settled cancellation observable without waiting
             // for a wall-clock expiry that no executor can renew.
@@ -9400,7 +9278,7 @@ impl RunStateStore for InMemoryRunStateStore {
             status,
             waiting_for,
             error_message,
-            forbid_open_settlement_generation,
+            expected_run_generation,
             event,
         } = request;
         if expected_statuses.is_empty() {
@@ -9416,7 +9294,6 @@ impl RunStateStore for InMemoryRunStateStore {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
             let cancellation_requests = self.cancellation_requests.read().await;
-            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             let lineage_markers = in_memory_lineage_cancellation_markers(
                 &runs,
@@ -9433,31 +9310,21 @@ impl RunStateStore for InMemoryRunStateStore {
             if !transition_admitted {
                 return Ok(GuardedRunStatusTransition::StatusConflict);
             }
-            if forbid_open_settlement_generation.is_some_and(|generation| {
+            if expected_run_generation.is_some_and(|generation| {
                 runs.get(run_id)
                     .is_none_or(|run| run.run_generation != generation)
             }) {
                 return Ok(GuardedRunStatusTransition::StatusConflict);
             }
-            if forbid_open_settlement_generation.is_some_and(|generation| {
-                runs.get(run_id).is_some_and(|run| {
-                    run.run_generation == generation
-                        && run_events_have_open_settlement(&run.events, generation)
-                })
-            }) {
-                return Ok(GuardedRunStatusTransition::SettlementInProgress);
-            }
-            reconcile_in_memory_execution_slot_for_session(
-                &mut slots,
-                &runs,
-                user_id,
-                expected_session_id,
-                durable_run_status_blocks_session(status, waiting_for),
-            )?;
-            let slot_key = (user_id.to_string(), expected_session_id.to_string());
-            if slots
-                .get(&slot_key)
-                .is_some_and(|owner| owner.as_str() != run_id)
+            if runs
+                .get(run_id)
+                .is_some_and(run_requires_independent_admission)
+                && in_memory_session_has_other_execution(
+                    &runs,
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                )?
             {
                 return Ok(GuardedRunStatusTransition::SessionBlocked);
             }
@@ -9470,7 +9337,6 @@ impl RunStateStore for InMemoryRunStateStore {
                     false
                 } else {
                     apply_in_memory_status_transition(
-                        &mut slots,
                         run,
                         status,
                         waiting_for,
@@ -9607,7 +9473,6 @@ impl RunStateStore for InMemoryRunStateStore {
         let _action_fence = action_fence.lock_owned().await;
         let cancellation_requests = self.cancellation_requests.read().await;
         {
-            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             let lineage_markers = in_memory_lineage_cancellation_markers(
                 &runs,
@@ -9651,7 +9516,7 @@ impl RunStateStore for InMemoryRunStateStore {
             }
             let mut events = terminal_user_intent_return_events(&run.events, true, false);
             events.push(terminal_event);
-            apply_in_memory_status_transition(&mut slots, run, STATUS_CANCELLED, None, None, None)?;
+            apply_in_memory_status_transition(run, STATUS_CANCELLED, None, None, None)?;
             run.error_code = None;
             run.error_message = None;
             run.events.extend(events);
@@ -9925,7 +9790,6 @@ impl RunStateStore for InMemoryRunStateStore {
                 .read()
                 .await
                 .contains(&(user_id.to_string(), run_id.to_string()));
-            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             let Some(run) = runs
                 .get_mut(run_id)
@@ -10082,14 +9946,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     interaction_resolution_events(kind, request_id, response_data, resume_wait);
                 let terminal_event = events[0].clone();
                 if resume_wait {
-                    apply_in_memory_status_transition(
-                        &mut slots,
-                        run,
-                        STATUS_RUNNING,
-                        None,
-                        None,
-                        None,
-                    )?;
+                    apply_in_memory_status_transition(run, STATUS_RUNNING, None, None, None)?;
                 }
                 let first_event_idx = run.last_event_idx + 1;
                 run.events.extend(events.clone());
@@ -10141,7 +9998,6 @@ impl RunStateStore for InMemoryRunStateStore {
                 .read()
                 .await
                 .contains(&(user_id.to_string(), run_id.to_string()));
-            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             let Some(run) = runs
                 .get_mut(run_id)
@@ -10302,7 +10158,6 @@ impl RunStateStore for InMemoryRunStateStore {
                     return Ok(DurableRunInteractionWaitOutcome::NoLongerActive);
                 }
                 apply_in_memory_status_transition(
-                    &mut slots,
                     run,
                     STATUS_WAITING,
                     Some(kind.waiting_for()),
@@ -11141,7 +10996,6 @@ pub struct DatabaseRunStateStore {
     pool: SharedPool,
     owner_pod_id: String,
     lease_ttl: Duration,
-    session_execution_slot_stale_after: Duration,
     #[cfg(any(test, feature = "e2e-hooks"))]
     native_binding_insert_failure_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -11245,14 +11099,13 @@ const RUN_STATUS_FACTS_SELECT_SQL: &str = "WITH selected AS (
  SELECT MIN(CASE WHEN event_type='run_started' THEN event_idx END) AS started,
         MIN(CASE WHEN event_type='workspace_bound' THEN event_idx END) AS workspace,
         MIN(CASE WHEN event_type='executor_bound' THEN event_idx END) AS executor,
-        COALESCE(MAX(CASE WHEN event_type='run_accounting_finalized' THEN event_idx END),
-                 MAX(CASE WHEN event_type='run_finished' THEN event_idx END)) AS accounting
+        MAX(CASE WHEN event_type='run_finished' THEN event_idx END) AS accounting
  FROM agent_run_events WHERE user_id=? AND run_id=?
-   AND event_type IN ('run_started','workspace_bound','executor_bound','run_accounting_finalized','run_finished')
+   AND event_type IN ('run_started','workspace_bound','executor_bound','run_finished')
  ) SELECT e.payload_json,e.event_idx FROM agent_run_events e JOIN selected s
  ON e.event_idx IN (s.started,s.workspace,s.executor,s.accounting)
  WHERE e.user_id=? AND e.run_id=?
-   AND e.event_type IN ('run_started','workspace_bound','executor_bound','run_accounting_finalized','run_finished')
+   AND e.event_type IN ('run_started','workspace_bound','executor_bound','run_finished')
  ORDER BY e.event_idx";
 
 const RUN_OBSERVATION_EVENTS_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
@@ -11647,7 +11500,7 @@ impl DatabaseRunStateStore {
             return Ok(StatusTransitionCommit::default());
         }
         if !self
-            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
+            .validate_new_execution_status_tx(&mut tx, &run, status, waiting_for)
             .await
             .map_err(|e| e.to_string())?
         {
@@ -11770,14 +11623,12 @@ impl DatabaseRunStateStore {
     // attempt, the regular renewal interval, one full retry, and a final
     // fencing margin without weakening owner/generation checks.
     pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(120);
-    pub const DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER: Duration = Duration::from_secs(120);
 
     pub fn new(pool: SharedPool) -> Self {
         Self {
             pool,
             owner_pod_id: default_owner_pod_id(),
             lease_ttl: Self::DEFAULT_LEASE_TTL,
-            session_execution_slot_stale_after: Self::DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER,
             #[cfg(any(test, feature = "e2e-hooks"))]
             native_binding_insert_failure_once: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -12212,11 +12063,6 @@ impl DatabaseRunStateStore {
         self
     }
 
-    pub fn with_session_execution_slot_stale_after(mut self, stale_after: Duration) -> Self {
-        self.session_execution_slot_stale_after = stale_after;
-        self
-    }
-
     #[cfg(test)]
     fn with_recovery_page_pause(
         mut self,
@@ -12371,127 +12217,6 @@ impl DatabaseRunStateStore {
         };
         self.settle_terminal_in_admitted_transaction(tx, request, admission)
             .await
-    }
-
-    /// Claim a canonical terminal under the caller's existing Session fence.
-    /// The conditional write is also the owner/control read: no projection or
-    /// diagnostic row can make an otherwise committed result disappear.
-    pub async fn claim_canonical_terminal_in_transaction(
-        &self,
-        tx: &mut Transaction<'_, MySql>,
-        request: AtomicRunTerminalSettlementRequest<'_>,
-        expected_event_idx: i64,
-        receipt: &serde_json::Value,
-        opening_hash: &str,
-        context_admission_hash: &str,
-    ) -> Result<Option<RunMutationAdmission>, String> {
-        for hash in [opening_hash, context_admission_hash] {
-            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(
-                    "canonical terminal requires exact immutable Run admission hashes".into(),
-                );
-            }
-        }
-        validate_expected_run_session_id(request.expected_session_id)?;
-        if request.expected_statuses.is_empty() || !durable_run_status_is_terminal(request.status) {
-            return Err(
-                "canonical settlement requires a terminal outcome and expected states".into(),
-            );
-        }
-        if request
-            .expected_statuses
-            .iter()
-            .any(|status| durable_run_status_is_terminal(status))
-        {
-            return Err("canonical terminal claim requires active expected states".into());
-        }
-        let generation = i64::try_from(request.expected_owner_generation)
-            .map_err(|_| "Run generation exceeds BIGINT")?;
-        let origin = cancelled_terminal_origin(request.status, request.events)?;
-        let error_code = terminal_error_code_from_transition(
-            request.status,
-            request.error_message,
-            request.events,
-        );
-        let prompt =
-            i64::try_from(request.prompt_tokens).map_err(|_| "prompt usage exceeds BIGINT")?;
-        let completion = i64::try_from(request.completion_tokens)
-            .map_err(|_| "completion usage exceeds BIGINT")?;
-        let encoded = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
-        if encoded.len() > 256 * 1024 {
-            return Err("canonical terminal receipt exceeds its bounded size".into());
-        }
-        let mut update = QueryBuilder::<MySql>::new("UPDATE agent_runs SET status = ");
-        update.push_bind(request.status).push(", waiting_for = ").push_bind(request.waiting_for)
-            .push(", error_message = ").push_bind(request.error_message)
-            .push(", error_code = ").push_bind(error_code)
-            .push(", total_prompt_tokens = ").push_bind(prompt)
-            .push(", total_completion_tokens = ").push_bind(completion)
-            .push(", total_tool_calls = ").push_bind(i64::from(request.tool_calls))
-            .push(", terminal_receipt_json = ").push_bind(encoded)
-            .push(", owner_pod_id = NULL, owner_lease_expires_at = NULL, updated_at = NOW(6) WHERE user_id = ")
-            .push_bind(request.user_id).push(" AND session_id = ").push_bind(request.expected_session_id)
-            .push(" AND run_id = ").push_bind(request.run_id)
-            .push(" AND run_generation = ").push_bind(generation)
-            .push(" AND owner_pod_id = ").push_bind(&self.owner_pod_id)
-            .push(" AND owner_lease_expires_at >= NOW(6) AND terminal_receipt_json IS NULL AND last_event_idx = ")
-            .push_bind(expected_event_idx).push(" AND status IN (");
-        let mut states = update.separated(", ");
-        for status in request.expected_statuses {
-            states.push_bind(*status);
-        }
-        states.push_unseparated(")");
-        if origin != Some(DurableCancellationOrigin::User) {
-            update.push(" AND cancellation_requested_at IS NULL");
-        }
-        update
-            .push(" AND opening_hash = ")
-            .push_bind(opening_hash)
-            .push(" AND context_admission_hash = ")
-            .push_bind(context_admission_hash);
-        update.push(
-            " AND EXISTS (SELECT 1 FROM agent_session_execution_slots slot
-            WHERE slot.user_id = agent_runs.user_id AND slot.session_id = agent_runs.session_id
-              AND slot.run_id = agent_runs.run_id)",
-        );
-        let affected = update
-            .build()
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| error.to_string())?
-            .rows_affected();
-        Ok((affected == 1).then(|| RunMutationAdmission {
-            user_id: request.user_id.to_owned(),
-            session_id: request.expected_session_id.to_owned(),
-            run_id: request.run_id.to_owned(),
-            generation: request.expected_owner_generation,
-            opening_hash: Some(opening_hash.to_owned()),
-            context_admission_hash: Some(context_admission_hash.to_owned()),
-            operation: RunMutationOperation::Terminal,
-        }))
-    }
-
-    /// A lost acknowledgement may retry only the exact terminal receipt.
-    /// Merely observing a completed status is never proof of this commit.
-    pub async fn canonical_terminal_receipt_matches(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        receipt: &serde_json::Value,
-    ) -> Result<bool, String> {
-        let stored: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT terminal_receipt_json FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        ).bind(user_id).bind(session_id).bind(run_id).fetch_optional(self.pool.get()).await.map_err(|error| error.to_string())?;
-        stored
-            .flatten()
-            .map(|stored| {
-                serde_json::from_str::<serde_json::Value>(&stored)
-                    .map(|stored| stored == *receipt)
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()
-            .map(|stored| stored.unwrap_or(false))
     }
 
     /// Admit terminal settlement once, returning the exact locked run facts for
@@ -12749,12 +12474,7 @@ impl DatabaseRunStateStore {
             return Ok(None);
         }
         if !self
-            .sync_session_execution_slot_after_status_tx(
-                tx,
-                &run,
-                request.status,
-                request.waiting_for,
-            )
+            .validate_new_execution_status_tx(tx, &run, request.status, request.waiting_for)
             .await
             .map_err(|error| error.to_string())?
         {
@@ -13245,255 +12965,50 @@ impl DatabaseRunStateStore {
         .map_err(|source| db_error("load_database_lease_deadline", "active", source).to_string())
     }
 
-    async fn acquire_session_execution_slot_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        admission_facts: Option<crate::storage::SessionExecutionAdmissionFacts>,
-    ) -> DbStoreResult<bool> {
-        Self::acquire_session_execution_slot_in_tx(
-            tx,
-            user_id,
-            session_id,
-            run_id,
-            admission_facts,
-            self.session_execution_slot_stale_after,
-        )
-        .await
-    }
-
-    async fn acquire_session_execution_slot_in_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        admission_facts: Option<crate::storage::SessionExecutionAdmissionFacts>,
-        stale_after: Duration,
-    ) -> DbStoreResult<bool> {
-        // Deletion fencing locks this same session row before proving the slot
-        // empty. Execution authority exists only for the exact active,
-        // owner-scoped durable session; missing, foreign, or terminal session
-        // identities must fail closed before any slot write.
-        let session_is_active = if let Some(facts) = admission_facts.as_ref() {
-            if !facts.belongs_to(user_id, session_id) {
-                return Err(db_error(
-                    "session_execution_admission_facts_identity",
-                    session_id,
-                    sqlx::Error::Protocol(
-                        "session execution admission facts do not match the requested session"
-                            .into(),
-                    ),
-                ));
-            }
-            facts.session_is_active()
-        } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT status FROM agent_sessions
-                 WHERE user_id = ? AND session_id = ? FOR UPDATE",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|source| db_error("load_session_execution_status", session_id, source))?
-            .as_deref()
-                == Some("active")
-        };
-        if !session_is_active {
-            return Ok(false);
-        }
-        crate::session_context_coordinator::ensure_run_execution_binding_ready_in_tx(
-            tx, user_id, session_id,
-        )
-        .await?;
-        let slot = if let Some(facts) = admission_facts {
-            facts.slot().cloned()
-        } else {
-            sqlx::query(
-                "SELECT run_id, updated_at FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ? FOR UPDATE",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|source| db_error("load_session_execution_slot", session_id, source))?
-            .map(|row| {
-                Ok::<_, sqlx::Error>((
-                    row.try_get::<String, _>("run_id")?,
-                    row.try_get::<chrono::NaiveDateTime, _>("updated_at")?,
-                ))
-            })
-            .transpose()
-            .map_err(|source| db_error("decode_session_execution_slot", session_id, source))?
-        };
-
-        let Some((owner, slot_updated_at)) = slot else {
-            sqlx::query(
-                "INSERT INTO agent_session_execution_slots
-                 (user_id, session_id, run_id, acquired_at, updated_at)
-                 VALUES (?, ?, ?, NOW(6), NOW(6))",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(run_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|source| db_error("acquire_session_execution_slot", session_id, source))?;
-            return Ok(true);
-        };
-
-        if owner != run_id {
-            let slot_age = chrono::Utc::now()
-                .naive_utc()
-                .signed_duration_since(slot_updated_at)
-                .to_std()
-                .unwrap_or_default();
-            let slot_is_stale = slot_age >= stale_after;
-            {
-                let owner_state = sqlx::query(
-                    "SELECT status, waiting_for, owner_lease_expires_at FROM agent_runs
-                     WHERE user_id = ? AND run_id = ?",
-                )
-                .bind(user_id)
-                .bind(&owner)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(|source| {
-                    db_error("load_session_execution_slot_owner", session_id, source)
-                })?;
-                let owner_reclaimable = owner_state
-                    .as_ref()
-                    .map(|row| {
-                        let status = row.try_get::<String, _>("status")?;
-                        let waiting_for = row.try_get::<Option<String>, _>("waiting_for")?;
-                        let owner_lease_expires_at = row
-                            .try_get::<Option<chrono::NaiveDateTime>, _>(
-                                "owner_lease_expires_at",
-                            )?;
-                        // A missing lease is stronger evidence of no live
-                        // executor than an expired one. The runtime clears
-                        // ownership on graceful task exit; after the slot's
-                        // stale window that abandoned status must be
-                        // reclaimable even if terminal persistence failed.
-                        let owner_lease_expired = owner_lease_expires_at
-                            .is_none_or(|expires_at| expires_at < chrono::Utc::now().naive_utc());
-                        Ok::<_, sqlx::Error>(session_execution_slot_owner_reclaimable(
-                            &status,
-                            waiting_for.as_deref(),
-                            owner_lease_expired,
-                            slot_is_stale,
-                        ))
-                    })
-                    .transpose()
-                    .map_err(|source| {
-                        db_error("decode_session_execution_slot_owner", session_id, source)
-                    })?
-                    .unwrap_or(true);
-                if owner_reclaimable {
-                    sqlx::query(
-                        "DELETE FROM agent_session_execution_slots
-                         WHERE user_id = ? AND session_id = ? AND run_id = ?",
-                    )
-                    .bind(user_id)
-                    .bind(session_id)
-                    .bind(&owner)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(|source| {
-                        db_error("cleanup_stale_session_execution_slot", session_id, source)
-                    })?;
-                    sqlx::query(
-                        "INSERT INTO agent_session_execution_slots
-                         (user_id, session_id, run_id, acquired_at, updated_at)
-                         VALUES (?, ?, ?, NOW(6), NOW(6))",
-                    )
-                    .bind(user_id)
-                    .bind(session_id)
-                    .bind(run_id)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(|source| {
-                        db_error("reacquire_session_execution_slot", session_id, source)
-                    })?;
-                    return Ok(true);
-                }
-            }
-            return Ok(false);
-        }
-
-        sqlx::query(
-            "UPDATE agent_session_execution_slots
-             SET updated_at = NOW(6)
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(run_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|source| db_error("refresh_session_execution_slot", session_id, source))?;
-        Ok(true)
-    }
-
-    async fn release_session_execution_slot_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-    ) -> DbStoreResult<()> {
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(run_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|source| db_error("release_session_execution_slot", session_id, source))?;
-        Ok(())
-    }
-
-    async fn sync_session_execution_slot_after_status_tx(
+    /// Only a transition from parked history to executing needs an occupancy
+    /// check. Existing executing Runs already own their status/lease; terminal
+    /// retirement never updates a second representation of that ownership.
+    async fn validate_new_execution_status_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         run: &DurableRunRecord,
         status: &str,
         waiting_for: Option<&str>,
     ) -> DbStoreResult<bool> {
-        if !run_requires_session_execution_slot(run) {
-            if durable_run_status_blocks_session(status, waiting_for) {
-                crate::session_context_coordinator::ensure_run_execution_binding_ready_in_tx(
-                    tx,
-                    &run.user_id,
-                    &run.session_id,
-                )
-                .await?;
-            }
+        if !durable_run_status_blocks_session(status, waiting_for)
+            || durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
+        {
             return Ok(true);
         }
-        if durable_run_status_blocks_session(status, waiting_for) {
-            debug_assert!(
-                durable_run_status_kind(status) != DurableRunStatusKind::Paused
-                    || waiting_for.is_some(),
-                "paused without waiting_for must release the session execution slot"
-            );
-            self.acquire_session_execution_slot_tx(
-                tx,
-                &run.user_id,
-                &run.session_id,
-                &run.run_id,
-                None,
-            )
-            .await
-        } else {
-            Self::release_session_execution_slot_tx(tx, &run.user_id, &run.session_id, &run.run_id)
-                .await?;
-            Ok(true)
+        crate::session_context_coordinator::ensure_run_execution_binding_ready_in_tx(
+            tx,
+            &run.user_id,
+            &run.session_id,
+        )
+        .await?;
+        if !run_requires_independent_admission(run) {
+            return Ok(true);
         }
+        let active: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+        )
+        .bind(&run.user_id)
+        .bind(&run.session_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("load_execution_session_status", &run.session_id, source))?;
+        if active.as_deref() != Some("active") {
+            return Ok(false);
+        }
+        crate::storage::session_execution_activity(
+            tx,
+            &run.user_id,
+            &run.session_id,
+            Some(&run.run_id),
+        )
+        .await
+        .map(|activity| activity.is_idle())
+        .map_err(|source| db_error("check_execution_activity", &run.session_id, source))
     }
 
     /// Plan the immutable interaction closures that must precede a terminal
@@ -13534,13 +13049,21 @@ impl DatabaseRunStateStore {
                      OR (required.event_type = 'provider_interaction_required'
                          AND resolved.event_type = 'provider_interaction_resolved'))
                )
-             ORDER BY required.event_idx ASC",
+             ORDER BY required.event_idx ASC LIMIT 1025",
         )
         .bind(&run.user_id)
         .bind(&run.run_id)
         .fetch_all(&mut **tx)
         .await
         .map_err(|source| db_error("load_terminal_unresolved_interactions", &run.run_id, source))?;
+        if required_rows.len() > 1024 {
+            return Err(invalid_database_value_error(
+                "terminal_interaction_work_bound",
+                "agent_run_events",
+                "event_type",
+                "too many unresolved terminal interactions",
+            ));
+        }
         let mut events = Vec::with_capacity(required_rows.len());
         for row in required_rows {
             let required_event_type: String = row.try_get("event_type").map_err(|source| {
@@ -13617,12 +13140,21 @@ impl DatabaseRunStateStore {
         if !releases_executor_ownership {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL)
+        let bounded_sql = format!("{UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL} LIMIT 1025");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(bounded_sql))
             .bind(user_id)
             .bind(run_id)
             .fetch_all(&mut **tx)
             .await
             .map_err(|source| db_error(operation, run_id, source))?;
+        if rows.len() > 1024 {
+            return Err(invalid_database_value_error(
+                operation,
+                "agent_run_events",
+                "event_type",
+                "terminal user-intent history exceeds work bound",
+            ));
+        }
         let existing = rows
             .into_iter()
             .map(|row| decode_run_event_payload(&row, run_id))
@@ -13707,6 +13239,12 @@ impl DatabaseRunStateStore {
                 .collect::<DbStoreResult<Vec<_>>>()
                 .map_err(|error| error.to_string())?,
         );
+        run.events.extend(
+            self.canonical_terminal_projection_events(run, &[(-1, run.last_event_idx)], true)
+                .await?,
+        );
+        run.events
+            .sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
         Ok(())
     }
 
@@ -14399,7 +13937,7 @@ impl DatabaseRunStateStore {
         claim_existing: bool,
         requested_session_id: Option<&str>,
         participant: &mut dyn RunStartTransactionParticipant,
-    ) -> Result<DurableRunStartClaim, String> {
+    ) -> Result<DurableRunStartClaim, RunAdmissionError> {
         participant.prepare().await?;
         let initial_rows = self.prepare_initial_run_event_rows(&mut record)?;
         self.insert_run_record_transaction_with_collaborator(
@@ -14415,11 +13953,6 @@ impl DatabaseRunStateStore {
         )
         .await
         .map(|(claim, _)| claim)
-        .map_err(|error| match error {
-            CollaboratorStoreError::SessionUnavailable => "session is not active".to_owned(),
-            CollaboratorStoreError::Persistence(reason) => reason,
-            error => error.to_string(),
-        })
     }
 
     async fn insert_run_record(
@@ -14444,7 +13977,7 @@ impl DatabaseRunStateStore {
         }
         let initial_event_rows = self.prepare_initial_run_event_rows(&mut record)?;
         let admission_authority =
-            DurableRunStartAuthority::before_creation(record.run_generation, Some(self.lease_ttl));
+            DurableRunStartAuthority::before_creation(&record, Some(self.lease_ttl));
         let encoded_opening = finalize_run_opening(&mut record)?;
         let receipt_record = deadline.map(|_| run_start_receipt_metadata(&mut record));
         let transaction = self.insert_run_record_transaction(
@@ -15094,7 +14627,7 @@ impl DatabaseRunStateStore {
         anchor_run_id: &str,
         event_type: &str,
         source_key: Option<&str>,
-    ) -> Result<Option<serde_json::Value>, CollaboratorStoreError> {
+    ) -> Result<Option<serde_json::Value>, RunAdmissionError> {
         let row = if let Some(source_key) = source_key {
             sqlx::query(
                 "SELECT payload_json, event_idx FROM agent_run_events
@@ -15134,7 +14667,7 @@ impl DatabaseRunStateStore {
         user_id: &str,
         session_id: &str,
         anchor_run_id: &str,
-    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+    ) -> Result<Option<DurableCollaboratorAssociation>, RunAdmissionError> {
         let mut query =
             sqlx::QueryBuilder::<MySql>::new("SELECT event_type, payload_json, event_idx FROM (");
         for (index, event_type) in [
@@ -15177,7 +14710,7 @@ impl DatabaseRunStateStore {
         let event = decode_run_event_payload(event, anchor_run_id)?;
         let association = decode_collaborator_fact(&event, "association")?;
         let latest = facts.get(COLLABORATOR_STAGE_EVENT).ok_or_else(|| {
-            CollaboratorStoreError::AssociationConflict {
+            RunAdmissionError::AssociationConflict {
                 anchor_run_id: anchor_run_id.into(),
             }
         })?;
@@ -15212,7 +14745,7 @@ impl DatabaseRunStateStore {
             Option<DurableRunRecord>,
             Vec<serde_json::Value>,
         ),
-        CollaboratorStoreError,
+        RunAdmissionError,
     > {
         validate_collaborator_admission(record, admission)?;
         let anchor = load_run_metadata_after_session_admission_tx(
@@ -15236,7 +14769,7 @@ impl DatabaseRunStateStore {
         };
         if let Some(existing) = &existing {
             if existing.association != admission.association {
-                return Err(CollaboratorStoreError::AssociationConflict {
+                return Err(RunAdmissionError::AssociationConflict {
                     anchor_run_id: admission.anchor_run_id.clone(),
                 });
             }
@@ -15256,7 +14789,7 @@ impl DatabaseRunStateStore {
             if admission.expected_previous_stage_run_id.as_deref()
                 != Some(&existing.latest_stage.run_id)
             {
-                return Err(CollaboratorStoreError::PreviousStageChanged {
+                return Err(RunAdmissionError::PreviousStageChanged {
                     anchor_run_id: admission.anchor_run_id.clone(),
                 });
             }
@@ -15268,11 +14801,11 @@ impl DatabaseRunStateStore {
                 AGENT_RUN_COLUMNS,
             )
             .await?
-            .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            .ok_or_else(|| RunAdmissionError::RunUnavailable {
                 run_id: existing.latest_stage.run_id.clone(),
             })?;
             if !durable_run_status_is_terminal(&previous.status) {
-                return Err(CollaboratorStoreError::PreviousStageActive {
+                return Err(RunAdmissionError::PreviousStageActive {
                     run_id: previous.run_id,
                 });
             }
@@ -15292,12 +14825,12 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("fence_collaborator_dispatch", &previous.run_id, source))?;
             if unsettled.is_some() {
-                return Err(CollaboratorStoreError::UnsettledDispatch {
+                return Err(RunAdmissionError::UnsettledDispatch {
                     run_id: previous.run_id,
                 });
             }
             if existing.native_session.is_none() {
-                return Err(CollaboratorStoreError::NativeSessionUnbound {
+                return Err(RunAdmissionError::NativeSessionUnbound {
                     anchor_run_id: admission.anchor_run_id.clone(),
                 });
             }
@@ -15305,7 +14838,7 @@ impl DatabaseRunStateStore {
             || admission.anchor_run_id != record.run_id
             || admission.expected_previous_stage_run_id.is_some()
         {
-            return Err(CollaboratorStoreError::AssociationConflict {
+            return Err(RunAdmissionError::AssociationConflict {
                 anchor_run_id: admission.anchor_run_id.clone(),
             });
         }
@@ -15313,7 +14846,7 @@ impl DatabaseRunStateStore {
             record
                 .parent_run_id
                 .as_deref()
-                .ok_or(CollaboratorStoreError::InvalidAdmission {
+                .ok_or(RunAdmissionError::InvalidAdmission {
                     field: "parent_run_id",
                 })?;
         let parent = load_run_metadata_after_session_admission_tx(
@@ -15324,7 +14857,7 @@ impl DatabaseRunStateStore {
             AGENT_RUN_COLUMNS,
         )
         .await?
-        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+        .ok_or_else(|| RunAdmissionError::RunUnavailable {
             run_id: parent_id.into(),
         })?;
         let live: bool = sqlx::query_scalar(
@@ -15347,14 +14880,14 @@ impl DatabaseRunStateStore {
                 .await?
                 .any()
         {
-            return Err(CollaboratorStoreError::ParentNotCurrent {
+            return Err(RunAdmissionError::ParentNotCurrent {
                 run_id: parent_id.into(),
             });
         }
         let root = parent
             .root_run_id
             .as_ref()
-            .ok_or(CollaboratorStoreError::InvalidAdmission {
+            .ok_or(RunAdmissionError::InvalidAdmission {
                 field: "parent_root",
             })?;
         let path = format!(
@@ -15362,7 +14895,7 @@ impl DatabaseRunStateStore {
             parent
                 .ancestor_path
                 .as_deref()
-                .ok_or(CollaboratorStoreError::InvalidAdmission {
+                .ok_or(RunAdmissionError::InvalidAdmission {
                     field: "parent_lineage"
                 },)?,
             record.run_id
@@ -15370,7 +14903,7 @@ impl DatabaseRunStateStore {
         let depth = parent
             .depth
             .checked_add(1)
-            .ok_or(CollaboratorStoreError::InvalidAdmission { field: "depth" })?;
+            .ok_or(RunAdmissionError::InvalidAdmission { field: "depth" })?;
         if record
             .root_run_id
             .as_ref()
@@ -15381,7 +14914,7 @@ impl DatabaseRunStateStore {
                 .is_some_and(|value| value != &path)
             || (record.depth != 0 && record.depth != depth)
         {
-            return Err(CollaboratorStoreError::InvalidAdmission {
+            return Err(RunAdmissionError::InvalidAdmission {
                 field: "child_lineage",
             });
         }
@@ -15417,13 +14950,13 @@ impl DatabaseRunStateStore {
         tx: &mut Transaction<'_, MySql>,
         anchor: &DurableRunRecord,
         events: &[serde_json::Value],
-    ) -> Result<Vec<RunEventInsertRow>, CollaboratorStoreError> {
+    ) -> Result<Vec<RunEventInsertRow>, RunAdmissionError> {
         let mut rows = Vec::with_capacity(events.len());
         for event in events {
             let idx = anchor
                 .last_event_idx
                 .checked_add(rows.len() as i64 + 1)
-                .ok_or(CollaboratorStoreError::InvalidAdmission { field: "event_idx" })?;
+                .ok_or(RunAdmissionError::InvalidAdmission { field: "event_idx" })?;
             rows.push(build_run_event_insert_row(
                 &anchor.user_id,
                 &anchor.run_id,
@@ -15448,7 +14981,7 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("advance_collaborator_events", &anchor.run_id, source))?;
             if updated.rows_affected() != 1 {
-                return Err(CollaboratorStoreError::AssociationConflict {
+                return Err(RunAdmissionError::AssociationConflict {
                     anchor_run_id: anchor.run_id.clone(),
                 });
             }
@@ -15497,8 +15030,8 @@ impl DatabaseRunStateStore {
         .await
         .map(|(claim, _)| claim)
         .map_err(|error| match error {
-            CollaboratorStoreError::SessionUnavailable => "session is not active".to_owned(),
-            CollaboratorStoreError::Persistence(reason) => reason,
+            RunAdmissionError::SessionUnavailable => "session is not active".to_owned(),
+            RunAdmissionError::Persistence(reason) => reason,
             error => error.to_string(),
         })
     }
@@ -15507,7 +15040,7 @@ impl DatabaseRunStateStore {
         &self,
         record: &DurableRunRecord,
         admission: &CollaboratorStageAdmission,
-    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+    ) -> Result<CollaboratorStageReceipt, RunAdmissionError> {
         let proof = tokio::time::timeout(RUN_START_TIMEOUT_RECEIPT_TIMEOUT, async {
             let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
                 .await
@@ -15570,17 +15103,17 @@ impl DatabaseRunStateStore {
                 )
             })?;
             connection.release();
-            Ok::<_, CollaboratorStoreError>(receipt)
+            Ok::<_, RunAdmissionError>(receipt)
         })
         .await;
         match proof {
             Ok(Ok(Some(receipt))) => Ok(receipt),
             Ok(Err(
-                error @ (CollaboratorStoreError::SourceMessageConflict { .. }
-                | CollaboratorStoreError::AssociationConflict { .. }
-                | CollaboratorStoreError::SessionUnavailable),
+                error @ (RunAdmissionError::SourceMessageConflict { .. }
+                | RunAdmissionError::AssociationConflict { .. }
+                | RunAdmissionError::SessionUnavailable),
             )) => Err(error),
-            _ => Err(CollaboratorStoreError::CommitUnknown {
+            _ => Err(RunAdmissionError::CommitUnknown {
                 anchor_run_id: admission.anchor_run_id.clone(),
                 source_message_id: admission.source_message_id.clone(),
             }),
@@ -15595,8 +15128,7 @@ impl DatabaseRunStateStore {
         initial: RunInsertData<'_>,
         collaborator: Option<&CollaboratorStageAdmission>,
         mut participant: Option<&mut dyn RunStartTransactionParticipant>,
-    ) -> Result<(DurableRunStartClaim, Option<CollaboratorStageReceipt>), CollaboratorStoreError>
-    {
+    ) -> Result<(DurableRunStartClaim, Option<CollaboratorStageReceipt>), RunAdmissionError> {
         let RunInsertData {
             events: initial_event_rows,
             opening: encoded_opening,
@@ -15638,19 +15170,35 @@ impl DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
-        let execution_admission_facts = crate::storage::admit_session_execution_write_with_facts(
-            &mut tx,
-            &record.session_id,
-            &record.user_id,
-        )
-        .await
+        let independent = run_requires_independent_admission(&record)
+            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
+        let admitted = if independent {
+            crate::storage::admit_independent_run_creation(
+                &mut tx,
+                &record.session_id,
+                &record.user_id,
+                &record.run_id,
+            )
+            .await
+        } else {
+            crate::storage::admit_session_execution_write(
+                &mut tx,
+                &record.session_id,
+                &record.user_id,
+            )
+            .await
+            .map(|()| true)
+        }
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
-                CollaboratorStoreError::SessionUnavailable
+                RunAdmissionError::SessionUnavailable
             } else {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
+        if !admitted {
+            return Err(RunAdmissionError::SessionBusy);
+        }
         let mut collaborator_event_rows = vec![];
         let mut collaborator_events_on_new_run = false;
         let mut stage_receipt = None;
@@ -15699,16 +15247,6 @@ impl DatabaseRunStateStore {
         // The unique Run key is the authority for creation. The INSERT below
         // handles duplicate identities and exact replay after rollback; a
         // preceding existence read repeats that work and cannot prove absence.
-        if !run_requires_session_execution_slot(&record) {
-            crate::session_context_coordinator::ensure_run_execution_binding_ready_in_tx(
-                &mut tx,
-                &record.user_id,
-                &record.session_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        }
-
         if let Some(participant) = participant.as_mut() {
             participant
                 .stage(
@@ -15717,7 +15255,25 @@ impl DatabaseRunStateStore {
                     record.opening.as_mut(),
                 )
                 .await
-                .map_err(CollaboratorStoreError::Persistence)?;
+                .map_err(RunAdmissionError::Persistence)?;
+        }
+        // A Root participant binds only the Context snapshot captured by the
+        // coordinator in this transaction. That capture has already validated
+        // the exact binding/generation and Ready state. Callers without that
+        // opening retain the ordinary binding validation.
+        if record
+            .opening
+            .as_ref()
+            .and_then(DurableRunOpening::root_context)
+            .is_none()
+        {
+            crate::session_context_coordinator::ensure_run_execution_binding_ready_in_tx(
+                &mut tx,
+                &record.user_id,
+                &record.session_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         }
         let encoded_opening = if participant.is_some() {
             finalize_run_opening(&mut record)?
@@ -15729,7 +15285,7 @@ impl DatabaseRunStateStore {
         {
             participant
                 .prepared_opening(hash)
-                .map_err(CollaboratorStoreError::Persistence)?;
+                .map_err(RunAdmissionError::Persistence)?;
         }
         let work_binding_present = record.work_binding.is_some();
         let work_item_present = record
@@ -15768,15 +15324,12 @@ impl DatabaseRunStateStore {
             work_item_present,
         ];
 
-        let requires_execution_slot = run_requires_session_execution_slot(&record)
-            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
         // The INSERT commits the owner, generation and initial lease together
         // with the run, session slot and opening events. MatrixOne can give a
         // different pooled connection an older CN snapshot, so a second UPDATE
         // is not a reliable way to rediscover this acknowledged creation.
         // Carry its original, conservative lease window out of the transaction.
-        let authority =
-            DurableRunStartAuthority::before_creation(record.run_generation, Some(self.lease_ttl));
+        let authority = DurableRunStartAuthority::before_creation(&record, Some(self.lease_ttl));
         let insert_result = match self
             .insert_run_row_tx(
                 &mut tx,
@@ -15813,30 +15366,12 @@ impl DatabaseRunStateStore {
                 return Err(db_error("insert_run", &record.run_id, source).into());
             }
         };
-        if requires_execution_slot
-            && !self
-                .acquire_session_execution_slot_tx(
-                    &mut tx,
-                    &record.user_id,
-                    &record.session_id,
-                    &record.run_id,
-                    Some(execution_admission_facts),
-                )
-                .await
-                .map_err(|e| e.to_string())?
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error("insert_run_rollback_slot_blocked", &record.run_id, source).to_string()
-            })?;
-            connection.release();
-            return Err("session already has an active run".to_string().into());
-        }
         if insert_result.rows_affected() == 0 {
             tx.rollback().await.map_err(|source| {
                 db_error("insert_run_rollback_noop", &record.run_id, source).to_string()
             })?;
             connection.release();
-            return Err("session already has an active run".to_string().into());
+            return Err(RunAdmissionError::SessionBusy);
         }
         Self::insert_run_event_rows_tx(
             &mut tx,
@@ -15892,7 +15427,7 @@ impl DatabaseRunStateStore {
             };
             if exact_owner_generation != Some(record.run_generation) {
                 if let Some(admission) = collaborator {
-                    return Err(CollaboratorStoreError::CommitUnknown {
+                    return Err(RunAdmissionError::CommitUnknown {
                         anchor_run_id: admission.anchor_run_id.clone(),
                         source_message_id: admission.source_message_id.clone(),
                     });
@@ -15914,8 +15449,8 @@ impl DatabaseRunStateStore {
             .and_then(Result::ok)
             .unwrap_or(false);
             if !collaborator_proof {
-                let admission = collaborator.ok_or(CollaboratorStoreError::Unsupported)?;
-                return Err(CollaboratorStoreError::CommitUnknown {
+                let admission = collaborator.ok_or(RunAdmissionError::Unsupported)?;
+                return Err(RunAdmissionError::CommitUnknown {
                     anchor_run_id: admission.anchor_run_id.clone(),
                     source_message_id: admission.source_message_id.clone(),
                 });
@@ -16702,23 +16237,6 @@ impl DatabaseRunStateStore {
                     },
                 ));
             }
-            if !self
-                .sync_session_execution_slot_after_status_tx(
-                    &mut tx,
-                    &run,
-                    STATUS_CANCELLED,
-                    None,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                return Ok(StagedExecutionOwnerCancellation::Rollback(
-                    AtomicExecutionOwnerCancellation::NotOwnedActive {
-                        status: run.status,
-                        owner_generation: run.run_generation,
-                    },
-                ));
-            }
             enqueue_work_terminal_event_for_run(&mut tx, &run, STATUS_CANCELLED).await?;
             Self::insert_run_event_rows_tx(
                 &mut tx,
@@ -16885,7 +16403,7 @@ impl DatabaseRunStateStore {
             &astra_turn_types::ToolInvocationIdentity,
             &CollaboratorNativeSession,
         )>,
-    ) -> Result<Option<CollaboratorNativeSession>, CollaboratorStoreError> {
+    ) -> Result<Option<CollaboratorNativeSession>, RunAdmissionError> {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| db_error("acquire_collaborator_native_session", anchor_id, source))?;
@@ -16902,17 +16420,17 @@ impl DatabaseRunStateStore {
             AGENT_RUN_COLUMNS,
         )
         .await?
-        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+        .ok_or_else(|| RunAdmissionError::RunUnavailable {
             run_id: anchor_id.to_string(),
         })?;
         let association =
             Self::collaborator_association_tx(&mut tx, user_id, session_id, anchor_id)
                 .await?
-                .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
+                .ok_or_else(|| RunAdmissionError::AssociationConflict {
                     anchor_run_id: anchor_id.to_string(),
                 })?;
         if association.latest_stage.run_id != stage_id {
-            return Err(CollaboratorStoreError::PreviousStageChanged {
+            return Err(RunAdmissionError::PreviousStageChanged {
                 anchor_run_id: anchor_id.into(),
             });
         }
@@ -16924,17 +16442,17 @@ impl DatabaseRunStateStore {
             AGENT_RUN_COLUMNS,
         )
         .await?
-        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+        .ok_or_else(|| RunAdmissionError::RunUnavailable {
             run_id: stage_id.to_string(),
         })?;
         // Reporting generation is a CAS fence, not the origin of the receipt.
         if stage.run_generation != expected_owner_generation {
-            return Err(CollaboratorStoreError::ParentNotCurrent {
+            return Err(RunAdmissionError::ParentNotCurrent {
                 run_id: stage_id.into(),
             });
         }
         if expected_receipt.is_none() && !durable_run_status_is_terminal(&stage.status) {
-            return Err(CollaboratorStoreError::PreviousStageActive {
+            return Err(RunAdmissionError::PreviousStageActive {
                 run_id: stage_id.into(),
             });
         }
@@ -16943,7 +16461,7 @@ impl DatabaseRunStateStore {
                 || identity.session_id != session_id
                 || identity.run_id != stage_id
         }) {
-            return Err(CollaboratorStoreError::NativeSessionUnproven);
+            return Err(RunAdmissionError::NativeSessionUnproven);
         }
         // Do not accept an owner HashMap, provider output text, a caller's ACK
         // flag, a semantic cache hit, or an outcome_unknown ledger row.
@@ -16963,12 +16481,12 @@ impl DatabaseRunStateStore {
             if expected_receipt.is_none() && proof.is_empty() {
                 return Ok(None);
             }
-            return Err(CollaboratorStoreError::NativeSessionUnproven);
+            return Err(RunAdmissionError::NativeSessionUnproven);
         };
         let identity = astra_turn_types::ToolInvocationIdentity::new(
             user_id, session_id, stage_id, &row.0, &row.1,
         )
-        .map_err(|_| CollaboratorStoreError::NativeSessionUnproven)?;
+        .map_err(|_| RunAdmissionError::NativeSessionUnproven)?;
         let (outcome_json, fingerprint_json, state) = (&row.2, &row.3, row.4.clone());
         let state: astra_turn_types::ToolInvocationState =
             serde_json::from_value(serde_json::Value::String(state)).map_err(|source| {
@@ -16992,7 +16510,7 @@ impl DatabaseRunStateStore {
                 descriptor: locator.descriptor.clone(),
             })
         {
-            return Err(CollaboratorStoreError::NativeSessionUnproven);
+            return Err(RunAdmissionError::NativeSessionUnproven);
         }
         let outcome: astra_turn_types::ToolInvocationTerminalOutcome =
             serde_json::from_str(outcome_json).map_err(|source| {
@@ -17012,7 +16530,7 @@ impl DatabaseRunStateStore {
                 astra_turn_types::ToolInvocationTerminalOutcome::Failed { result, .. },
             ) => result,
             _ => {
-                return Err(CollaboratorStoreError::NativeSessionUnproven);
+                return Err(RunAdmissionError::NativeSessionUnproven);
             }
         };
         if result
@@ -17021,7 +16539,7 @@ impl DatabaseRunStateStore {
             .and_then(serde_json::Value::as_bool)
             != Some(true)
         {
-            return Err(CollaboratorStoreError::NativeSessionUnproven);
+            return Err(RunAdmissionError::NativeSessionUnproven);
         }
         let Some(metadata) = result
             .metadata
@@ -17030,17 +16548,17 @@ impl DatabaseRunStateStore {
             if expected_receipt.is_none() {
                 return Ok(None);
             }
-            return Err(CollaboratorStoreError::NativeSessionUnproven);
+            return Err(RunAdmissionError::NativeSessionUnproven);
         };
         let native_session: CollaboratorNativeSession = serde_json::from_value(metadata.clone())
-            .map_err(|_| CollaboratorStoreError::NativeSessionUnproven)?;
+            .map_err(|_| RunAdmissionError::NativeSessionUnproven)?;
         if native_session.anchor_run_id != anchor_id
             || native_session.provider != association.association.provider
             || native_session.native_session_id.trim().is_empty()
             || native_session.native_session_id.len() > 512
             || expected_receipt.is_some_and(|(_, expected)| *expected != native_session)
         {
-            return Err(CollaboratorStoreError::NativeSessionUnproven);
+            return Err(RunAdmissionError::NativeSessionUnproven);
         }
         let action_id = format!("tool_invocation:{}", identity.storage_key());
         let grant: Option<(String, String)> = sqlx::query_as(
@@ -17055,16 +16573,16 @@ impl DatabaseRunStateStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|source| db_error("prove_native_session_generation", stage_id, source))?;
-        let (payload, hash) = grant.ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+        let (payload, hash) = grant.ok_or(RunAdmissionError::NativeSessionUnproven)?;
         if hash != sha256_hex(payload.as_bytes()) {
-            return Err(CollaboratorStoreError::NativeSessionUnproven);
+            return Err(RunAdmissionError::NativeSessionUnproven);
         }
-        let grant: serde_json::Value = serde_json::from_str(&payload)
-            .map_err(|_| CollaboratorStoreError::NativeSessionUnproven)?;
+        let grant: serde_json::Value =
+            serde_json::from_str(&payload).map_err(|_| RunAdmissionError::NativeSessionUnproven)?;
         let original_generation = grant
             .pointer("/data/owner_generation")
             .and_then(serde_json::Value::as_u64)
-            .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+            .ok_or(RunAdmissionError::NativeSessionUnproven)?;
         if grant.get("event_type").and_then(serde_json::Value::as_str)
             != Some("action_admission_granted")
             || grant
@@ -17082,7 +16600,7 @@ impl DatabaseRunStateStore {
                 .and_then(serde_json::Value::as_str)
                 != Some(session_id)
         {
-            return Err(CollaboratorStoreError::NativeSessionUnproven);
+            return Err(RunAdmissionError::NativeSessionUnproven);
         }
         if let Some(existing) = association.native_session {
             let event = Self::collaborator_event_tx(
@@ -17094,7 +16612,7 @@ impl DatabaseRunStateStore {
                 None,
             )
             .await?
-            .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+            .ok_or(RunAdmissionError::NativeSessionUnproven)?;
             let original_invocation: astra_turn_types::ToolInvocationIdentity =
                 decode_collaborator_fact(&event, "invocation")?;
             let bound_generation: u64 = decode_collaborator_fact(&event, "owner_generation")?;
@@ -17102,7 +16620,7 @@ impl DatabaseRunStateStore {
                 || original_invocation != identity
                 || bound_generation != original_generation
             {
-                return Err(CollaboratorStoreError::NativeSessionUnproven);
+                return Err(RunAdmissionError::NativeSessionUnproven);
             }
             tx.rollback()
                 .await
@@ -17135,7 +16653,7 @@ impl DatabaseRunStateStore {
             .unwrap_or(false);
             if !proven {
                 tracing::warn!(run_id = %identity.run_id, error = %source, "native session binding commit acknowledgement unknown");
-                return Err(CollaboratorStoreError::CommitUnknown {
+                return Err(RunAdmissionError::CommitUnknown {
                     anchor_run_id: anchor_id.to_string(),
                     source_message_id: identity.invocation_id.clone(),
                 });
@@ -17193,9 +16711,9 @@ impl RunStateStore for DatabaseRunStateStore {
         mut record: DurableRunRecord,
         admission: CollaboratorStageAdmission,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+    ) -> Result<CollaboratorStageReceipt, RunAdmissionError> {
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            return Err(CollaboratorStoreError::DeadlineExpired);
+            return Err(RunAdmissionError::DeadlineExpired);
         }
         validate_collaborator_admission(&record, &admission)?;
         let initial_rows = self.prepare_initial_run_event_rows(&mut record)?;
@@ -17229,10 +16747,10 @@ impl RunStateStore for DatabaseRunStateStore {
         };
         match result {
             Ok((_, Some(receipt))) => Ok(receipt),
-            Ok((_, None)) => Err(CollaboratorStoreError::AssociationConflict {
+            Ok((_, None)) => Err(RunAdmissionError::AssociationConflict {
                 anchor_run_id: admission.anchor_run_id,
             }),
-            Err(CollaboratorStoreError::CommitUnknown { .. }) => {
+            Err(RunAdmissionError::CommitUnknown { .. }) => {
                 self.reconcile_collaborator_admission(&receipt_record, &admission)
                     .await
             }
@@ -17245,7 +16763,7 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         session_id: &str,
         anchor_run_id: &str,
-    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+    ) -> Result<Option<DurableCollaboratorAssociation>, RunAdmissionError> {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| {
@@ -17282,7 +16800,7 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         session_id: &str,
         stage_run_id: &str,
-    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+    ) -> Result<Option<DurableCollaboratorAssociation>, RunAdmissionError> {
         // Stage events are intentionally owned by the stable association
         // anchor. Resolve that owner through the indexed stage binding, then
         // reuse the canonical association decoder. Ordinary child guidance
@@ -17341,7 +16859,7 @@ impl RunStateStore for DatabaseRunStateStore {
         identity: &astra_turn_types::ToolInvocationIdentity,
         native_session: &CollaboratorNativeSession,
         expected_owner_generation: u64,
-    ) -> Result<(), CollaboratorStoreError> {
+    ) -> Result<(), RunAdmissionError> {
         self.bind_collaborator_native_session(
             &identity.user_id,
             &identity.session_id,
@@ -17351,7 +16869,7 @@ impl RunStateStore for DatabaseRunStateStore {
             Some((identity, native_session)),
         )
         .await?
-        .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+        .ok_or(RunAdmissionError::NativeSessionUnproven)?;
         Ok(())
     }
 
@@ -17362,7 +16880,7 @@ impl RunStateStore for DatabaseRunStateStore {
         anchor_run_id: &str,
         expected_predecessor_run_id: &str,
         expected_owner_generation: u64,
-    ) -> Result<Option<CollaboratorNativeSession>, CollaboratorStoreError> {
+    ) -> Result<Option<CollaboratorNativeSession>, RunAdmissionError> {
         self.bind_collaborator_native_session(
             user_id,
             session_id,
@@ -17442,7 +16960,7 @@ impl RunStateStore for DatabaseRunStateStore {
         claim_existing: bool,
         requested_session_id: Option<&str>,
         participant: &mut dyn RunStartTransactionParticipant,
-    ) -> Result<DurableRunStartClaim, String> {
+    ) -> Result<DurableRunStartClaim, RunAdmissionError> {
         self.insert_run_record_with_participant(
             record,
             claim_existing,
@@ -17779,30 +17297,6 @@ impl RunStateStore for DatabaseRunStateStore {
         }
     }
 
-    async fn has_open_run_settlement(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        generation: u64,
-    ) -> Result<bool, String> {
-        let keys: Vec<String> = sqlx::query_scalar(
-            "SELECT idempotency_key FROM agent_run_events WHERE user_id = ? AND run_id = ?
-             AND idempotency_key IN (?, ?, ?)",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .bind(format!("run-settlement-started:{generation}"))
-        .bind(format!("run-settlement-finished:{generation}"))
-        .bind(format!("run-accounting-finalized:{generation}"))
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_settlement", run_id, source).to_string())?;
-        Ok(keys
-            .iter()
-            .any(|key| key == &format!("run-settlement-started:{generation}"))
-            && keys.len() == 1)
-    }
-
     async fn terminalize_orphaned_run_cancellation(
         &self,
         request: AtomicOrphanRunCancellationRequest<'_>,
@@ -17960,21 +17454,6 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error(
                         "terminalize_orphaned_run_cancellation_rollback_lost_cas",
-                        request.run_id,
-                        source,
-                    )
-                    .to_string()
-                })?;
-                return Ok::<(bool, Option<String>), String>((false, None));
-            }
-            if !self
-                .sync_session_execution_slot_after_status_tx(&mut tx, &run, STATUS_CANCELLED, None)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                tx.rollback().await.map_err(|source| {
-                    db_error(
-                        "terminalize_orphaned_run_cancellation_rollback_slot",
                         request.run_id,
                         source,
                     )
@@ -18154,6 +17633,17 @@ impl RunStateStore for DatabaseRunStateStore {
             .saturating_add(1)
             .saturating_sub(i64::try_from(tail_limit).unwrap_or(i64::MAX))
             .max(0);
+        run.events.extend(
+            self.canonical_terminal_projection_events(
+                &run,
+                &[
+                    (-1, head_limit as i64 - 1),
+                    (tail_start - 1, last_event_idx),
+                ],
+                true,
+            )
+            .await?,
+        );
         run.events.retain(|event| {
             event["index"].as_i64().is_some_and(|index| {
                 index <= last_event_idx && (index < head_limit as i64 || index >= tail_start)
@@ -18437,25 +17927,31 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         after_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
-        let Some((session_id, status, last_event_idx, execution_live, opening_frames)) =
-            sqlx::query_as::<_, (String, String, i64, i64, Option<String>)>(
-                "SELECT session_id, status, last_event_idx,
-                 CAST(CASE WHEN owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
-                   AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
-                 THEN 1 ELSE 0 END AS SIGNED),
-                 CASE WHEN ? < 2 AND ? < last_event_idx THEN opening_events_json ELSE NULL END
-                 FROM agent_runs WHERE user_id = ? AND run_id = ?",
-            )
+        let sql = format!("SELECT {AGENT_RUN_RECOVERY_COLUMNS},
+            CAST(CASE WHEN owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
+                AND (status IN ('running','waiting') OR (status='paused' AND waiting_for IS NOT NULL))
+                THEN 1 ELSE 0 END AS SIGNED) AS execution_live,
+            CASE WHEN ? < 2 AND ? < last_event_idx THEN opening_events_json ELSE NULL END AS opening_frames
+            FROM agent_runs WHERE user_id = ? AND run_id = ?");
+        let Some(row) = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(after_event_idx)
             .bind(after_event_idx)
             .bind(user_id)
             .bind(run_id)
             .fetch_optional(self.pool.get())
             .await
-            .map_err(|source| db_error("load_run_event_delta_head", run_id, source).to_string())?
+            .map_err(|error| error.to_string())?
         else {
             return Ok(None);
         };
+        let opening_frames: Option<String> = row
+            .try_get("opening_frames")
+            .map_err(|error| error.to_string())?;
+        let execution_live: i64 = row
+            .try_get("execution_live")
+            .map_err(|error| error.to_string())?;
+        let run = run_record_from_row(row).map_err(|error| error.to_string())?;
+        let last_event_idx = run.last_event_idx;
         let mut events = decode_opening_frames(opening_frames.as_deref())?;
         events.retain(|event| {
             event["index"]
@@ -18482,9 +17978,18 @@ impl RunStateStore for DatabaseRunStateStore {
                     .map_err(|error| error.to_string())?,
             );
         }
+        events.extend(
+            self.canonical_terminal_projection_events(
+                &run,
+                &[(after_event_idx, last_event_idx)],
+                true,
+            )
+            .await?,
+        );
+        events.sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
         Ok(Some(DurableRunEventDelta {
-            session_id,
-            status,
+            session_id: run.session_id,
+            status: run.status,
             execution_live: execution_live == 1,
             last_event_idx,
             events,
@@ -19550,6 +19055,10 @@ impl RunStateStore for DatabaseRunStateStore {
                 .collect::<DbStoreResult<Vec<_>>>()
                 .map_err(|error| error.to_string())?,
         );
+        run.events.extend(
+            self.canonical_terminal_projection_events(&run, &[(-1, run.last_event_idx)], false)
+                .await?,
+        );
         run.events
             .sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
         Ok(Some(run_status_snapshot_from_run(&run)))
@@ -19693,7 +19202,7 @@ impl RunStateStore for DatabaseRunStateStore {
             status,
             waiting_for,
             error_message,
-            forbid_open_settlement_generation,
+            expected_run_generation,
             event,
         } = request;
         if expected_statuses.is_empty() {
@@ -19741,7 +19250,7 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(GuardedRunStatusTransition::StatusConflict);
         };
-        if let Some(generation) = forbid_open_settlement_generation {
+        if let Some(generation) = expected_run_generation {
             if run.run_generation != generation {
                 tx.rollback().await.map_err(|source| {
                     db_error(
@@ -19753,54 +19262,6 @@ impl RunStateStore for DatabaseRunStateStore {
                 })?;
                 connection.release();
                 return Ok(GuardedRunStatusTransition::StatusConflict);
-            }
-            let started_key = format!("run-settlement-started:{generation}");
-            let finished_key = format!("run-settlement-finished:{generation}");
-            let accounting_key = format!("run-accounting-finalized:{generation}");
-            let started_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND idempotency_key = ?",
-            )
-            .bind(user_id)
-            .bind(run_id)
-            .bind(&started_key)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error(
-                    "guarded_transition_check_settlement_started",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            if started_count > 0 {
-                let closed_count: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM agent_run_events
-                     WHERE user_id = ? AND run_id = ? AND idempotency_key IN (?, ?)",
-                )
-                .bind(user_id)
-                .bind(run_id)
-                .bind(&finished_key)
-                .bind(&accounting_key)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|source| {
-                    db_error("guarded_transition_check_settlement_closed", run_id, source)
-                        .to_string()
-                })?;
-                if closed_count == 0 {
-                    tx.rollback().await.map_err(|source| {
-                        db_error(
-                            "guarded_transition_rollback_settlement_in_progress",
-                            run_id,
-                            source,
-                        )
-                        .to_string()
-                    })?;
-                    connection.release();
-                    return Ok(GuardedRunStatusTransition::SettlementInProgress);
-                }
             }
         }
         if expected_statuses.contains(&run.status.as_str())
@@ -19916,7 +19377,7 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(GuardedRunStatusTransition::StatusConflict);
         }
         if !self
-            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
+            .validate_new_execution_status_tx(&mut tx, &run, status, waiting_for)
             .await
             .map_err(|e| e.to_string())?
         {
@@ -22284,7 +21745,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 return Ok(DurableRunInteractionWaitOutcome::NoLongerActive);
             }
             if !self
-                .sync_session_execution_slot_after_status_tx(
+                .validate_new_execution_status_tx(
                     &mut tx,
                     &run,
                     STATUS_WAITING,
@@ -22890,12 +22351,7 @@ impl RunStateStore for DatabaseRunStateStore {
             }
             if resume_wait
                 && !self
-                    .sync_session_execution_slot_after_status_tx(
-                        &mut tx,
-                        &run,
-                        STATUS_RUNNING,
-                        None,
-                    )
+                    .validate_new_execution_status_tx(&mut tx, &run, STATUS_RUNNING, None)
                     .await
                     .map_err(|error| error.to_string())?
             {
@@ -25102,22 +24558,11 @@ fn run_event_data_or_self(
 
 fn run_status_snapshot_from_run(run: &DurableRunRecord) -> DurableRunStatusSnapshot {
     let binding = run_status_binding_from_events(&run.events);
-    let accounting = run
-        .events
-        .iter()
-        .rev()
-        .find_map(|event| {
-            (extract_event_type(event) == "run_accounting_finalized")
-                .then(|| event.get("data").cloned())
-                .flatten()
-        })
-        .or_else(|| {
-            run.events.iter().rev().find_map(|event| {
-                (extract_event_type(event) == "run_finished")
-                    .then(|| event.get("data").cloned())
-                    .flatten()
-            })
-        });
+    let accounting = run.events.iter().rev().find_map(|event| {
+        (extract_event_type(event) == "run_finished")
+            .then(|| event.get("data").cloned())
+            .flatten()
+    });
     DurableRunStatusSnapshot {
         run_id: run.run_id.clone(),
         user_id: run.user_id.clone(),
@@ -26683,12 +26128,9 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                         serde_json::Value::from(retry_after_ms),
                     );
                 }
-            } else if data.get("source").and_then(serde_json::Value::as_str)
-                == Some(crate::models::MOI_MODEL_GATEWAY_ERROR_SOURCE)
-            {
-                for key in ["retryable", "action", "http_status"] {
-                    insert_if_present(&mut out, &data, key);
-                }
+            }
+            if let Some(metadata) = crate::models::ModelGatewayErrorMetadata::from_details(&data) {
+                out.extend(metadata.wire_fields());
             }
             for key in ["run_id", "error_kind", "reason", "blocked"] {
                 insert_if_present(&mut out, &data, key);
@@ -29928,6 +29370,7 @@ mod tests {
         original_input: String,
         authority: Option<crate::session_context_coordinator::RunContextAuthority>,
         hash: Option<String>,
+        expected_binding_generation: Option<u64>,
     }
 
     impl RunContextOpeningFixture {
@@ -29946,6 +29389,7 @@ mod tests {
                 original_input,
                 authority: None,
                 hash: None,
+                expected_binding_generation: None,
             }
         }
     }
@@ -29966,7 +29410,7 @@ mod tests {
                     &self.key,
                     &self.run_id,
                     admission.generation(),
-                    None,
+                    self.expected_binding_generation,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -29982,6 +29426,208 @@ mod tests {
         fn prepared_opening(&mut self, hash: &str) -> Result<(), String> {
             self.hash = Some(hash.into());
             Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_opening_waiter_observes_controller_commit_and_binding_change() {
+        use crate::session_context_coordinator::{
+            AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
+            PreparedSessionContextCommit, SessionContextCoordinator, SessionExecutionBindingV1,
+        };
+        use astra_turn_types::{
+            ActorContextV1, ActorKindV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalDeltaModeV1,
+            CanonicalTurnDeltaV1, CoordinatorMutationV1, SessionSurfaceV1,
+        };
+        struct AnnouncedOpening(
+            RunContextOpeningFixture,
+            std::sync::Arc<tokio::sync::Notify>,
+        );
+        #[async_trait]
+        impl RunStartTransactionParticipant for AnnouncedOpening {
+            async fn prepare(&mut self) -> Result<(), String> {
+                self.1.notify_one();
+                Ok(())
+            }
+            async fn stage(
+                &mut self,
+                tx: &mut Transaction<'_, MySql>,
+                admission: &RunMutationAdmission,
+                opening: Option<&mut DurableRunOpening>,
+            ) -> Result<(), String> {
+                self.0.stage(tx, admission, opening).await
+            }
+            fn prepared_opening(&mut self, hash: &str) -> Result<(), String> {
+                self.0.prepared_opening(hash)
+            }
+        }
+        let (store, pool) = setup_database_run_state_store_it().await;
+        for binding_change in [false, true] {
+            let suffix = Uuid::new_v4();
+            let user = format!("wait-context-user-{suffix}");
+            let session = format!("wait-context-session-{suffix}");
+            let run_id = format!("wait-context-run-{suffix}");
+            insert_active_database_session_fixture(&pool, &user, &session).await;
+            let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+            let key = SessionKeyV1::owner_session("server", &user, &session, "main");
+            let mut blocker = pool.get().begin().await.unwrap();
+            let controller = if binding_change {
+                crate::storage::admit_session_execution_write(&mut blocker, &session, &user)
+                    .await
+                    .unwrap();
+                None
+            } else {
+                // A genuine Controller commit takes the lifecycle fence and
+                // waits on this separately held display row. The Run will
+                // subsequently wait behind that Controller, not race ahead.
+                let actor = ActorContextV1::owner_user(
+                    &user,
+                    "controller",
+                    ActorKindV1::Cli,
+                    SessionSurfaceV1::Cli,
+                    None,
+                    Default::default(),
+                );
+                let AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } = coordinator
+                    .acquire_writer_and_reserve_turn(
+                        &key,
+                        None,
+                        &actor,
+                        Duration::from_secs(60),
+                        "wait-writer",
+                        "wait-turn",
+                        Some(0),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("controller admission must succeed")
+                };
+                let prepared = PreparedSessionContextCommit::new(
+                    &reservation,
+                    CanonicalTurnDeltaV1 {
+                        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                        completed_turn: 1,
+                        journal_event_seq: 1,
+                        conversation_seq: 1,
+                        compaction_generation: 0,
+                        config_version_id: None,
+                        mode: CanonicalDeltaModeV1::Append,
+                        logical_segments: vec![vec![
+                            json!({"role":"assistant","content":"committed while Run waits"}),
+                        ]],
+                    },
+                    "wait-commit",
+                    true,
+                )
+                .unwrap();
+                sqlx::query("SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE")
+                    .bind(&user).bind(&session).fetch_one(&mut *blocker).await.unwrap();
+                let task_coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+                let task =
+                    tokio::spawn(
+                        async move { task_coordinator.commit_prepared_turn(&prepared).await },
+                    );
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    let mut probe = pool.get().acquire().await.unwrap();
+                    probe.close_on_drop();
+                    let fence = tokio::time::timeout(Duration::from_millis(100), sqlx::query(
+                        "SELECT user_id FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ? FOR UPDATE",
+                    ).bind(&user).bind(&session).fetch_one(&mut *probe)).await;
+                    drop(probe);
+                    if fence.is_err() {
+                        break;
+                    }
+                    fence.unwrap().unwrap();
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "Controller never acquired the lifecycle fence"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                assert!(!task.is_finished());
+                Some(task)
+            };
+            let announced = std::sync::Arc::new(tokio::sync::Notify::new());
+            let mut fixture =
+                RunContextOpeningFixture::new(pool.clone(), &user, &session, &run_id, "hi".into());
+            fixture.expected_binding_generation = Some(0);
+            let mut participant = AnnouncedOpening(fixture, announced.clone());
+            let mut run = durable_run_record(&run_id);
+            run.user_id = user.clone();
+            run.session_id = session.clone();
+            run.events = vec![json!({"event_type":"run_started", "data":{}})];
+            let task_store = store.clone();
+            let run_session = session.clone();
+            let waiter = tokio::spawn(async move {
+                let result = task_store
+                    .insert_run_with_participant(run, false, Some(&run_session), &mut participant)
+                    .await;
+                (result, participant.0.authority)
+            });
+            tokio::time::timeout(Duration::from_secs(3), announced.notified())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !waiter.is_finished(),
+                "Run admission must wait for the lifecycle owner"
+            );
+            if binding_change {
+                let binding = SessionExecutionBindingV1::server_work_default("work:waiter:main");
+                sqlx::query("INSERT INTO session_execution_bindings
+                    (isolation_domain, owner_user_id, session_id, branch_id, generation, binding_json)
+                    VALUES ('server', ?, ?, 'main', 1, ?)")
+                    .bind(&user).bind(&session).bind(serde_json::to_string(&binding).unwrap())
+                    .execute(&mut *blocker).await.unwrap();
+            }
+            blocker.commit().await.unwrap();
+            let cursor = if let Some(controller) = controller {
+                let result = tokio::time::timeout(Duration::from_secs(5), controller)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let CoordinatorMutationV1::Applied { cursor } = result else {
+                    panic!("Controller commit must apply")
+                };
+                Some(cursor)
+            } else {
+                None
+            };
+            let (result, captured) = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(cursor) = cursor {
+                assert!(matches!(
+                    result.unwrap(),
+                    DurableRunStartClaim::Started { .. }
+                ));
+                let authority = captured.unwrap();
+                assert_eq!(authority.turn, 2);
+                assert_eq!(
+                    authority.base_head.unwrap().cursor,
+                    cursor,
+                    "the post-wait opening must consume the committed Context, not an older snapshot"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "binding absence became false while admission waited"
+                );
+                assert!(captured.is_none());
+                assert!(store.load_run(&user, &run_id).await.unwrap().is_none());
+            }
+            cleanup_database_run_fixture(&pool, &user, &run_id).await;
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                .bind(&user)
+                .bind(&session)
+                .execute(pool.get())
+                .await
+                .unwrap();
         }
     }
 
@@ -30195,7 +29841,6 @@ mod tests {
     ) {
         cleanup_database_run_fixture(pool, user, run_id).await;
         for table in [
-            "agent_session_execution_slots",
             "session_context_operation_receipts",
             "session_context_authority_events",
             "session_context_heads",
@@ -30348,7 +29993,7 @@ mod tests {
                     .unwrap(),
                 other_before
             );
-            let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+            let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))")
                 .bind(&other_user).bind(&other_session).fetch_one(pool.get()).await.unwrap();
             assert_eq!(slots, 0, "failed restore rolls back Run and slot together");
             assert_eq!(
@@ -30613,14 +30258,6 @@ mod tests {
             );
 
             cleanup_database_run_fixture(&pool, &user, &run_id).await;
-            sqlx::query(
-                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user)
-            .bind(&session)
-            .execute(pool.get())
-            .await
-            .unwrap();
             sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
                 .bind(&user)
                 .bind(&session)
@@ -30993,14 +30630,6 @@ mod tests {
                 .await
                 .expect("reconcile cancellation marker commit acknowledgement")
         );
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("clean reusable execution slot");
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
             .bind(&user_id)
@@ -31230,14 +30859,6 @@ mod tests {
         for (user_id, session_id, run_id) in
             [(&user_a, &session_a, &run_a), (&user_b, &session_b, &run_b)]
         {
-            sqlx::query(
-                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .execute(pool.get())
-            .await
-            .expect("clean execution slot");
             cleanup_database_run_fixture(&pool, user_id, run_id).await;
             sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
                 .bind(user_id)
@@ -31330,14 +30951,6 @@ mod tests {
         assert_eq!(child.events, child_baseline.events);
         assert_eq!(child.last_event_idx, child_baseline.last_event_idx);
 
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("clean root-child execution slot");
         cleanup_database_run_fixture(&pool, &user_id, &child_run_id).await;
         cleanup_database_run_fixture(&pool, &user_id, &root_run_id).await;
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
@@ -31348,9 +30961,244 @@ mod tests {
             .expect("clean root-child session");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_independent_admission_fences_competing_runs_live_leases_and_unknown_effects()
+    {
+        use crate::tool_invocation_ledger::{
+            DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
+        };
+        use astra_turn_types::{
+            DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
+            ToolInvocationIdentity, ToolInvocationResultPayload, ToolInvocationState,
+            ToolInvocationTerminalOutcome,
+        };
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let user = format!("activity-user-{suffix}");
+        let session = format!("activity-session-{suffix}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let record = |id: &str| {
+            let mut run = durable_run_record(&format!("{id}-{suffix}"));
+            run.user_id = user.clone();
+            run.session_id = session.clone();
+            run
+        };
+        // Keep another Session's owners first in both physical tables. A
+        // correlated EXISTS/LIMIT must not let those rows hide this Session's
+        // active execution or unresolved custody.
+        let other_user = format!("activity-other-user-{suffix}");
+        let other_session = format!("activity-other-session-{suffix}");
+        insert_active_database_session_fixture(&pool, &other_user, &other_session).await;
+        let mut other_run = durable_run_record(&format!("other-{suffix}"));
+        other_run.user_id = other_user.clone();
+        other_run.session_id = other_session.clone();
+        store.insert_run(other_run.clone()).await.unwrap();
+        let other_identity = ToolInvocationIdentity::new(
+            &other_user,
+            &other_session,
+            &other_run.run_id,
+            "other-turn",
+            "other-call",
+        )
+        .unwrap();
+        let other_decision =
+            ToolInvocationDecision::new(&json!({"route":"server_runtime"})).unwrap();
+        let other_fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("bash", "activity-regression").unwrap(),
+            &json!({"command":"other-effect"}),
+            &other_decision.decision_id,
+        )
+        .unwrap();
+        DatabaseToolInvocationLedger::new(pool.clone())
+            .prepare(&other_identity, &other_fingerprint, &other_decision)
+            .await
+            .unwrap();
+        let left = record("left");
+        let right = record("right");
+        let remote_store = store
+            .clone()
+            .with_owner_pod_id(format!("remote-owner-{suffix}"));
+        let results = tokio::join!(
+            store.insert_run(left.clone()),
+            remote_store.insert_run(right.clone())
+        );
+        assert_eq!(
+            usize::from(results.0.is_ok()) + usize::from(results.1.is_ok()),
+            1,
+            "the contender waiting on admission must see the committed Run"
+        );
+        let (store, losing_store, winner) = if results.0.is_ok() {
+            (store, remote_store, left)
+        } else {
+            (remote_store, store, right)
+        };
+        assert!(
+            !losing_store
+                .release_owner_lease(&user, &session, &winner.run_id, winner.run_generation,)
+                .await
+                .unwrap(),
+            "another Server cannot retire the winner's lease"
+        );
+        // Terminal publication may precede executor exit. Its still-live
+        // lease must block admission even though no status blocks it now.
+        sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+            .bind(&user)
+            .bind(&winner.run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let next = record("next");
+        assert!(store.insert_run(next.clone()).await.is_err());
+        assert!(
+            store
+                .release_owner_lease(&user, &session, &winner.run_id, winner.run_generation)
+                .await
+                .unwrap()
+        );
+        store
+            .insert_run(next.clone())
+            .await
+            .expect("actual executor exit releases occupancy");
+
+        let identity = ToolInvocationIdentity::new(
+            &user,
+            &session,
+            &next.run_id,
+            "effect-turn",
+            "effect-call",
+        )
+        .unwrap();
+        let decision = ToolInvocationDecision::new(&json!({"route":"server_runtime"})).unwrap();
+        let fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("bash", "activity-regression").unwrap(),
+            &json!({"command":"external-effect"}),
+            &decision.decision_id,
+        )
+        .unwrap();
+        let ledger = DatabaseToolInvocationLedger::new(pool.clone());
+        ledger
+            .prepare(&identity, &fingerprint, &decision)
+            .await
+            .unwrap();
+        ledger
+            .claim_dispatch(
+                &identity,
+                "effect-worker",
+                90_000,
+                ToolInvocationDispatchAdmission {
+                    expected_control_epoch: -1,
+                    expected_owner_generation: next.run_generation,
+                    expected_owner_pod_id: store.owner_pod_id.clone(),
+                    expected_execution_binding_generation: None,
+                },
+            )
+            .await
+            .unwrap();
+        ledger
+            .mark_outcome_unknown(&identity, "effect-worker")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user,
+                    &session,
+                    &next.run_id,
+                    &[STATUS_RUNNING],
+                    Some(next.run_generation),
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
+        store
+            .release_owner_lease(&user, &session, &next.run_id, next.run_generation)
+            .await
+            .unwrap();
+        let final_run = record("after-effect");
+        assert!(
+            store.insert_run(final_run.clone()).await.is_err(),
+            "terminal Run and executor exit cannot discharge unknown effects"
+        );
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            &user,
+            &session,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let mut tx = pool.get().begin().await.unwrap();
+        let facts =
+            crate::storage::admit_context_execution_write_with_facts(&mut tx, &session, &user)
+                .await
+                .unwrap();
+        assert_eq!(
+            crate::session_context_coordinator::lock_session_run_execution_blocker(
+                &mut tx, &key, &facts
+            )
+            .await
+            .unwrap(),
+            Some(crate::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool)
+        );
+        tx.rollback().await.unwrap();
+        // A confirmed effect outcome, rather than a Run status or deleted
+        // pointer, is the existing custody owner's release boundary.
+        ledger
+            .compare_and_complete(
+                &identity,
+                ToolInvocationState::OutcomeUnknown,
+                None,
+                &ToolInvocationTerminalOutcome::Succeeded {
+                    result: ToolInvocationResultPayload::new(
+                        "confirmed external receipt",
+                        Default::default(),
+                        None,
+                    )
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .insert_run(final_run.clone())
+            .await
+            .expect("confirmed custody allows the next independent Run");
+        cleanup_database_run_fixture(&pool, &other_user, &other_run.run_id).await;
+        sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
+            .bind(&other_user)
+            .bind(&other_session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&other_user)
+            .bind(&other_session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        for run in [&winner, &next, &final_run] {
+            cleanup_database_run_fixture(&pool, &user, &run.run_id).await;
+        }
+        sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_execution_slot_requires_exact_active_session_on_matrixone() {
+    async fn database_independent_run_requires_exact_active_session_on_matrixone() {
         let (store, pool) = setup_database_run_state_store_it().await;
         let user_id = format!("runs-it-session-owner-{}", Uuid::new_v4());
         let foreign_user_id = format!("runs-it-session-foreign-{}", Uuid::new_v4());
@@ -31390,40 +31238,29 @@ mod tests {
                 .expect("insert exact-session execution-slot fixture");
             }
 
-            let mut tx = pool
-                .get()
-                .begin()
-                .await
-                .expect("begin execution-slot fixture");
-            let acquired = store
-                .acquire_session_execution_slot_tx(&mut tx, &user_id, &session_id, &run_id, None)
-                .await
-                .expect("evaluate exact-session execution-slot admission");
-            assert_eq!(acquired, expected, "unexpected admission for {case}");
-            tx.commit().await.expect("commit execution-slot fixture");
-            let slot_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
+            let mut run = durable_run_record(&run_id);
+            run.user_id = user_id.clone();
+            run.session_id = session_id.clone();
+            assert_eq!(
+                store.insert_run(run).await.is_ok(),
+                expected,
+                "unexpected admission for {case}"
+            );
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ?",
             )
             .bind(&user_id)
             .bind(&session_id)
             .fetch_one(pool.get())
             .await
-            .expect("load exact-session execution slot");
+            .unwrap();
             assert_eq!(
-                slot_count,
-                if expected { 1 } else { 0 },
-                "slot leak for {case}"
+                count,
+                i64::from(expected),
+                "rejected admission leaked a Run for {case}"
             );
+            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
 
-            sqlx::query(
-                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .expect("clean exact-session execution slot");
             if let Some(stored_owner) = stored_owner {
                 sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
                     .bind(stored_owner)
@@ -31473,8 +31310,7 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
+                "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
             )
             .bind(&user_id)
             .bind(&session_id)
@@ -31499,14 +31335,6 @@ mod tests {
         let session_id = format!("runs-it-claim-session-{}", Uuid::new_v4());
         let run_id = format!("runs-it-claim-run-{}", Uuid::new_v4());
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("clean run-start claim slot");
         insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
 
         let claim = |store: DatabaseRunStateStore| {
@@ -31551,14 +31379,6 @@ mod tests {
         assert_eq!(durable.session_id, session_id);
         assert_eq!(durable.last_event_idx, durable.events.len() as i64 - 1);
 
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("remove run-start claim slot");
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
             .bind(&user_id)
@@ -31569,25 +31389,25 @@ mod tests {
     }
 
     #[test]
-    fn session_execution_slot_applies_only_to_user_root_runs() {
+    fn independent_execution_admission_applies_only_to_user_root_runs() {
         let root = durable_run_record("root");
-        assert!(run_requires_session_execution_slot(&root));
+        assert!(run_requires_independent_admission(&root));
 
         let mut retry = durable_run_record("retry");
         retry.retry_of = Some("root".into());
-        assert!(!run_requires_session_execution_slot(&retry));
+        assert!(!run_requires_independent_admission(&retry));
 
         let mut child = durable_run_record("child");
         child.parent_run_id = Some("root".into());
-        assert!(!run_requires_session_execution_slot(&child));
+        assert!(!run_requires_independent_admission(&child));
 
         let mut delegated = durable_run_record("delegated");
         delegated.delegation_id = Some("delegation-1".into());
-        assert!(!run_requires_session_execution_slot(&delegated));
+        assert!(!run_requires_independent_admission(&delegated));
 
         let mut agent_parent = durable_run_record("agent-parent");
         agent_parent.agent_id = Some("orchestrator".into());
-        assert!(!run_requires_session_execution_slot(&agent_parent));
+        assert!(!run_requires_independent_admission(&agent_parent));
     }
 
     #[test]
@@ -31641,42 +31461,6 @@ mod tests {
         ));
         assert!(!durable_run_status_blocks_session(STATUS_PAUSED, None));
         assert!(!durable_run_status_blocks_session(STATUS_COMPLETED, None));
-        assert!(session_execution_slot_owner_reclaimable(
-            STATUS_COMPLETED,
-            None,
-            false,
-            false
-        ));
-        assert!(session_execution_slot_owner_reclaimable(
-            STATUS_PAUSED,
-            None,
-            false,
-            false
-        ));
-        assert!(!session_execution_slot_owner_reclaimable(
-            STATUS_RUNNING,
-            None,
-            false,
-            true
-        ));
-        assert!(!session_execution_slot_owner_reclaimable(
-            STATUS_RUNNING,
-            None,
-            true,
-            false
-        ));
-        assert!(session_execution_slot_owner_reclaimable(
-            STATUS_RUNNING,
-            None,
-            true,
-            true
-        ));
-        assert!(!session_execution_slot_owner_reclaimable(
-            STATUS_PAUSED,
-            Some("user_resume"),
-            true,
-            true
-        ));
         assert!(!durable_run_status_blocks_session(STATUS_DELEGATED, None));
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_WAITING),
@@ -32075,21 +31859,14 @@ mod tests {
             STATUS_FAILED,
             STATUS_CANCELLED,
         ] {
-            let mut slots = std::collections::HashMap::new();
             let mut run = durable_run_record(&format!("{terminal}-terminal"));
             run.status = terminal.into();
 
-            apply_in_memory_status_transition(&mut slots, &mut run, terminal, None, None, None)
+            apply_in_memory_status_transition(&mut run, terminal, None, None, None)
                 .expect("idempotent terminal replay must succeed");
-            let error = apply_in_memory_status_transition(
-                &mut slots,
-                &mut run,
-                STATUS_RUNNING,
-                None,
-                None,
-                None,
-            )
-            .expect_err("terminal run must not resurrect");
+            let error =
+                apply_in_memory_status_transition(&mut run, STATUS_RUNNING, None, None, None)
+                    .expect_err("terminal run must not resurrect");
             assert!(error.contains("terminal state immutability violated"));
             assert_eq!(run.status, terminal);
         }
@@ -32258,7 +32035,7 @@ mod tests {
                     status: STATUS_RUNNING,
                     waiting_for: None,
                     error_message: None,
-                    forbid_open_settlement_generation: None,
+                    expected_run_generation: None,
                     event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
                 },
             )
@@ -32295,7 +32072,7 @@ mod tests {
                     status: STATUS_RUNNING,
                     waiting_for: None,
                     error_message: None,
-                    forbid_open_settlement_generation: None,
+                    expected_run_generation: None,
                     event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
                 },
             )
@@ -32336,7 +32113,7 @@ mod tests {
                     status: STATUS_RUNNING,
                     waiting_for: None,
                     error_message: None,
-                    forbid_open_settlement_generation: None,
+                    expected_run_generation: None,
                     event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
                 },
             )
@@ -32362,78 +32139,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_guarded_transition_reconciles_stale_slot_cache_from_run_truth() {
-        let store = InMemoryRunStateStore::new();
-
-        let mut paused = durable_run_record("paused-stale-slot");
-        paused.status = STATUS_PAUSED.into();
-        paused.waiting_for = None;
-        store.insert_run(paused).await.unwrap();
-        {
-            let mut slots = store.execution_slots.write().await;
-            slots.insert(
-                ("u1".to_string(), "s1".to_string()),
-                "ghost-run".to_string(),
-            );
-        }
-
-        let outcome = store
-            .update_run_status_with_event_if_current_unless_session_blocked(
-                GuardedRunStatusTransitionRequest {
-                    user_id: "u1",
-                    run_id: "paused-stale-slot",
-                    expected_session_id: "s1",
-                    expected_statuses: &[STATUS_PAUSED],
-                    status: STATUS_RUNNING,
-                    waiting_for: None,
-                    error_message: None,
-                    forbid_open_settlement_generation: None,
-                    event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome, GuardedRunStatusTransition::Updated);
-        let slots = store.execution_slots.read().await;
-        assert_eq!(
-            slots
-                .get(&("u1".to_string(), "s1".to_string()))
-                .map(String::as_str),
-            Some("paused-stale-slot")
-        );
-    }
-
-    #[tokio::test]
-    async fn in_memory_blocking_start_repairs_missing_slot_before_admission() {
-        let store = InMemoryRunStateStore::new();
-        store
-            .insert_run(durable_run_record("live-owner"))
-            .await
-            .unwrap();
-        store
-            .execution_slots
-            .write()
-            .await
-            .remove(&("u1".to_string(), "s1".to_string()));
-
-        store
-            .insert_run(durable_run_record("must-not-start"))
-            .await
-            .expect_err("run truth must prevent admission when its slot index is missing");
-
-        assert_eq!(
-            store
-                .execution_slots
-                .read()
-                .await
-                .get(&("u1".to_string(), "s1".to_string()))
-                .map(String::as_str),
-            Some("live-owner")
-        );
-    }
-
-    #[tokio::test]
     async fn concurrent_guarded_resume_allows_only_one_root_run_per_session() {
         let store = std::sync::Arc::new(InMemoryRunStateStore::new());
         for run_id in ["paused-a", "paused-b"] {
@@ -32456,7 +32161,7 @@ mod tests {
                             status: STATUS_RUNNING,
                             waiting_for: None,
                             error_message: None,
-                            forbid_open_settlement_generation: None,
+                            expected_run_generation: None,
                             event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
                         },
                     )
@@ -32477,7 +32182,7 @@ mod tests {
                             status: STATUS_RUNNING,
                             waiting_for: None,
                             error_message: None,
-                            forbid_open_settlement_generation: None,
+                            expected_run_generation: None,
                             event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
                         },
                     )
@@ -33051,7 +32756,7 @@ mod tests {
                         status: STATUS_RUNNING,
                         waiting_for: None,
                         error_message: None,
-                        forbid_open_settlement_generation: None,
+                        expected_run_generation: None,
                         event: make_event("run_resumed", json!({})),
                     },
                 )
@@ -34262,11 +33967,6 @@ mod tests {
         for run_id in &all_ids {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup recovery claim slots");
     }
 
     #[tokio::test]
@@ -34467,15 +34167,6 @@ mod tests {
 
         for (run_id, session_id, _) in &fixtures {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
-            sqlx::query(
-                "DELETE FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(session_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup handoff execution slot");
             sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
                 .bind(&user_id)
                 .bind(session_id)
@@ -34589,17 +34280,8 @@ mod tests {
             })
         );
 
-        for (run_id, session_id) in &fixtures {
+        for (run_id, _) in &fixtures {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
-            sqlx::query(
-                "DELETE FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(session_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup lock-order execution slot");
         }
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
@@ -34780,11 +34462,6 @@ mod tests {
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         cleanup_database_run_fixture(&pool, &user_id, &sentinel_run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup periodic recovery slot");
     }
 
     #[tokio::test]
@@ -34972,16 +34649,232 @@ mod tests {
             .execute(pool.get())
             .await
             .unwrap();
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_canonical_terminal_claim_allocates_from_real_tail_and_fences_controls() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let user = format!("terminal-user-{suffix}");
+        let session = format!("terminal-session-{suffix}");
+        let run_id = format!("terminal-run-{suffix}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut participant =
+            RunContextOpeningFixture::new(pool.clone(), &user, &session, &run_id, "input".into());
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        run.events = vec![json!({"event_type":"run_started", "data":{}})];
+        assert!(matches!(
+            store
+                .insert_run_with_participant(run, true, Some(&session), &mut participant)
+                .await
+                .unwrap(),
+            DurableRunStartClaim::Started { .. }
+        ));
+        let opened = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        let receipt = CanonicalRunTerminalReceipt {
+            schema_version: 1,
+            user_id: user.clone(),
+            session_id: session.clone(),
+            run_id: run_id.clone(),
+            generation: opened.run_generation,
+            opening_hash: opened.opening_hash.clone().unwrap(),
+            context_admission_hash: opened.context_admission_hash.clone(),
+            outcome: CanonicalTerminalOutcome::Completed,
+            error_hash: None,
+            error_code: None,
+            error_metadata: None,
+            context: CanonicalTerminalContext::Unchanged,
+            transcript: CanonicalTerminalTranscript {
+                item_count: 0,
+                digest: format!("{:x}", Sha256::digest([])),
+                assistant_source_event_id: None,
+            },
+            usage: None,
+            tool_ledger: None,
+        };
+        let request = CanonicalRunTerminalRequest {
+            user_id: &user,
+            run_id: &run_id,
+            expected_session_id: &session,
+            expected_statuses: &[STATUS_RUNNING],
+            expected_owner_generation: opened.run_generation,
+            status: STATUS_COMPLETED,
+            waiting_for: None,
+            error_message: None,
+            error_code: None,
+            error_metadata: None,
+            cancellation_origin: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+        // Unrelated genuine events advance the actual tail. The control cursor
+        // is not an equality test against every trace/action event.
+        store
+            .append_events_batch_for_user(
+                &user,
+                &session,
+                &run_id,
+                &[json!({"event_type":"action_started", "data":{"action_id":"read"}})],
+            )
+            .await
+            .unwrap();
+        let mut tx = pool.get().begin().await.unwrap();
+        crate::storage::admit_session_execution_write(&mut tx, &session, &user)
+            .await
+            .unwrap();
+        let metadata = crate::models::ModelGatewayErrorMetadata::from_details(
+            json!({"source":"moi_model_gateway", "retryable":false, "http_status":402})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            store
+                .claim_canonical_terminal_in_transaction(
+                    &mut tx,
+                    CanonicalRunTerminalRequest {
+                        error_metadata: Some(&metadata),
+                        ..request
+                    },
+                    &receipt,
+                )
+                .await
+                .err()
+                .expect("changed metadata must not claim a terminal")
+                .contains("exact receipt")
+        );
+        let admission = store
+            .claim_canonical_terminal_in_transaction(&mut tx, request, &receipt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.authorizes_context_terminal(
+            &user,
+            &session,
+            &run_id,
+            opened.run_generation,
+            receipt.context_admission_hash.as_deref().unwrap(),
+            &receipt.opening_hash
+        ));
+        tx.rollback().await.unwrap();
+        assert!(
+            store
+                .resolve_canonical_terminal_receipt(request, &receipt)
+                .await
+                .unwrap()
+                .is_none(),
+            "rollback must not publish a terminal"
+        );
+        let active = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert_eq!(active.status, STATUS_RUNNING);
+        assert_eq!(active.last_event_idx, 1);
+        assert!(active.owner_pod_id.is_some());
+        // A stale epoch cannot claim the same opening.
+        let stale = CanonicalRunTerminalRequest {
+            expected_owner_generation: opened.run_generation + 1,
+            ..request
+        };
+        let mut stale_receipt = receipt.clone();
+        stale_receipt.generation += 1;
+        let mut tx = pool.get().begin().await.unwrap();
+        crate::storage::admit_session_execution_write(&mut tx, &session, &user)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_canonical_terminal_in_transaction(&mut tx, stale, &stale_receipt)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tx.rollback().await.unwrap();
+        // Even historical/resolved control facts take the canonical locked
+        // disposition path, rather than being mistaken for a quiet completion.
+        store
+            .append_events_batch_for_user(
+                &user,
+                &session,
+                &run_id,
+                &[user_intent_event("steering")],
+            )
+            .await
+            .unwrap();
+        let mut tx = pool.get().begin().await.unwrap();
+        crate::storage::admit_session_execution_write(&mut tx, &session, &user)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_canonical_terminal_in_transaction(&mut tx, request, &receipt)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tx.rollback().await.unwrap();
+        // Real guidance is returned by the existing control owner in the
+        // very same terminal transaction. Its closure survives lost ACK too.
+        let mut tx = pool.get().begin().await.unwrap();
+        crate::storage::admit_session_execution_write(&mut tx, &session, &user)
+            .await
+            .unwrap();
+        let CanonicalTerminalClaim::Claimed {
+            control_events: controls,
+            ..
+        } = store
+            .claim_canonical_terminal_with_controls_in_transaction(&mut tx, request, &receipt)
+            .await
+            .unwrap()
+        else {
+            panic!("guidance must converge through its canonical disposition owner")
+        };
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0]["event_type"], "user_intent_returned");
+        tx.commit().await.unwrap();
+        let committed = store
+            .resolve_canonical_terminal_receipt(request, &receipt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.completion_first(), 4);
+        assert_eq!(committed.completion_count(), 1);
+        // Later genuine facts cannot shift the reserved virtual completion.
+        sqlx::query("UPDATE agent_runs SET last_event_idx = last_event_idx + 5 WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            store
+                .resolve_canonical_terminal_receipt(request, &receipt)
+                .await
+                .unwrap()
+                .unwrap(),
+            committed
+        );
+        let mut altered = receipt.clone();
+        altered.transcript.digest = "a".repeat(64);
+        assert!(
+            store
+                .resolve_canonical_terminal_receipt(request, &altered)
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE agent_run_events SET payload_json = '{}' WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent_returned'")
+            .bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .resolve_canonical_terminal_receipt(request, &receipt)
+                .await
+                .is_err(),
+            "lost-ACK proof must reject changed control facts"
+        );
+        cleanup_execution_resume_fixture(&pool, &user, &run_id).await;
     }
 
     #[tokio::test]
@@ -35196,7 +35089,7 @@ mod tests {
         }
         assert!(store.load_run(&user, &run_id).await.unwrap().is_some());
         cleanup_database_run_fixture(&pool, &user, &run_id).await;
-        for table in ["agent_session_execution_slots", "agent_sessions"] {
+        for table in ["agent_sessions"] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
             )))
@@ -35276,7 +35169,7 @@ mod tests {
             "lost acknowledgement and replay cannot duplicate staged writes"
         );
         cleanup_database_run_fixture(&pool, &user, &run_id).await;
-        for table in ["agent_session_execution_slots", "agent_sessions"] {
+        for table in ["agent_sessions"] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
             )))
@@ -35332,8 +35225,7 @@ mod tests {
         assert_eq!(durable.events[1]["index"], 1);
         assert_eq!(
             sqlx::query_scalar::<_, Option<String>>(
-                "SELECT run_id FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
+                "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
             )
             .bind(&user_id)
             .bind(&session_id)
@@ -35345,11 +35237,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup exact create slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -35496,11 +35383,6 @@ mod tests {
         }
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup transition execution slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -35571,11 +35453,6 @@ mod tests {
         assert_eq!(durable.last_event_idx, 0);
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup empty transition execution slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -35651,11 +35528,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup zero-event create slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -35777,11 +35649,6 @@ mod tests {
             "one ordinary checkpoint and one immutable handoff"
         );
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -35899,11 +35766,6 @@ mod tests {
             before
         );
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -35992,11 +35854,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup checkpoint lock slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -36048,11 +35905,6 @@ mod tests {
         assert_eq!(durable.events[2]["index"], 2);
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup append ACK slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -36236,8 +36088,7 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
+                "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
             )
             .bind(&user_id)
             .bind(&session_b)
@@ -36248,11 +36099,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup cross-session slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -36625,11 +36471,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup frontier-order slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -36790,14 +36631,6 @@ mod tests {
             .expect("count forbidden queued resume");
             assert_eq!(resumed, 0, "{mode} queued approval must not resume");
             cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-            sqlx::query(
-                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup queued-loss slot");
             sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
                 .bind(&user_id)
                 .bind(&session_id)
@@ -37043,11 +36876,6 @@ mod tests {
         for run_id in [&stale_run, &terminal_run] {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup approval authority slots");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -37141,11 +36969,6 @@ mod tests {
                 cleanup_database_run_fixture(&pool, &user_id, &child_id).await;
             }
             cleanup_database_run_fixture(&pool, &user_id, &root_id).await;
-            sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-                .bind(&user_id)
-                .execute(pool.get())
-                .await
-                .expect("cleanup slot");
             sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
                 .bind(&user_id)
                 .execute(pool.get())
@@ -37294,11 +37117,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup atomic terminal slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -37493,11 +37311,6 @@ mod tests {
             );
             cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         }
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup terminal interaction slots");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -37660,11 +37473,6 @@ mod tests {
         assert_eq!(checkpoint.checkpoint_version, "checkpoint_v2");
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup projection frontier slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -37799,11 +37607,6 @@ mod tests {
             cleanup_database_run_fixture(&pool, user_id, run_id).await;
         }
         for user_id in [&user_a, &user_b] {
-            sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-                .bind(user_id)
-                .execute(pool.get())
-                .await
-                .expect("cleanup no-HOL slot");
             sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
                 .bind(user_id)
                 .execute(pool.get())
@@ -37941,11 +37744,6 @@ mod tests {
         }
         for user_index in 0..USERS {
             let user_id = format!("{prefix}-u{user_index}");
-            sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-                .bind(&user_id)
-                .execute(pool.get())
-                .await
-                .expect("cleanup stress slots");
             sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
                 .bind(&user_id)
                 .execute(pool.get())
@@ -38056,11 +37854,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup registration ACK-loss execution slot");
     }
 
     #[tokio::test]
@@ -38157,11 +37950,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup ACK-loss execution slot");
     }
 
     #[tokio::test]
@@ -38316,11 +38104,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup guidance ACK execution slot");
     }
 
     #[tokio::test]
@@ -38589,11 +38372,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup equivalent-winner execution slot");
     }
 
     #[tokio::test]
@@ -38697,11 +38475,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup provider execution slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
             .bind(&user_id)
             .execute(pool.get())
@@ -38852,11 +38625,6 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup interaction slot");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -39137,11 +38905,6 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup rejected Work attachment rows");
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup Work interaction slot");
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
             .bind(&user_id)
             .bind(&session_id)
@@ -40819,6 +40582,36 @@ mod tests {
                     assert_eq!(o["retryable"], false);
                     assert_eq!(o["action"], "open_billing_overview");
                     assert_eq!(o["http_status"], 402);
+                },
+            ),
+            (
+                "run_error rejects untrusted recovery fields",
+                make_event(
+                    "run_error",
+                    json!({
+                        "error":"redacted", "source":"ordinary_provider", "retryable":false,
+                        "action":"open_billing_overview", "http_status":402,
+                    }),
+                ),
+                &|out| {
+                    for field in ["source", "retryable", "action", "http_status"] {
+                        assert!(out.get(field).is_none(), "{field}");
+                    }
+                },
+            ),
+            (
+                "run_error bounds trusted recovery fields",
+                make_event(
+                    "run_error",
+                    json!({
+                        "error":"redacted", "source":"moi_model_gateway", "retryable":"false",
+                        "action":"https://private.invalid", "http_status":200, "provider_body":"private",
+                    }),
+                ),
+                &|out| {
+                    for field in ["retryable", "action", "http_status", "provider_body"] {
+                        assert!(out.get(field).is_none(), "{field}");
+                    }
                 },
             ),
             // ── approval / user_input ──
@@ -45197,8 +44990,7 @@ mod tests {
                 "{suffix}"
             );
             let slot_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
+                "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
             )
             .bind(&user_id)
             .bind(&session_id)
@@ -47029,10 +46821,6 @@ mod tests {
         }));
         run.events.push(make_event(
             "run_finished",
-            json!({"prompt_tokens": 1, "completion_tokens": 2}),
-        ));
-        run.events.push(make_event(
-            "run_accounting_finalized",
             json!({"prompt_tokens": 11, "completion_tokens": 22, "tool_calls": 3}),
         ));
         run.last_event_idx = run.events.len() as i64 - 1;
@@ -47046,7 +46834,7 @@ mod tests {
             .await
             .unwrap()
             .expect("bounded status snapshot");
-        assert_eq!(snapshot.last_event_idx, 34_002);
+        assert_eq!(snapshot.last_event_idx, 34_001);
         assert_eq!(snapshot.total_prompt_tokens, 11);
         assert_eq!(snapshot.total_completion_tokens, 22);
         assert_eq!(snapshot.total_tool_calls, 3);
@@ -47060,12 +46848,12 @@ mod tests {
             .await
             .unwrap()
             .expect("bounded run observation");
-        assert_eq!(observation.total_event_count, 34_003);
+        assert_eq!(observation.total_event_count, 34_002);
         assert_eq!(observation.run.events.len(), 64);
         assert_eq!(observation.run.events[0]["data"]["index"], 0);
         assert_eq!(
             extract_event_type(observation.run.events.last().unwrap()),
-            "run_accounting_finalized"
+            "run_finished"
         );
     }
 

@@ -1543,32 +1543,25 @@ async fn phase1_run_durability_schema_contract() {
             "restart recovery must not depend on mutable-status-leading index {removed_index}"
         );
     }
+    assert!(
+        column_names(&pool, &schema, "agent_session_execution_slots")
+            .await
+            .is_empty(),
+        "bootstrap must not create a second execution-ownership representation"
+    );
     assert_eq!(
-        index_columns(&pool, &schema, "agent_session_execution_slots", "PRIMARY").await,
-        ["user_id", "session_id"],
-        "session execution slot must be a first-class unique owner/session resource"
+        index_columns(&pool, &schema, "agent_runs", "idx_agent_runs_session_lease").await,
+        ["user_id", "session_id", "owner_lease_expires_at"]
     );
     assert_eq!(
         index_columns(
             &pool,
             &schema,
-            "agent_session_execution_slots",
-            "idx_session_execution_slots_run"
+            "agent_runs",
+            "idx_agent_runs_session_activity"
         )
         .await,
-        ["user_id", "run_id"],
-        "slot release/cleanup must be owner/run indexed"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "agent_session_execution_slots",
-            "idx_session_execution_slots_updated"
-        )
-        .await,
-        ["updated_at"],
-        "stale slot cleanup must not require scanning the slot table"
+        ["user_id", "session_id", "status", "waiting_for"]
     );
     let context_heads = column_names(&pool, &schema, "session_context_heads").await;
     for expected in [

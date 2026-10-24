@@ -891,6 +891,81 @@ pub fn is_safe_moi_model_gateway_error_code(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+/// Bounded recovery facts already sanitized by the negotiated model gateway.
+/// Provider bodies and arbitrary classified-error details never enter this value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelGatewayErrorMetadata {
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+}
+
+impl ModelGatewayErrorMetadata {
+    pub fn from_error(error: &astra_core::ClassifiedError) -> Option<Self> {
+        let details: serde_json::Value =
+            serde_json::from_str(error.details_json.as_deref()?).ok()?;
+        Self::from_details(details.as_object()?)
+    }
+
+    pub fn from_details(details: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        use serde_json::Value;
+        if details.get("source").and_then(Value::as_str) != Some(MOI_MODEL_GATEWAY_ERROR_SOURCE) {
+            return None;
+        }
+        Some(Self {
+            source: MOI_MODEL_GATEWAY_ERROR_SOURCE.into(),
+            retryable: details.get("retryable").and_then(Value::as_bool),
+            action: details
+                .get("action")
+                .and_then(Value::as_str)
+                .filter(|value| is_safe_moi_model_gateway_error_code(value))
+                .map(str::to_owned),
+            http_status: details
+                .get("http_status")
+                .and_then(Value::as_u64)
+                .filter(|status| (400..=599).contains(status))
+                .map(|status| status as u16),
+        })
+    }
+
+    /// Stored receipts must validate rather than sanitize corrupt recovery facts.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.source != MOI_MODEL_GATEWAY_ERROR_SOURCE
+            || self
+                .action
+                .as_deref()
+                .is_some_and(|action| !is_safe_moi_model_gateway_error_code(action))
+            || self
+                .http_status
+                .is_some_and(|status| !(400..=599).contains(&status))
+        {
+            return Err("invalid model gateway error metadata");
+        }
+        Ok(())
+    }
+
+    pub fn wire_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::Value;
+        let mut fields =
+            serde_json::Map::from_iter([("source".into(), Value::String(self.source.clone()))]);
+        if let Some(retryable) = self.retryable {
+            fields.insert("retryable".into(), retryable.into());
+        }
+        if let Some(action) = &self.action {
+            fields.insert("action".into(), action.clone().into());
+        }
+        if let Some(status) = self.http_status {
+            fields.insert("http_status".into(), status.into());
+        }
+        fields
+    }
+}
+
 impl ModelExecutionPlacement {
     #[must_use]
     pub fn as_str(self) -> &'static str {

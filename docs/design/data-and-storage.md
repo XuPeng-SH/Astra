@@ -9,7 +9,7 @@ Data and storage owns platform state layering, MatrixOne usage, retention, archi
 
 | Layer | Purpose |
 | --- | --- |
-| C0 control | sessions, runs, tasks, checkpoints, leases, execution slots. |
+| C0 control | sessions, runs, tasks, checkpoints, leases. |
 | C1 transcript | user-visible messages and transcript items. |
 | C2 audit facts | durable events, permissions, provider decisions. |
 | C3 trace facts | execution trace and diagnostic events. |
@@ -165,14 +165,16 @@ Retention is a product contract:
 - Diagnostic event counters commit with their inserted diagnostic rows. Exact
   replay contributes no insertion delta. They count captured diagnostics, not
   conversation turns or user-visible messages.
-- Fresh root admission commits Run identity, execution slot, Context writer/turn
-  reservation and original input transcript in one transaction. The Run opening
-  receipt proves the batch after a lost acknowledgement. Raw identity conflicts
-  roll back admission. Resume does not admit a second original input.
+- Fresh root admission commits one immutable Run opening containing the
+  original input, admitted execution contract and Context base identity, plus
+  its execution slot. It does not borrow a Controller writer or reservation,
+  or materialize a second raw input before execution. Exact opening identity
+  resolves a lost acknowledgement. Resume reuses this original admission.
 - Raw conversation history stores original input, applied user guidance and the
   actual terminal assistant answer with its model-item identity. It does not
-  copy tool starts/results: Run events, canonical Context and effect receipts
-  retain their existing responsibilities. Paused output does not occupy the
+  copy tool starts/results: canonical Context owns model continuation and the
+  invocation ledger owns governed outcomes and effect uncertainty. Run tool
+  cards are optional live presentation. Paused output does not occupy the
   final-answer identity. Compaction cannot replace the original user input.
 - Raw append validates database identity equality in bounded batches. Exact
   owner, nullable Run, role, content and immutable payload must match; the full
@@ -180,11 +182,14 @@ Retention is a product contract:
   presentation enrichment. Unknown JSON fields remain immutable identity.
   Conflicts in any chunk roll back the entire transaction, including earlier
   siblings. Exact replay allocates no new sequence and preserves enrichment.
-- Root execution commits canonical Context (segments, manifest, head, operation
-  receipt and writer release), raw transcript, Run terminal and semantic usage
-  together. Context rejection leaves the Run active; Run rejection rolls back
+- Root execution commits canonical Context (segments, manifest and head),
+  original raw transcript, one bounded Run completion receipt, semantic usage
+  and execution-slot release together. It needs no Controller operation receipt,
+  writer release, settlement markers or mirrored terminal event payloads. Context rejection leaves the Run active; Run rejection rolls back
   Context too. Lost acknowledgement resolves the exact generation-scoped Run
-  receipt and reads matching raw identities and Context commitments. Recovery
+  receipt and verifies full raw identities and the exact immutable Context
+  manifest, ordered references and segment contents. A later Session head or
+  compaction does not invalidate a retained historical commit. Recovery
   cannot repair absent history or accept conflicting facts.
 - Session list/GET/resumable recency is the later of explicit Session metadata
   activity and the current server/default-branch reachable manifest's immutable
@@ -396,3 +401,44 @@ non-unique replacement for this constraint. This fresh-schema prerequisite does
 not authorize a Run or replace generic immutable-content validation; admitted
 Run writes can omit source membership probes only after their complete opening
 and terminal authority path is installed.
+
+
+## Ordinary conversation admission and finish
+
+Existing Server sessions are authenticated and checked for current status in
+transactional Run admission. They do not require a preceding display-record
+read. New-session quota creation and provider-authorized session resolution keep
+their own boundaries. Unbound ordinary requests require binding absence during
+canonical Context capture; bound sessions require explicit execution selection.
+
+A new ordinary conversation does not automatically discover personal skills,
+the skill catalog, Work bindings, pending Work operations or legacy plans.
+Explicit skill selection, authenticated restrictions, explicit Work and recovered
+operations still use their canonical owners. The new-Run opening ACK initializes
+already-existing guidance and permission observers at its exact empty-control
+frontier; a later wake remains pending and recovery hydrates actual history.
+Cross-pod quiet startup uses the existing watcher cadence rather than another
+synchronous control scan.
+
+Opening and final persistence each use a short transaction. Model requests,
+tool execution, history materialization and optional cleanup do not run while
+those transactions hold Session locks. Final outcome, canonical Context and raw
+conversation commit together so a completed response is available to the next
+turn. Optional traces use the bounded asynchronous ingestion owner and its
+shutdown drain. Moving work to that owner does not remove it from SQL budgets.
+
+Only observations resolved against the selected canonical builtin implementation
+can omit invocation custody. Agent action semantics have one owner in
+`astra-turn-types`: `agent list` observes the in-memory child snapshot and does
+not consume delivery or require a receive inbox. Argument validation, permission,
+capability, cancellation and output governance still apply, including failures.
+Other agent actions, provider/Runner calls and actual external effects retain
+canonical prepare/dispatch/outcome custody. Public names and provider-authored
+readonly metadata cannot grant observation authority.
+
+The receive inbox is opened only for an executable invocation requiring it.
+Observation-only turns do not start mailbox polling or cleanup. For a genuinely
+used inbox, release transfers ownership immediately into the messaging owner's
+existing cancellation-safe exact-token task. Its completion is tracked by the
+application drain; final conversation persistence does not await its SQL. Pending
+messages and ambiguous delivery custody are retained by that owner.

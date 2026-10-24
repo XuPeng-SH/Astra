@@ -1985,7 +1985,6 @@ async fn cleanup_session_delete_fixture_for_owner(
         "conversation_log",
         "agent_event_edges",
         "agent_events",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
     ] {
@@ -7636,23 +7635,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
             .expect("insert skill evaluation");
     }
 
-    for (user_id, run_id) in [
-        (&owner_user_id, &owner_run_id),
-        (&other_user_id, &foreign_run_id),
-    ] {
-        sqlx::query(
-            "INSERT INTO agent_session_execution_slots
-             (user_id, session_id, run_id, acquired_at, updated_at)
-             VALUES (?, ?, ?, NOW(6), NOW(6))",
-        )
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(run_id)
-        .execute(&pool)
-        .await
-        .expect("insert session execution slot");
-    }
-
     for (user_id, run_id, artifact_id, marker) in [
         (&owner_user_id, &owner_run_id, &owner_artifact_id, "owner"),
         (
@@ -7847,10 +7829,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         1
     );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_events"), 1);
-    assert_eq!(
-        deleted_rows_for_table(&delete_audit, "agent_session_execution_slots"),
-        1
-    );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
     assert_eq!(
         deleted_rows_for_table(&delete_audit, "session_artifacts"),
@@ -7868,10 +7846,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     for (label, table) in [
         ("agent_sessions", "agent_sessions"),
         ("agent_events", "agent_events"),
-        (
-            "agent_session_execution_slots",
-            "agent_session_execution_slots",
-        ),
         ("conversation_log", "conversation_log"),
         ("session_artifacts", "session_artifacts"),
         ("ctx_snapshots", "ctx_snapshots"),

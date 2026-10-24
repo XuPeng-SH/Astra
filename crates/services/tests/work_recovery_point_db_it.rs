@@ -325,20 +325,15 @@ async fn canonical_recovery_point_capture_is_quiescent_idempotent_and_explicitly
     // A recovery point is a between-Run boundary even when no writer lease
     // remains. Exercise root-slot custody, children, and executor unwinding.
     let run_id = common::id("capture-blocking-run");
-    for (status, waiting, live_owner, slot) in [
-        ("running", None, false, false),
-        ("paused", Some("approval"), false, false),
-        ("completed", None, true, false),
-        ("completed", None, false, true),
+    for (status, waiting, live_owner) in [
+        ("running", None, false),
+        ("paused", Some("approval"), false),
+        ("completed", None, true),
     ] {
         sqlx::query("INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status, waiting_for, owner_pod_id, owner_lease_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL 60 SECOND))")
             .bind(&owner_id).bind(&session_id).bind(&run_id).bind(&run_id).bind(&run_id).bind(status)
             .bind(waiting).bind(live_owner.then_some("live-executor"))
             .execute(pool.get()).await.unwrap();
-        if slot {
-            sqlx::query("INSERT INTO agent_session_execution_slots (user_id, session_id, run_id) VALUES (?, ?, ?)")
-                .bind(&owner_id).bind(&session_id).bind(&run_id).execute(pool.get()).await.unwrap();
-        }
         assert!(
             matches!(
                 repository
@@ -349,7 +344,7 @@ async fn canonical_recovery_point_capture_is_quiescent_idempotent_and_explicitly
                     reason: astra_services::work::WorkRecoveryPointBlocker::ActiveRun,
                 })
             ),
-            "Run {status}/{waiting:?}/slot={slot} must block capture"
+            "Run {status}/{waiting:?}/live_owner={live_owner} must block capture"
         );
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM work_recovery_points WHERE owner_id = ? AND work_id = ?",
@@ -363,7 +358,7 @@ async fn canonical_recovery_point_capture_is_quiescent_idempotent_and_explicitly
             count, 0,
             "rejected capture must not publish a recovery point"
         );
-        for table in ["agent_session_execution_slots", "agent_runs"] {
+        for table in ["agent_runs"] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
             )))

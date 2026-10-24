@@ -395,6 +395,11 @@ impl DatabaseWorkRecoveryPointRepository {
             lock_recovery_context_in_transaction(&mut transaction, &key, &execution_admission)
                 .await
                 .map_err(map_context_verification_error)?;
+        if context.has_unresolved_invocations {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::UnresolvedInvocation,
+            });
+        }
         if context.execution_blocker.is_some() {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
                 reason: super::repository::WorkRecoveryPointBlocker::ActiveRun,
@@ -403,11 +408,6 @@ impl DatabaseWorkRecoveryPointRepository {
         if context.has_active_reservation {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
                 reason: super::repository::WorkRecoveryPointBlocker::ActiveReservation,
-            });
-        }
-        if context.has_unresolved_invocations {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::UnresolvedInvocation,
             });
         }
         let execution = canonical_execution_binding(&key, context.execution_binding.as_ref())?;

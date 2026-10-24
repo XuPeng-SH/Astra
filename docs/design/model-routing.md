@@ -210,7 +210,7 @@ CLI/Web selectors and WebSocket chat continue to use explicit Offerings.
 The configured strong Offering is admitted for the authenticated principal
 first. Auto treats model selection as an explicit semantic-admission boundary:
 it starts or awaits the shared bounded Work-admission request before primary
-inference under the default capacity-aware policy, `boundary_only`, or `always`.
+inference under the default `boundary_only` policy, explicit `capacity_aware`, or `always`.
 It reuses an existing decision or in-flight request. `disabled` still suppresses
 the judge, and missing or unusable assessments retain strong. Ordinary non-Auto
 turns retain their existing admission timing. The pure policy

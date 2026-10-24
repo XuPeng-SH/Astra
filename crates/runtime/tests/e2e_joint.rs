@@ -817,7 +817,6 @@ async fn cleanup_device_owner_fixture(pool: &SharedPool, user_id: &str, session_
 
 async fn cleanup_joint_run(pool: &SharedPool, user_id: &str, run_id: &str) {
     for sql in [
-        "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND run_id = ?",
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",

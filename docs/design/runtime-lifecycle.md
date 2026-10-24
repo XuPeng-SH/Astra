@@ -877,7 +877,7 @@ Runtime lifecycle migration should proceed in stages:
 | Resume after compaction | Rebuild from checkpoint, transcript, tasks, provider state. |
 | Deleted task in old UI cache | Durable projection wins; task remains hidden. |
 | Owner lease expired | New owner may recover without double-executing non-idempotent side effects. |
-| Buffered completion exists | Finalize without resuming execution when safe. |
+| Buffered answer exists | Resume through current authorization, custody and execution-slot guards; cached events never authorize completion. |
 
 The legacy webhook and schedule trigger APIs are retired. They did not admit a Run: webhook firing only returned `fired: true`, and stored cron expressions had no scheduler consumer. Executed work uses the existing Run admission and lifecycle boundaries.
 

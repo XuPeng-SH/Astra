@@ -1455,12 +1455,16 @@ impl RunEngine {
                 policy.next_renewal_at(tokio::time::Instant::now(), fence_deadline);
             let mut ownership_lost = false;
             let mut retired = false;
+            let mut executor_exited = false;
             'heartbeat: loop {
                 let mut renewal_due = false;
                 let operation_guard = loop {
                     tokio::select! {
                         biased;
-                        _ = &mut stop_rx => break 'heartbeat,
+                        _ = &mut stop_rx => {
+                            executor_exited = true;
+                            break 'heartbeat;
+                        },
                         _ = tokio::time::sleep_until(fence_deadline) => {
                             if heartbeat_authority.current_state().terminal_in_progress {
                                 // The SQL generation fence still owns a
@@ -1468,7 +1472,10 @@ impl RunEngine {
                                 // reconciliation within the durable lease's
                                 // safety margin before declaring owner loss.
                                 let settled = tokio::select! {
-                                    _ = &mut stop_rx => break 'heartbeat,
+                                    _ = &mut stop_rx => {
+                                        executor_exited = true;
+                                        break 'heartbeat;
+                                    },
                                     settled = tokio::time::timeout(policy.safety_margin, async {
                                         loop {
                                             let state = heartbeat_authority.current_state();
@@ -1553,7 +1560,10 @@ impl RunEngine {
                     );
                     let renewed = tokio::select! {
                         biased;
-                        _ = &mut stop_rx => break 'heartbeat,
+                        _ = &mut stop_rx => {
+                            executor_exited = true;
+                            break 'heartbeat;
+                        },
                         result = tokio::time::timeout_at(renewal_started_at + policy.attempt_wait, renewal) => result,
                     };
                     match renewed {
@@ -1607,6 +1617,7 @@ impl RunEngine {
                 break;
             }
 
+            retired |= heartbeat_authority.current_state().retired;
             heartbeat_authority.deactivate();
             {
                 let mut registered = authorities
@@ -1625,7 +1636,7 @@ impl RunEngine {
                 execution_lease_lost.store(true, Ordering::Release);
                 execution_cancel_token.cancel();
             }
-            if ownership_lost || retired {
+            if (ownership_lost || retired) && !executor_exited {
                 // A terminal commit is not executor exit. Keep the exact
                 // lease until the guard drops; bound a hung executor by TTL.
                 if tokio::time::timeout(policy.lease_duration, &mut stop_rx)
@@ -1636,6 +1647,11 @@ impl RunEngine {
                 }
             }
 
+            // The exact terminal receipt already cleared durable ownership.
+            // Parking/error exits still release their live generation below.
+            if retired {
+                return;
+            }
             match tokio::time::timeout(
                 OWNER_LEASE_RELEASE_MAX_WAIT,
                 engine.store.release_owner_lease(
@@ -1977,6 +1993,7 @@ impl RunEngine {
                 );
             }
             return Ok(RunExecutionAuthority {
+                opening_control_tail: None,
                 owner_generation: receipt.owner_generation,
                 owner_lease_expires_at: lease_expires_at,
             });
@@ -2022,7 +2039,7 @@ impl RunEngine {
         execution_deadline: Option<tokio::time::Instant>,
     ) -> Result<
         astra_services::runs::CollaboratorStageReceipt,
-        astra_services::runs::CollaboratorStoreError,
+        astra_services::runs::RunAdmissionError,
     > {
         let build_record = self.build_run_start_record(
             run_id,
@@ -2038,11 +2055,11 @@ impl RunEngine {
         let record = match execution_deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, build_record)
                 .await
-                .map_err(|_| astra_services::runs::CollaboratorStoreError::DeadlineExpired)??,
+                .map_err(|_| astra_services::runs::RunAdmissionError::DeadlineExpired)??,
             None => build_record.await?,
         };
         if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            return Err(astra_services::runs::CollaboratorStoreError::DeadlineExpired);
+            return Err(astra_services::runs::RunAdmissionError::DeadlineExpired);
         }
         self.store
             .insert_run_with_collaborator_stage(record, admission, execution_deadline)
@@ -2078,7 +2095,7 @@ impl RunEngine {
         context: RunStartContext,
         claim_existing: bool,
         participant: &mut dyn astra_services::runs::RunStartTransactionParticipant,
-    ) -> Result<DurableRunStartClaim, String> {
+    ) -> Result<DurableRunStartClaim, astra_services::runs::RunAdmissionError> {
         let record = self
             .build_run_start_record(
                 run_id, user_id, session_id, None, None, None, None, context, true,
@@ -2398,7 +2415,7 @@ impl RunEngine {
         status: &str,
         waiting_for: Option<&str>,
         error_message: Option<&str>,
-        forbid_open_settlement_generation: Option<u64>,
+        expected_run_generation: Option<u64>,
         event: serde_json::Value,
     ) -> Result<GuardedRunStatusTransition, String> {
         self.store
@@ -2411,7 +2428,7 @@ impl RunEngine {
                     status,
                     waiting_for,
                     error_message,
-                    forbid_open_settlement_generation,
+                    expected_run_generation,
                     event,
                 },
             )
@@ -3288,17 +3305,6 @@ impl RunEngine {
     ) -> Result<(), String> {
         self.store
             .request_session_cancellation(user_id, session_id)
-            .await
-    }
-
-    pub async fn has_open_run_settlement(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        generation: u64,
-    ) -> Result<bool, String> {
-        self.store
-            .has_open_run_settlement(user_id, run_id, generation)
             .await
     }
 
@@ -5050,6 +5056,7 @@ mod tests {
             engine
                 .confirm_started_execution_authority(
                     RunExecutionAuthority {
+                        opening_control_tail: None,
                         owner_generation: 0,
                         owner_lease_expires_at: None
                     },
@@ -5641,7 +5648,7 @@ mod tests {
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
         let engine = RunEngine::new(store.clone());
-        let guard = engine
+        let mut guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
@@ -5667,14 +5674,15 @@ mod tests {
         assert!(!lease_lost.load(Ordering::Acquire));
         assert!(!cancel.is_cancelled());
         assert_eq!(store.lease_releases(), 0, "terminal is not executor exit");
-        drop(guard);
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-            if store.lease_releases() > 0 {
-                break;
-            }
-        }
-        assert_eq!(store.lease_releases(), 1);
+        guard.stop_tx.take().unwrap().send(()).unwrap();
+        (&mut guard._join)
+            .await
+            .expect("retired heartbeat must stop without polling a completed receiver");
+        assert_eq!(
+            store.lease_releases(),
+            0,
+            "terminal receipt already retired durable ownership"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -6967,6 +6975,7 @@ mod tests {
             record: DurableRunRecord,
         ) -> Result<RunExecutionAuthority, String> {
             let authority = RunExecutionAuthority {
+                opening_control_tail: None,
                 owner_generation: record.run_generation,
                 owner_lease_expires_at: self
                     .owner_lease_duration()
@@ -7499,15 +7508,29 @@ mod tests {
             RequestedTurnInteractionMode::Headless
         );
 
-        run.events[0]["data"]
-            .as_object_mut()
-            .unwrap()
-            .remove("interaction_mode");
+        let mut presentation_only = run.clone();
+        presentation_only.events[0]["data"]["interaction_mode"] = serde_json::json!("unknown");
+        assert_eq!(
+            durable_run_effective_interaction_mode(&presentation_only).unwrap(),
+            RequestedTurnInteractionMode::Headless,
+            "delivery projection cannot replace immutable admission authority"
+        );
+
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("interaction_mode");
+        });
         assert!(durable_run_effective_interaction_mode(&run).is_err());
 
-        run.events[0]["data"]["interaction_mode"] = serde_json::json!("unknown");
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["interaction_mode"] = serde_json::json!("unknown");
+        });
         assert!(durable_run_effective_interaction_mode(&run).is_err());
-        run.events[0]["data"]["interaction_mode"] = serde_json::json!("headless");
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["interaction_mode"] = serde_json::json!("headless");
+        });
         run.events.push(run.events[0].clone());
         assert!(durable_run_effective_interaction_mode(&run).is_err());
     }
@@ -7668,18 +7691,24 @@ mod tests {
             );
             assert!(durable_run_delegation_authority(&child, "other-owner").is_err());
             let mut invalid = child.clone();
-            invalid.events[0]["data"]
-                .as_object_mut()
-                .unwrap()
-                .remove("profile_authority");
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"][0]["data"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("profile_authority");
+            });
             assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
             invalid = child.clone();
-            invalid.events[0]["data"]["profile_authority"] =
-                serde_json::json!({"kind":"ordinary_root"});
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"][0]["data"]["profile_authority"] =
+                    serde_json::json!({"kind":"ordinary_root"});
+            });
             assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
             invalid = child.clone();
-            invalid.events[0]["data"]["profile_authority"] =
-                serde_json::json!({"kind":"non_delegating", "authority":{"kind":"unknown"}});
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"][0]["data"]["profile_authority"] =
+                    serde_json::json!({"kind":"non_delegating", "authority":{"kind":"unknown"}});
+            });
             assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
             if authority == DelegationAuthority::Forbidden {
                 invalid = child;
@@ -7718,42 +7747,58 @@ mod tests {
             .unwrap();
         assert_eq!(durable_run_generation_controls(&run).unwrap(), controls);
 
-        let valid_start = run.events[0].clone();
+        let valid_start = run.opening.as_ref().unwrap().events()[0].clone();
         run.events.push(valid_start.clone());
         assert!(durable_run_generation_controls(&run).is_err());
         run.events.pop();
 
-        run.events[0]["data"]["generation_controls"] = serde_json::json!({
-            "thinking": {"mode": "off"},
-            "preserve_thinking": true
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"] = serde_json::json!({
+                "thinking": {"mode": "off"},
+                "preserve_thinking": true
+            });
         });
         assert!(durable_run_generation_controls(&run).is_err());
-        run.events[0] = valid_start.clone();
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0] = valid_start.clone();
+        });
 
-        run.events[0]["data"]["generation_controls"] = serde_json::json!({
-            "thinking": {"mode": "off"},
-            "first_output_max_tokens": null
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"] = serde_json::json!({
+                "thinking": {"mode": "off"},
+                "first_output_max_tokens": null
+            });
         });
         assert!(durable_run_generation_controls(&run).is_err());
-        run.events[0] = valid_start;
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0] = valid_start;
+        });
 
-        run.events[0]["data"]["generation_controls"]["first_output_max_tokens"] =
-            serde_json::json!(0);
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"]["first_output_max_tokens"] =
+                serde_json::json!(0);
+        });
         assert!(durable_run_generation_controls(&run).is_err());
-        run.events[0]["data"]["generation_controls"] = serde_json::json!({
-            "thinking": {"mode": "enabled", "budget_tokens": 4096},
-            "first_output_max_tokens": 4096,
-            "preserve_thinking": true
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"] = serde_json::json!({
+                "thinking": {"mode": "enabled", "budget_tokens": 4096},
+                "first_output_max_tokens": 4096,
+                "preserve_thinking": true
+            });
         });
         assert!(durable_run_generation_controls(&run).is_err());
 
-        run.events[0]["data"]["generation_controls"]["thinking"] =
-            serde_json::json!({"mode": "unknown"});
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"]["thinking"] =
+                serde_json::json!({"mode": "unknown"});
+        });
         assert!(durable_run_generation_controls(&run).is_err());
-        run.events[0]["data"]
-            .as_object_mut()
-            .unwrap()
-            .remove("generation_controls");
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("generation_controls");
+        });
         assert!(durable_run_generation_controls(&run).is_err());
     }
 
@@ -7785,13 +7830,17 @@ mod tests {
             Some(policy)
         );
 
-        let valid_start = run.events[0].clone();
-        run.events[0]["data"]
-            .as_object_mut()
-            .unwrap()
-            .remove("requested_model_policy");
+        let valid_start = run.opening.as_ref().unwrap().events()[0].clone();
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("requested_model_policy");
+        });
         assert!(durable_run_requested_model_policy(&run).is_err());
-        run.events[0] = valid_start.clone();
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0] = valid_start.clone();
+        });
         run.events.push(valid_start);
         assert!(durable_run_requested_model_policy(&run).is_err());
     }
@@ -8060,7 +8109,10 @@ mod tests {
             vec![child.events[0].clone(), child.events[0].clone()],
         ] {
             let mut invalid = child.clone();
-            invalid.events = events;
+            invalid.events = events.clone();
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"] = serde_json::to_value(events).unwrap();
+            });
             assert!(invalid.execution_authentication().is_err());
             assert!(invalid.execution_restrictions().is_err());
             assert!(invalid.admission_source().is_err());

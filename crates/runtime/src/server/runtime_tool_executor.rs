@@ -3406,6 +3406,25 @@ impl RuntimeToolExecutor {
         request
     }
 
+    pub(crate) fn invocation_requires_receive_inbox(
+        &self,
+        invocation: &astra_turn_core::tool::deferred_activation::CanonicalToolInvocation,
+    ) -> bool {
+        let call = invocation.logical_target_call();
+        let Some(name) = astra_turn_core::tool_call_shape::tool_call_name(call) else {
+            return false;
+        };
+        let Ok(args) = astra_turn_core::tool_call_shape::parse_tool_call_arguments(call) else {
+            return false;
+        };
+        let request = self.tool_execution_request(name, &args);
+        self.tool_execution_service
+            .builtin_agent_invocation_semantics(&request)
+            .ok()
+            .flatten()
+            .is_some_and(|semantics| semantics.receive_inbox)
+    }
+
     pub(crate) fn tool_execution_request_for_invocation(
         &self,
         identity: &astra_turn_types::ToolInvocationIdentity,
@@ -4070,20 +4089,10 @@ impl RuntimeToolExecutor {
         // there is no second replay cache or persistent dispatch state here.
         let route = self.tool_execution_service.routing_decision(&request);
         request.policy.work_attribution = self.work_invocation_attribution(&request, route);
-        let is_observation = request.policy.resolved_provider_policy.is_none()
-            && request.policy.delegation_model_admission.is_none()
-            && delegation_preparation.is_none()
-            && matches!(
-                route,
-                ToolExecutionRouteKind::ServerLocal
-                    | ToolExecutionRouteKind::ServerControlPlane
-                    | ToolExecutionRouteKind::ServerRuntime
-            )
-            && self
-                .tool_execution_service
-                .tool_registry()
-                .get(&request.tool_name)
-                .is_some_and(astra_runtime_env::ToolSpec::is_run_observation);
+        let is_observation = match self.tool_execution_service.is_run_observation(&request) {
+            Ok(observation) => observation && delegation_preparation.is_none(),
+            Err(result) => return GovernableRuntimeToolResult::completed(result),
+        };
         let mut dispatch_rejection = None;
         let durable_invocation = if request.policy.permission_grant.is_some() && !is_observation {
             let identity = match astra_turn_types::ToolInvocationIdentity::new(
@@ -10113,6 +10122,14 @@ pub(crate) mod tests {
     async fn tool_search_executes_without_creating_a_durable_effect_receipt() {
         let (mut executor, _dir) = test_executor();
         executor.enable_durable_invocations();
+        executor.set_current_selected_tool_offers(HashMap::from([(
+            "tool_search".into(),
+            SelectedToolOfferSnapshot::new_with_route(
+                "tool_search",
+                "server-control-plane",
+                super::super::tool_route_selection::ToolExecutionRouteKind::ServerControlPlane,
+            ),
+        )]));
         let identity = astra_turn_types::ToolInvocationIdentity::new(
             "test-user",
             "test-session",
@@ -10144,6 +10161,75 @@ pub(crate) mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn selected_readonly_failures_keep_recovery_without_creating_effect_custody() {
+        let (mut executor, _workspace) = test_executor();
+        executor.enable_durable_invocations();
+        executor.set_current_selected_tool_offers(HashMap::from([(
+            "agent".into(),
+            SelectedToolOfferSnapshot::new_with_route(
+                "agent",
+                "server-control-plane",
+                super::super::tool_route_selection::ToolExecutionRouteKind::ServerControlPlane,
+            ),
+        )]));
+        let grant = crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+            reason: None,
+            updates_hash: None,
+        };
+        // The executor has no agent context, giving a real readonly handler
+        // failure. Invalid calls use the same canonical schema error owner.
+        for (call, args, invalid) in [
+            ("handler-failure", json!({"action":"list"}), false),
+            ("missing-action", json!({}), true),
+            ("unknown-action", json!({"action":"unsupported"}), true),
+            (
+                "malformed",
+                json!({"action":"list", "_parse_error":{"kind":"truncated"}}),
+                true,
+            ),
+        ] {
+            let identity = astra_turn_types::ToolInvocationIdentity::new(
+                "test-user",
+                "test-session",
+                "run",
+                "chain",
+                call,
+            )
+            .unwrap();
+            let result = executor
+                .execute_invocation_with_metadata(
+                    "run",
+                    "chain",
+                    call,
+                    "agent",
+                    &args,
+                    None,
+                    Some(&grant),
+                )
+                .await;
+            assert!(result.is_error, "{call}: {result:?}");
+            assert!(
+                executor
+                    .durable_invocation_record_for_test(&identity)
+                    .await
+                    .is_none(),
+                "{call}"
+            );
+            if invalid {
+                let body: Value = serde_json::from_str(&result.output).unwrap();
+                assert_eq!(body["executed"], false, "{call}: {body}");
+                assert_eq!(
+                    body["error_kind"],
+                    astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+                    "{call}: {body}"
+                );
+                assert!(body["recovery_evidence"].is_object(), "{call}: {body}");
+            }
+        }
     }
 
     #[test]

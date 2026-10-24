@@ -2175,6 +2175,22 @@ impl UserIntentState {
         self.wake = wake;
     }
 
+    /// A successful new opening contains no guidance history. Consume only
+    /// readiness at/before that ACK; newer committed input remains pending.
+    pub(crate) fn bind_opening_wake(
+        &mut self,
+        mut wake: tokio::sync::watch::Receiver<i64>,
+        tail: i64,
+    ) {
+        self.durable.user_intent_cursor =
+            usize::try_from(tail).expect("opening tail is nonnegative");
+        let observed = *wake.borrow_and_update();
+        if observed > tail {
+            wake.mark_changed();
+        }
+        self.wake = Some(wake);
+    }
+
     pub(crate) fn input_wake_is_pending(&self) -> Option<bool> {
         self.wake
             .as_ref()
@@ -2453,18 +2469,6 @@ impl MessagingState {
             run_id,
             agent_id,
         });
-    }
-
-    pub(crate) async fn ensure_mailbox_for_tools(&mut self, calls: &[Value]) -> Result<(), String> {
-        if calls.iter().any(|call| {
-            matches!(
-                astra_turn_core::tool_call_shape::tool_call_name(call),
-                Some("agent" | "agent_fanout")
-            )
-        }) {
-            self.ensure_mailbox().await?;
-        }
-        Ok(())
     }
 
     pub(crate) async fn ensure_mailbox(&mut self) -> Result<(), String> {
@@ -5691,6 +5695,30 @@ pub(crate) mod tests {
 
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
+
+    #[test]
+    fn opening_control_ack_preserves_newer_guidance_and_closed_wakes() {
+        let (send, receive) = tokio::sync::watch::channel(2);
+        let mut state = UserIntentState::default();
+        state.bind_opening_wake(receive, 2);
+        assert_eq!(state.user_intent_cursor(), 2);
+        assert!(!state.should_poll_user_intents(tokio::time::Instant::now()));
+        send.send_replace(3);
+        assert!(state.should_poll_user_intents(tokio::time::Instant::now()));
+        state.note_input_poll_started();
+        assert!(!state.should_poll_user_intents(tokio::time::Instant::now()));
+        let mut attached_late = UserIntentState::default();
+        attached_late.bind_opening_wake(send.subscribe(), 2);
+        assert!(
+            attached_late.should_poll_user_intents(tokio::time::Instant::now()),
+            "input committed before attachment must remain pending"
+        );
+        drop(send);
+        assert!(
+            state.should_poll_user_intents(tokio::time::Instant::now()),
+            "closed readiness falls back to the authoritative owner"
+        );
+    }
 
     #[test]
     fn pending_intent_disposition_requires_exact_custody_and_cannot_be_replaced() {
