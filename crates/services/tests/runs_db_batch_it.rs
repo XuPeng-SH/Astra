@@ -64,6 +64,9 @@ fn make_idempotent_event(
 
 fn durable_run_record(run_id: String, user_id: String, session_id: String) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
         terminal_receipt_json: None,
         run_id,
         user_id,

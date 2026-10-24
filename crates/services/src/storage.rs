@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v107";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v108";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -168,6 +168,10 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     resolved_model_name VARCHAR(255) NULL,
     runtime_profile VARCHAR(64) NULL,
     start_request_fingerprint VARCHAR(64) NULL,
+    opening_events_json LONGTEXT NULL,
+    opening_context_json LONGTEXT NULL,
+    opening_hash VARCHAR(64) NULL,
+    context_admission_hash VARCHAR(64) NULL,
     terminal_receipt_json LONGTEXT NULL,
     work_id VARCHAR(64) NULL,
     work_branch_id VARCHAR(64) NULL,
@@ -211,6 +215,10 @@ const AGENT_RUNS_RUNTIME_AUTHORITY_COLUMNS: &[&str] = &[
     "model_offering_id",
     "resolved_model_name",
     "start_request_fingerprint",
+    "opening_events_json",
+    "opening_context_json",
+    "opening_hash",
+    "context_admission_hash",
     "terminal_receipt_json",
 ];
 const AGENT_RUNS_WORK_BINDING_COLUMNS: &[&str] =
@@ -1007,7 +1015,7 @@ impl SessionWriteAdmissionFacts {
 pub(crate) struct SessionExecutionAdmissionFacts {
     user_id: String,
     session_id: String,
-    session_status: String,
+    session_status: Option<String>,
     slot: Option<(String, chrono::NaiveDateTime)>,
 }
 
@@ -1017,7 +1025,7 @@ impl SessionExecutionAdmissionFacts {
     }
 
     pub(crate) fn session_is_active(&self) -> bool {
-        self.session_status == "active"
+        self.session_status.as_deref() == Some("active")
     }
 
     pub(crate) fn slot(&self) -> Option<&(String, chrono::NaiveDateTime)> {
@@ -1150,6 +1158,44 @@ where
 {
     let session = admit_session_event_write_with_facts(tx, session_id, user_id, false).await?;
 
+    lock_execution_slot_with_session_status(tx, session_id, user_id, Some(session.session_status))
+        .await
+}
+
+/// A standalone Context root need not have a Server display Session. Lock an
+/// existing display row when present, preserving the same deletion/slot order;
+/// absence never becomes an active-Session proof usable to create a Run.
+pub(crate) async fn admit_context_execution_write_with_facts<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+) -> Result<SessionExecutionAdmissionFacts, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    lock_agent_session_write_fence(tx, session_id, user_id).await?;
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if status.as_deref() == Some("deleting") {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    lock_execution_slot_with_session_status(tx, session_id, user_id, status).await
+}
+
+async fn lock_execution_slot_with_session_status<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+    session_status: Option<String>,
+) -> Result<SessionExecutionAdmissionFacts, sqlx::Error>
+where
+    T: TransactionConnection,
+{
     // Lock the derived slot before any run row. A missing slot is a valid
     // state; the SELECT still establishes the canonical access order for
     // engines that protect the key range on FOR UPDATE.
@@ -1171,7 +1217,7 @@ where
     Ok(SessionExecutionAdmissionFacts {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
-        session_status: session.session_status,
+        session_status,
         slot,
     })
 }
@@ -4162,7 +4208,7 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, item_seq),
             INDEX idx_transcript_owner_run (user_id, run_id),
-            INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id),
+            UNIQUE KEY uq_transcript_owner_session_source_event (user_id, session_id, source_event_id),
             INDEX idx_transcript_owner_session_commit_item
                 (user_id, session_id, canonical_completed_turn, item_seq)
         )",
@@ -5876,15 +5922,25 @@ async fn verify_core_schema_shape(
     }
     let mut indexes: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for row in query(
-        "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS
+        "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE FROM information_schema.STATISTICS
          WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
     )
     .bind(database)
     .fetch_all(pool)
     .await?
     {
+        let table: String = row.try_get("TABLE_NAME")?;
+        let index: String = row.try_get("INDEX_NAME")?;
+        if table == "session_transcript_items"
+            && index == "uq_transcript_owner_session_source_event"
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 0
+        {
+            return Err(sqlx::Error::Protocol(
+                "transcript source identity requires a unique owner/session/source constraint; recreate the database".into(),
+            ));
+        }
         indexes
-            .entry((row.try_get("TABLE_NAME")?, row.try_get("INDEX_NAME")?))
+            .entry((table, index))
             .or_default()
             .push(row.try_get("COLUMN_NAME")?);
     }
@@ -6222,7 +6278,7 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "session_transcript_items",
-        "idx_transcript_owner_session_source_event",
+        "uq_transcript_owner_session_source_event",
         &["user_id", "session_id", "source_event_id"],
     )?;
     ensure_index_shape(

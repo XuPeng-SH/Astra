@@ -3832,8 +3832,7 @@ pub struct ServerAgenticLoopHost {
 struct ExecutionHandoffContext {
     requested: tokio_util::sync::CancellationToken,
     engine: crate::server::run::engine::RunEngine,
-    reservation: astra_turn_types::TurnReservationV1,
-    original_user_message: String,
+    authority: astra_services::session_context_coordinator::RunContextAuthority,
 }
 
 /// Unfinished-turn continuation, not a committed session cursor or authority.
@@ -4091,8 +4090,6 @@ pub(crate) fn authenticated_edge_provider_tool_schemas(
 pub(crate) struct RuntimeExecutionHandoff {
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub(crate) authenticated_edge_discovery: Option<AuthenticatedEdgeDiscovery>,
-    // Audit input is immutable; original_facts.message may reflect steering.
-    pub(crate) original_user_message: String,
     // Original composed model inputs, not credentials or execution grants.
     // Restore must independently authorize capabilities before reusing these
     // contracts. The enclosing checkpoint's byte limit bounds their retention.
@@ -4125,7 +4122,7 @@ pub(crate) struct RuntimeExecutionHandoff {
     pub(crate) verification: astra_turn_types::VerificationHandoff,
     pub(crate) heavy: astra_pipeline::step_protocol::HeavyCheckpoint,
     pub(crate) recorder: astra_pipeline::step_recorder::SettledRecorderContinuation,
-    pub(crate) reservation: astra_turn_types::TurnReservationV1,
+    pub(crate) context_authority: astra_services::session_context_coordinator::RunContextAuthority,
     pub(crate) continuation: astra_turn_types::ProviderCanonicalTransitionV2,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub(crate) execution_deadline: Option<astra_services::runs::ExecutionDeadlineSnapshot>,
@@ -4153,7 +4150,7 @@ impl RuntimeExecutionHandoff {
             || checkpoint.run_id != receipt.run_id
             || checkpoint.user_id != receipt.source.key.owner_user_id
             || checkpoint.session_id != receipt.source.key.session_id
-            || receipt.turn_reservation.key != receipt.source.key
+            || receipt.authority.key != receipt.source.key
             || receipt.run_generation <= receipt.producer_generation
         {
             return Err(invalid(
@@ -4170,8 +4167,8 @@ impl RuntimeExecutionHandoff {
         .map_err(|_| invalid("adopted execution checkpoint is malformed"))?;
         if producer_run_id != receipt.run_id
             || producer_owner_generation != receipt.producer_generation
-            || payload.reservation != receipt.source
-            || payload.original_facts.session_turn != receipt.source.reserved_turn
+            || payload.context_authority != receipt.source
+            || payload.original_facts.session_turn != receipt.source.turn
         {
             return Err(invalid(
                 "execution facts do not belong to the adopted producer",
@@ -7246,14 +7243,12 @@ impl ServerAgenticLoopHost {
         &mut self,
         requested: tokio_util::sync::CancellationToken,
         engine: crate::server::run::engine::RunEngine,
-        reservation: astra_turn_types::TurnReservationV1,
-        original_user_message: String,
+        authority: astra_services::session_context_coordinator::RunContextAuthority,
     ) {
         self.execution_handoff = Some(ExecutionHandoffContext {
             requested,
             engine,
-            reservation,
-            original_user_message,
+            authority,
         });
     }
 
@@ -18534,9 +18529,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let Some(base) = state.provider_canonical_wal_base.as_ref() else {
             return Ok(false);
         };
-        if context.reservation.key.owner_user_id != self.user_id
-            || context.reservation.key.session_id != self.session_id
-            || context.reservation.reserved_turn != state.session_turn
+        if context.authority.key.owner_user_id != self.user_id
+            || context.authority.key.session_id != self.session_id
+            || context.authority.turn != state.session_turn
+            || context.authority.run_id != run_id
+            || context.authority.generation != generation
             || heavy.run_execution_budget.is_none()
             || heavy.run_execution_control.is_none()
             || heavy.run_execution_budget != state.run_execution_budget_snapshot()
@@ -18633,7 +18630,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             producer_owner_generation: generation,
             heavy: RuntimeExecutionHandoff {
                 authenticated_edge_discovery: self.authenticated_edge_discovery.clone(),
-                original_user_message: context.original_user_message.clone(),
                 edge_profile: self.edge_profile.clone(),
                 edge_provider_tool_schemas: self.edge_provider_tool_schemas.clone(),
                 tool_schemas: self.tool_schemas.clone(),
@@ -18691,7 +18687,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 recorder: state.step_recorder.capture_settled_continuation(&heavy.light)
                     .map_err(|error| classify(error.to_string()))?,
                 heavy,
-                reservation: context.reservation.clone(),
+                context_authority: context.authority.clone(),
                 continuation: plan,
                 execution_deadline: self.execution_time_budget.map(|deadline| deadline.snapshot()),
             },
@@ -24443,8 +24439,8 @@ mod tests {
         let _journal = astra_services::session_journal::JournalDirGuard::new(journal.path());
         use astra_services::runs::RunStateStore;
         use astra_services::session_context_coordinator::{
-            AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
-            ResumedExecutionTurnRequest, SessionContextCoordinator,
+            DatabaseSessionContextCoordinator, ResumedExecutionTurnRequest,
+            SessionContextCoordinator,
         };
         use sqlx::Row;
         assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
@@ -24579,45 +24575,66 @@ mod tests {
                 .with_owner_pod_id("replay-test-owner"),
         );
         let engine = crate::server::run::engine::RunEngine::new(store.clone());
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        struct OpeningParticipant {
+            coordinator: DatabaseSessionContextCoordinator,
+            key: astra_turn_types::SessionKeyV1,
+            authority: Option<astra_services::session_context_coordinator::RunContextAuthority>,
+        }
+        #[async_trait::async_trait]
+        impl astra_services::runs::RunStartTransactionParticipant for OpeningParticipant {
+            async fn stage(
+                &mut self,
+                tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+                admission: &astra_services::runs::RunMutationAdmission,
+                opening: Option<&mut astra_services::runs::DurableRunOpening>,
+            ) -> Result<(), String> {
+                let authority = self
+                    .coordinator
+                    .capture_run_opening_in_transaction(
+                        tx,
+                        admission,
+                        &self.key,
+                        "replay-run",
+                        admission.generation(),
+                        None,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                opening.ok_or("missing Run opening")?.bind_root_context(
+                    astra_services::runs::RunContextOpening {
+                        authority: authority.clone(),
+                        original_input: "\n  inspect result\t\n".into(),
+                    },
+                )?;
+                self.authority = Some(authority);
+                Ok(())
+            }
+        }
+        let mut participant = OpeningParticipant {
+            coordinator: coordinator.clone(),
+            key: astra_turn_types::SessionKeyV1::owner_session("server", &user, session, "main"),
+            authority: None,
+        };
         engine
-            .start_run_with_context(
+            .admit_run_with_context(
                 run_id,
                 &user,
                 session,
+                Some(session),
                 crate::server::run::engine::RunStartContext {
                     execution_authentication: Some(execution_authentication.clone()),
                     ..Default::default()
                 },
+                false,
+                &mut participant,
             )
             .await
             .unwrap();
-        let original_admission =
-            store.load_run(&user, run_id).await.unwrap().unwrap().events[0].clone();
-        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-        let key = astra_turn_types::SessionKeyV1::owner_session("server", &user, session, "main");
-        let actor = astra_turn_types::ActorContextV1::owner_user(
-            &user,
-            "replay-writer",
-            astra_turn_types::ActorKindV1::Cli,
-            astra_turn_types::SessionSurfaceV1::Cli,
-            None,
-            astra_turn_types::AuthorityEpochsV1::default(),
-        );
-        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = coordinator
-            .acquire_writer_and_reserve_turn(
-                &key,
-                None,
-                &actor,
-                Duration::from_secs(60),
-                "writer",
-                "turn",
-                None,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("original turn admission failed")
-        };
+        let source = participant.authority.unwrap();
+        let opened = store.load_run(&user, run_id).await.unwrap().unwrap();
+        let opening_hash = opened.opening_hash.as_deref().unwrap();
+        let original_admission = opened.events[0].clone();
         let original_profile = Map::from_iter([(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS.into(),
             json!(["Original native runtime instructions"]),
@@ -24645,7 +24662,7 @@ mod tests {
         );
         state.current_run_owner_generation = Some(0);
         state.canonical_turn_chain_id = Some("replay-chain".into());
-        state.session_turn = reservation.reserved_turn;
+        state.session_turn = source.turn;
         state.total_prompt = 123;
         state
             .skills
@@ -24657,13 +24674,13 @@ mod tests {
         state.step_recorder = astra_pipeline::step_recorder::StepRecorder::with_persistence_for_run(
             &user, session, run_id, run_id,
         );
-        state.step_recorder.begin_turn(reservation.reserved_turn);
+        state.step_recorder.begin_turn(source.turn);
         // Tool-free rounds still advance the journal; the last tool record
         // cannot reconstruct this cursor.
         state.turn_event_buffer = Some(
             astra_services::session_journal::TurnEventBuffer::begin_turn_with_round(
                 Some(session),
-                reservation.reserved_turn,
+                source.turn,
                 7,
             ),
         );
@@ -24681,8 +24698,7 @@ mod tests {
                 wake
             },
             engine.clone(),
-            reservation.clone(),
-            "\n  inspect result\t\n".into(),
+            source.clone(),
         );
         let heavy =
             crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
@@ -24693,7 +24709,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        coordinator.release_writer(&lease).await.unwrap();
         let first_claim = store
             .claim_recoverable_active_runs(1)
             .await
@@ -24737,10 +24752,9 @@ mod tests {
             run_id,
             expected_owner_generation: generation,
             checkpoint_id: &checkpoint.checkpoint_id,
-            source: &reservation,
-            actor: &actor,
+            source: &source,
+            opening_hash,
             owner_pod_id: owner,
-            ttl: Duration::from_secs(60),
         };
         // Rejection must preserve durable custody and canonical turn authority.
         sqlx::query("UPDATE agent_runs SET owner_pod_id = 'live-owner', owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
@@ -24836,6 +24850,15 @@ mod tests {
         sqlx::query("UPDATE agent_run_events SET payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
             .bind(tail).bind(&user).bind(run_id).bind(tail_index).execute(pool.get()).await.unwrap();
         for generation in 2..=4 {
+            let admission_view = store
+                .load_run_admission(&user, run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let reauthorized =
+                astra_services::AuthService::reauthorize_execution_handoff(&auth, &admission_view)
+                    .await
+                    .expect("fresh original-session authorization must precede Run activation");
             let (first, second) = tokio::join!(
                 coordinator
                     .resume_execution_turn(resume_request(generation - 1, "replay-test-owner-a")),
@@ -24872,7 +24895,7 @@ mod tests {
                 // incomplete runtime checkpoint. Test missing and explicit-null
                 // original inputs through the actual adoption boundary.
                 for missing in [true, false] {
-                    let field = "original_user_message";
+                    let field = "edge_profile";
                     let mut malformed: Value =
                         serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
                     let facts = &mut malformed["heavy"];
@@ -24917,8 +24940,18 @@ mod tests {
                     aliases: Vec::new(),
                 }]
             );
-            assert_eq!(recovered.reservation, reservation);
-            assert_eq!(recovered.original_user_message, "\n  inspect result\t\n");
+            assert_eq!(recovered.context_authority, source);
+            assert_eq!(
+                adopted
+                    .run()
+                    .opening
+                    .as_ref()
+                    .unwrap()
+                    .root_context()
+                    .unwrap()
+                    .original_input,
+                "\n  inspect result\t\n"
+            );
             assert_eq!(
                 recovered.original_facts.message,
                 "subsequent steering guidance"
@@ -24936,11 +24969,11 @@ mod tests {
                     .unwrap(),
                 checkpoint
             );
-            assert!(adopted.receipt().writer_lease.writer_epoch > lease.writer_epoch);
-            let reauthorized =
-                astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
-                    .await
-                    .expect("the live original session may reauthorize the adopted proof");
+            assert_eq!(
+                adopted.receipt().authority.writer_epoch,
+                source.writer_epoch
+            );
+            assert_eq!(adopted.receipt().authority.generation, generation);
             assert_eq!(reauthorized.user.user_id, user);
             assert_eq!(
                 reauthorized.session_id.as_deref(),
@@ -24956,12 +24989,12 @@ mod tests {
                     .execute(pool.get())
                     .await
                     .unwrap();
-                let (status, _) =
-                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
-                        .await
-                        .expect_err(
-                            "a changed provider origin cannot downgrade to local authority",
-                        );
+                let (status, _) = astra_services::AuthService::reauthorize_execution_handoff(
+                    &auth,
+                    &admission_view,
+                )
+                .await
+                .expect_err("a changed provider origin cannot downgrade to local authority");
                 assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
                 sqlx::query("DELETE FROM auth_external_identities WHERE astra_user_id = ? AND provider_id = 'memoria:changed-origin'")
                     .bind(&user)
@@ -24973,10 +25006,12 @@ mod tests {
                     .execute(pool.get())
                     .await
                     .unwrap();
-                let (status, _) =
-                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
-                        .await
-                        .expect_err("an inactive account cannot continue an adopted run");
+                let (status, _) = astra_services::AuthService::reauthorize_execution_handoff(
+                    &auth,
+                    &admission_view,
+                )
+                .await
+                .expect_err("an inactive account cannot continue an adopted run");
                 assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
                 sqlx::query("UPDATE auth_users SET is_active = 1 WHERE user_id = ?")
                     .bind(&user)
@@ -25018,16 +25053,14 @@ mod tests {
                     replacement_principal.session_id.as_deref(),
                     Some(auth_session_id.as_str())
                 );
-                let (status, _) =
-                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
-                        .await
-                        .expect_err("a new login must not replace the revoked original session");
+                let (status, _) = astra_services::AuthService::reauthorize_execution_handoff(
+                    &auth,
+                    &admission_view,
+                )
+                .await
+                .expect_err("a new login must not replace the revoked original session");
                 assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
             }
-            coordinator
-                .release_writer(&adopted.receipt().writer_lease)
-                .await
-                .unwrap();
             if generation < 4 {
                 assert!(
                     engine
@@ -25178,22 +25211,21 @@ mod tests {
                     &[],
                 );
             }
-            let reservation = astra_turn_types::TurnReservationV1 {
-                schema_version: astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION,
-                reservation_id: "handoff-reservation".into(),
+            let authority = astra_services::session_context_coordinator::RunContextAuthority {
                 key: astra_turn_types::SessionKeyV1::owner_session(
-                    "test",
+                    "server",
                     "handoff-user",
                     "handoff-session",
                     "main",
                 ),
-                lease_id: "handoff-lease".into(),
-                writer_epoch: 1,
-                expected_cursor: None,
-                reserved_turn: 1,
-                created_at_unix_ms: 0,
-                expires_at_unix_ms: 1,
-                idempotency_key: "handoff-reservation".into(),
+                run_id: "handoff-run".into(),
+                generation: 0,
+                row_exists: false,
+                base_head: None,
+                turn: 1,
+                writer_epoch: 0,
+                authority_epochs: Default::default(),
+                binding: astra_services::session_context_coordinator::RunContextBinding::Absent,
             };
             host.bind_execution_handoff(
                 {
@@ -25202,8 +25234,7 @@ mod tests {
                     wake
                 },
                 engine.clone(),
-                reservation.clone(),
-                state.message.clone(),
+                authority.clone(),
             );
             let heavy =
                 crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)

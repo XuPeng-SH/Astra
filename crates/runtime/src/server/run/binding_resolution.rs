@@ -655,7 +655,7 @@ mod tests {
             completion_checks: None,
             model_catalog_reader: None,
             message: message.to_string(),
-            conversation_authority: None,
+
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),

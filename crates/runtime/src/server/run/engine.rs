@@ -2153,6 +2153,9 @@ impl RunEngine {
             ));
         }
         let record = DurableRunRecord {
+            opening: None,
+            opening_hash: None,
+            context_admission_hash: None,
             terminal_receipt_json: None,
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
@@ -3204,6 +3207,14 @@ impl RunEngine {
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String> {
         self.store.load_run(user_id, run_id).await
+    }
+
+    pub(crate) async fn load_run_admission(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::StoredRunAdmission>, String> {
+        self.store.load_run_admission(user_id, run_id).await
     }
 
     pub async fn load_run_observation(
@@ -8647,7 +8658,7 @@ mod tests {
             completion_checks: None,
             model_catalog_reader: None,
             message: "hello".to_string(),
-            conversation_authority: None,
+
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),

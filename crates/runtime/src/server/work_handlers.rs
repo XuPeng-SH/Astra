@@ -3935,7 +3935,6 @@ pub(super) async fn post_work_branch_turn_handler(
         explain: false,
         interaction_mode: None,
         interactive_client: false,
-        conversation_authority: None,
     };
     let stream_result = state
         .execution

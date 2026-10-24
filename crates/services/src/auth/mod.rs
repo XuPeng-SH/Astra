@@ -536,11 +536,11 @@ pub trait AuthService: Send + Sync {
         self.current_principal(headers).await
     }
 
-    /// Reauthorize only an atomically adopted handoff. A serialized run id,
-    /// user id, or provider scope is not sufficient to reconstruct a principal.
+    /// Fresh authorization from a store-created canonical admission before
+    /// claiming execution. Serialized provenance alone cannot grant a principal.
     async fn reauthorize_execution_handoff(
         &self,
-        _handoff: &crate::session_context_coordinator::ResumedExecutionTurn,
+        _admission: &crate::runs::StoredRunAdmission,
     ) -> Result<AuthPrincipal, AuthHttpError> {
         Err(execution_continuation_unavailable())
     }
@@ -657,8 +657,8 @@ pub struct AuthPrincipal {
 }
 
 /// Original authenticated identity references, never retained credentials or
-/// permission to resume execution. Only AuthService may reauthorize an adopted
-/// run; a fresh login by the same user is not the original session.
+/// permission to resume execution. Only AuthService may reauthorize a stored
+/// Run admission; a fresh login by the same user is not the original session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutionAuthenticationProvenance {
@@ -2029,17 +2029,9 @@ impl AuthService for DatabaseAuthService {
 
     async fn reauthorize_execution_handoff(
         &self,
-        handoff: &crate::session_context_coordinator::ResumedExecutionTurn,
+        admission: &crate::runs::StoredRunAdmission,
     ) -> Result<AuthPrincipal, AuthHttpError> {
-        let run = handoff.run();
-        let receipt = handoff.receipt();
-        if receipt.run_id != run.run_id
-            || receipt.run_generation != run.run_generation
-            || receipt.source.key.owner_user_id != run.user_id
-            || receipt.source.key.session_id != run.session_id
-        {
-            return Err(execution_continuation_denied());
-        }
+        let run = admission.run();
 
         let provenance = run
             .execution_authentication()

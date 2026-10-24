@@ -2285,6 +2285,9 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     let now = chrono::Utc::now().to_rfc3339();
     DatabaseRunStateStore::new(pool.clone())
         .insert_run(DurableRunRecord {
+            opening: None,
+            opening_hash: None,
+            context_admission_hash: None,
             terminal_receipt_json: None,
             run_id: active_run_id.clone(),
             user_id: owner_id.clone(),

@@ -359,20 +359,28 @@ by that wake; its existing settlement completes before the next handoff boundary
 This improves checkpoint capture during shutdown, not durable parking or restart
 execution admission.
 
-The handoff's runtime payload pairs the heavy snapshot with the original turn
-reservation and a canonical WAL continuation transition. The existing transition
-already identifies its committed base and parent result; these are not duplicated
-in another log. Its pending suffix includes the last settled tool results. Writing
-this payload neither invents an inference attempt nor commits a completed user
-turn. In particular, an absent committed conversation cursor must not be replaced
-with a fabricated cursor. The payload retains the existing WAL continuation
-and heavy snapshot for checkpoint custody. The old reservation is identity
-evidence, not renewed authority. Explicit same-run resume obtains a renewed
-writer/reservation pair and checkpoint custody in one coordinator transaction
-before reconstructing execution through the existing background loop.
-The payload preserves the raw submitted user text and original audit timestamp,
-separately from the loop's current input, which steering may replace. Restoration
-must not reconstruct either immutable audit fact from the mutable prompt state.
+The handoff's runtime payload pairs the heavy snapshot with its concrete
+Run-owned Context snapshot and a canonical WAL continuation transition. The
+transition already identifies its committed base and parent result; these are
+not duplicated in another log. Its pending suffix includes the last settled
+tool results. Writing the checkpoint neither invents an inference attempt nor
+commits a completed user turn. An absent conversation cursor remains absent.
+
+Before claiming custody, explicit same-run resume freshly authenticates the
+original session and admits the exact original model identity from a canonical
+store-created admission view. It preserves the original continuation ceiling;
+a new login is not a substitute. The existing coordinator transaction then
+claims Run generation, owner lease, execution slot and checkpoint custody, and
+verifies the immutable opening hash and Context base. It issues no Controller
+writer lease, turn reservation, operation receipt or authority audit event.
+Exact retry requires the same custody frontier, current live owner and slot.
+A Controller intervention changing the admitted base fences the old execution
+even after that Controller releases its lease.
+
+The immutable Run opening owns the raw submitted user text. The handoff retains
+the loop's current input, which steering may replace, without another audit-input
+copy. Restore reads the original text from that verified opening. The payload
+has no compatibility path for retired Controller reservations or duplicate input.
 
 Original execution facts also retain the original TurnGuard. Its owning module
 validates both checkpoint serialization and restoration; recovery does not import
@@ -421,7 +429,7 @@ effects and preserves compression tracking; every new host still installs its
 local skill schema. Terminal returns reset the entry for a subsequent user turn;
 a frozen handoff does not return.
 This does not authorize a preamble checkpoint with no current step or with a step
-left over from another logical turn; actual recovery must verify the reservation
+left over from another logical turn; actual recovery must verify the Run-owned Context snapshot
 and frontier together.
 
 Pending runtime context retains its original order, payload and round, excluding

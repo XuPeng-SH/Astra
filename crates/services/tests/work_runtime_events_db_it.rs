@@ -16,6 +16,9 @@ fn work_run(
     branch_id: &str,
 ) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
         terminal_receipt_json: None,
         run_id: run_id.to_owned(),
         user_id: owner_id.to_owned(),

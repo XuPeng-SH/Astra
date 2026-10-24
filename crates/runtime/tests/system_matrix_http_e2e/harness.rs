@@ -848,6 +848,9 @@ pub async fn seed_pending_approval(
     let store = DatabaseRunStateStore::new(ctx.shared_pool.clone()).with_owner_pod_id(owner_pod_id);
     store
         .insert_run(DurableRunRecord {
+            opening: None,
+            opening_hash: None,
+            context_admission_hash: None,
             terminal_receipt_json: None,
             run_id: run_id.to_string(),
             user_id: ctx.user_id.clone(),

@@ -1338,21 +1338,12 @@ pub(crate) async fn persist_root_turn_input(
     admit_session_event_write(&mut tx, session_id, user_id, false)
         .await
         .map_err(|error| error.to_string())?;
-    persist_root_turn_input_admitted(&mut tx, user_id, session_id, item).await?;
+    append_session_transcript_items_admitted_in_tx(&mut tx, user_id, session_id, &[item])
+        .await
+        .map_err(|error| error.to_string())?;
     tx.commit().await.map_err(|error| error.to_string())?;
     connection.release();
     Ok(())
-}
-
-pub(super) async fn persist_root_turn_input_admitted(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    item: TranscriptPersistItem,
-) -> Result<(), String> {
-    append_session_transcript_items_admitted_in_tx(tx, user_id, session_id, &[item])
-        .await
-        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
