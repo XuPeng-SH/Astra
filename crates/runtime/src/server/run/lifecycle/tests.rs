@@ -12087,7 +12087,7 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
     assert_eq!(same_session.0, StatusCode::CONFLICT);
     assert_eq!(
         same_session.1.0.error_code.as_deref(),
-        Some("session_execution_occupied")
+        Some("session_execution_slot_occupied")
     );
     assert_eq!(same_session.1.0.detail, "session already has an active run");
     assert_eq!(
@@ -23854,7 +23854,7 @@ async fn create_run_conflicts_when_same_session_already_has_active_run() {
     assert_eq!(err.1.0.detail, "session already has an active run");
     assert_eq!(
         err.1.0.error_code.as_deref(),
-        Some("session_execution_occupied")
+        Some("session_execution_slot_occupied")
     );
     // No run was admitted for the second request, so this must flow through
     // the client's pre-admission-rejection contract (restore the draft, no
@@ -23914,7 +23914,7 @@ async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
     assert_eq!(err.1.0.detail, "session already has an active run");
     assert_eq!(
         err.1.0.error_code.as_deref(),
-        Some("session_execution_occupied")
+        Some("session_execution_slot_occupied")
     );
     assert_eq!(
         err.1
@@ -33422,7 +33422,7 @@ async fn durable_resume_rejects_blocking_sibling_after_cache_miss() {
     assert_eq!(error.1.0.detail, "session already has an active run");
     assert_eq!(
         error.1.0.error_code.as_deref(),
-        Some("session_execution_occupied")
+        Some("session_execution_slot_occupied")
     );
     // Deliberately different from the create_run/stream_chat start-rejection
     // sites: a resume conflict is not a new-turn admission, so it must not
@@ -33498,7 +33498,7 @@ async fn durable_resume_checks_slot_despite_buffered_completion() {
     assert_eq!(error.0, StatusCode::CONFLICT);
     assert_eq!(
         error.1.0.error_code.as_deref(),
-        Some("session_execution_occupied")
+        Some("session_execution_slot_occupied")
     );
     let durable = engine
         .load_run("user-1", "run-buffered-complete")

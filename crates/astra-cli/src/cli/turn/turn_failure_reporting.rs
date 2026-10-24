@@ -86,7 +86,7 @@ pub(crate) fn report_admission_rejection(
     let metadata = failure.partial.error_metadata.as_ref();
     if matches!(
         failure.partial.error_code.as_deref(),
-        Some("session_writer_conflict" | "session_execution_occupied")
+        Some("session_writer_conflict" | "session_execution_slot_occupied")
     ) {
         let session_id = metadata
             .and_then(|value| value.get("session_id"))
@@ -1019,7 +1019,7 @@ mod tests {
         let failure = crate::TurnFailure {
             error: "conflict".into(),
             partial: crate::PartialTurnData {
-                error_code: Some("session_execution_occupied".into()),
+                error_code: Some("session_execution_slot_occupied".into()),
                 admission_rejected: true,
                 ..Default::default()
             },

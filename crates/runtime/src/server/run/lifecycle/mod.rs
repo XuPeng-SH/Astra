@@ -212,7 +212,8 @@ const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committe
 /// of settling this as a failed, executed turn. `resume_run`'s two sites
 /// deliberately do not — a resume conflict is not a new-turn admission and
 /// must not be treated as one.
-const SESSION_EXECUTION_OCCUPIED_ERROR_CODE: &str = "session_execution_occupied";
+// Public wire spelling is pinned by the frozen MOI consumer contract.
+const SESSION_EXECUTION_OCCUPIED_ERROR_CODE: &str = "session_execution_slot_occupied";
 
 const EXECUTION_AUTHORITY_NOT_CURRENT_ERROR_CODE: &str = "execution_authority_not_current";
 
