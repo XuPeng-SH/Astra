@@ -1631,6 +1631,21 @@ Server instances remain horizontally replaceable:
 - no database query occurs per token or stream chunk;
 - hundreds of simultaneous sessions do not serialize on one global lock.
 
+Deployment-model selection currently uses a disposable 30-second cache, capped
+at 256 entries, 4 MiB of conservative retained-allocation accounting and 128 KiB
+per entry. Accounting includes keys, string/vector capacities and JSON container
+allowances; it is not a whole-process RSS limit. Larger configurations remain
+usable without being cached. Expired entries may supply the existing database-error
+fallback until eviction; inactive, missing or unauthorized selections do not gain
+that fallback. Model-name and Offering-ID namespaces remain distinct.
+
+Sixty-four fixed process-local mutexes coalesce selection misses without retaining
+per-key locks after cancellation. Hash collisions can serialize unrelated cold
+fills; cache hits do not wait for a fill lock. Existing caller deadlines and
+admission budgets still apply. Invalidation clears values without replacing locks
+or cancelling in-flight fills, and is not a cross-Server revocation protocol.
+Provider execution retains its fresh owner-scoped database authorization read.
+
 Prompt-cache identity includes actual provider, upstream model, connection, trust scope, and cache protocol. Per-turn runtime feedback remains outside the stable prompt prefix.
 
 ## Observability and audit
