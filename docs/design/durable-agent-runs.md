@@ -366,20 +366,20 @@ This improves checkpoint capture during shutdown, not durable parking or restart
 execution admission.
 
 The handoff's runtime payload pairs the heavy snapshot with its concrete
-Run-owned Context snapshot and a canonical WAL continuation transition. The
-transition already identifies its committed base and parent result; these are
-not duplicated in another log. Its pending suffix includes the last settled
-tool results. Writing the checkpoint neither invents an inference attempt nor
+Run-owned Context snapshot and a verified continuation delta. The delta binds
+the admitted durable prefix to the last settled tool boundary inside that same
+checkpoint. In-flight parent transitions are rejected; this is settled
+continuation, not recovery of an unfinished model request. Writing the checkpoint neither invents an inference attempt nor
 commits a completed user turn. An absent conversation cursor remains absent.
 
 Before claiming custody, explicit same-run resume freshly authenticates the
 original session and admits the exact original model identity from a canonical
 store-created admission view. It preserves the original continuation ceiling;
 a new login is not a substitute. The existing coordinator transaction then
-claims Run generation, owner lease, execution slot and checkpoint custody, and
+claims Run generation, owner lease and checkpoint custody, and
 verifies the immutable opening hash and Context base. It issues no Controller
 writer lease, turn reservation, operation receipt or authority audit event.
-Exact retry requires the same custody frontier, current live owner and slot.
+Exact retry requires the same custody frontier and current live owner.
 A Controller intervention changing the admitted base fences the old execution
 even after that Controller releases its lease.
 

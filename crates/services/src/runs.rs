@@ -19250,19 +19250,19 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(GuardedRunStatusTransition::StatusConflict);
         };
-        if let Some(generation) = expected_run_generation {
-            if run.run_generation != generation {
-                tx.rollback().await.map_err(|source| {
-                    db_error(
-                        "guarded_transition_rollback_generation_conflict",
-                        run_id,
-                        source,
-                    )
-                    .to_string()
-                })?;
-                connection.release();
-                return Ok(GuardedRunStatusTransition::StatusConflict);
-            }
+        if let Some(generation) = expected_run_generation
+            && run.run_generation != generation
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "guarded_transition_rollback_generation_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            connection.release();
+            return Ok(GuardedRunStatusTransition::StatusConflict);
         }
         if expected_statuses.contains(&run.status.as_str())
             && let Err(error) = ensure_terminal_status_immutable(&run, status)
