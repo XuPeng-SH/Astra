@@ -19,12 +19,13 @@ use astra_core::{
 };
 use astra_services::coordination::AgentProfile;
 use astra_services::runs::{
-    AtomicRunTerminalEventReceipt, AtomicRunTerminalSettlementRequest,
-    AtomicRunTerminalSettlementResolution, DatabaseRunStateStore, RunStateStore,
+    CanonicalRunTerminalReceipt, CanonicalRunTerminalRequest, CanonicalTerminalClaim,
+    CanonicalTerminalContext, CanonicalTerminalOutcome, CanonicalTerminalTranscript,
+    DatabaseRunStateStore, DurableCancellationOrigin, RunStateStore,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::session_context_coordinator::{
-    DatabaseSessionContextCoordinator, PreparedSessionContextCommit,
+    DatabaseSessionContextCoordinator, PreparedSessionContextCommit, RunContextAuthority,
 };
 use astra_services::skills::SkillService;
 use astra_services::{CancellationSafePoolConnection, EdgeContext};
@@ -38,7 +39,7 @@ use astra_turn_core::contracts::{
 };
 use astra_turn_core::observer::filter_memory_operation_turns;
 use astra_turn_core::trace_event::TraceContext;
-use astra_turn_types::SessionCursorV1;
+use astra_turn_types::{SessionCursorV1, transcript_content_hash, transcript_payload_identity};
 
 use crate::MatrixOneSettings;
 use crate::server::run::engine::{RunOwnerLeaseTerminalAuthority, RunOwnerLeaseTerminalOperation};
@@ -143,6 +144,7 @@ pub(crate) struct PostLoopPersistContext {
     pub(crate) expected_owner_generation: Option<u64>,
     pub(crate) owner_lease_duration: Option<Duration>,
     pub(crate) terminal_authority: Option<RunOwnerLeaseTerminalAuthority>,
+    pub(crate) owner_pod_id: Option<String>,
     pub(crate) user_message: String,
     pub(crate) hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     pub(crate) observer_worker: Option<Arc<dyn TurnObserverWorker>>,
@@ -309,8 +311,8 @@ impl PostLoopPersistContext {
 
     /// Atomically settle a root run's canonical DB evidence, semantic usage,
     /// and durable terminal. `Ok(None)` requests the existing fallback for an
-    /// ephemeral deployment or a same-generation control cancellation still
-    /// awaiting terminal convergence.
+    /// ephemeral deployment. Durable control convergence never falls back to
+    /// an independent append.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persist_atomic_terminal_settlement(
         &self,
@@ -320,7 +322,9 @@ impl PostLoopPersistContext {
         status: &str,
         waiting_for: Option<&str>,
         error_message: Option<&str>,
-        events: &[Value],
+        error_code: Option<&str>,
+        error_metadata: Option<&astra_services::models::ModelGatewayErrorMetadata>,
+        cancellation_origin: Option<astra_turn_core::orchestration_types::CancellationOrigin>,
         context_commit: Option<&PreparedSessionContextCommit>,
     ) -> Result<Option<CanonicalTerminalSettlementCommit>, String> {
         let Some(pool) = self.shared_pool.as_ref() else {
@@ -330,17 +334,23 @@ impl PostLoopPersistContext {
             Some(authority) => Some(authority.begin().await?),
             None => None,
         };
-        match persist_server_loop_canonical_terminal_settlement(
+        persist_server_loop_canonical_terminal_settlement(
             pool,
             self.atomic_terminal_canonical_append(expected_owner_generation),
             state,
             CanonicalTerminalSettlement {
                 expected_statuses,
+                expected_owner_pod_id: self
+                    .owner_pod_id
+                    .as_deref()
+                    .ok_or("terminal has no configured execution owner")?,
                 expected_owner_generation,
                 status,
                 waiting_for,
                 error_message,
-                events,
+                error_code,
+                error_metadata,
+                cancellation_origin,
                 prompt_tokens: state.provider_input_tokens(),
                 completion_tokens: state.total_completion,
                 tool_calls: state.total_tool_calls,
@@ -349,34 +359,7 @@ impl PostLoopPersistContext {
             terminal_operation,
         )
         .await
-        {
-            Ok(commit) => Ok(Some(commit)),
-            // The terminal CAS can lose to an accepted cancellation marker.
-            // Rollback left no canonical loop evidence, so let the lifecycle
-            // persist that evidence and use its owner-fenced fallback to
-            // converge the authoritative cancelled terminal.
-            Err(error) if error.contains("lost durable execution authority") => {
-                let store = DatabaseRunStateStore::new(pool.clone());
-                let control = store.load_run_control(&self.user_id, &self.run_id).await?;
-                let snapshot = store
-                    .load_run_status_snapshot(&self.user_id, &self.run_id)
-                    .await?;
-                let cancellation_won = control.zip(snapshot).is_some_and(|(control, snapshot)| {
-                    snapshot.run_generation == expected_owner_generation
-                        && matches!(
-                            control.status.as_str(),
-                            STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
-                        )
-                        && control.cancellation_requested
-                });
-                if cancellation_won {
-                    Ok(None)
-                } else {
-                    Err(error)
-                }
-            }
-            Err(error) => Err(error),
-        }
+        .map(Some)
     }
 
     pub(crate) async fn materialize_run_transcript_evidence(
@@ -423,11 +406,15 @@ pub(crate) struct CanonicalLoopAppend<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct CanonicalTerminalSettlement<'a> {
     pub(crate) expected_statuses: &'a [&'a str],
+    pub(crate) expected_owner_pod_id: &'a str,
     pub(crate) expected_owner_generation: u64,
     pub(crate) status: &'a str,
     pub(crate) waiting_for: Option<&'a str>,
     pub(crate) error_message: Option<&'a str>,
-    pub(crate) events: &'a [Value],
+    pub(crate) error_code: Option<&'a str>,
+    pub(crate) error_metadata: Option<&'a astra_services::models::ModelGatewayErrorMetadata>,
+    pub(crate) cancellation_origin:
+        Option<astra_turn_core::orchestration_types::CancellationOrigin>,
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) tool_calls: u32,
@@ -436,6 +423,7 @@ pub(crate) struct CanonicalTerminalSettlement<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CanonicalTerminalSettlementCommit {
+    pub(crate) terminal_status: Option<&'static str>,
     pub(crate) canonical_context_cursor: Option<SessionCursorV1>,
     pub(crate) terminal_events: Vec<Value>,
     pub(crate) terminal_assistant_source_event_id: Option<String>,
@@ -444,8 +432,8 @@ pub(crate) struct CanonicalTerminalSettlementCommit {
 fn atomic_terminal_request<'a>(
     append: &'a CanonicalLoopAppend<'a>,
     settlement: CanonicalTerminalSettlement<'a>,
-) -> AtomicRunTerminalSettlementRequest<'a> {
-    AtomicRunTerminalSettlementRequest {
+) -> CanonicalRunTerminalRequest<'a> {
+    CanonicalRunTerminalRequest {
         user_id: append.user_id,
         run_id: append.run_id,
         expected_session_id: append.session_id,
@@ -454,7 +442,19 @@ fn atomic_terminal_request<'a>(
         status: settlement.status,
         waiting_for: settlement.waiting_for,
         error_message: settlement.error_message,
-        events: settlement.events,
+        error_code: settlement.error_code,
+        error_metadata: settlement.error_metadata,
+        cancellation_origin: settlement.cancellation_origin.map(|origin| match origin {
+            astra_turn_core::orchestration_types::CancellationOrigin::User => {
+                DurableCancellationOrigin::User
+            }
+            astra_turn_core::orchestration_types::CancellationOrigin::Runtime => {
+                DurableCancellationOrigin::Runtime
+            }
+            astra_turn_core::orchestration_types::CancellationOrigin::Unverified => {
+                DurableCancellationOrigin::Unverified
+            }
+        }),
         prompt_tokens: settlement.prompt_tokens,
         completion_tokens: settlement.completion_tokens,
         tool_calls: settlement.tool_calls,
@@ -496,76 +496,28 @@ async fn verify_canonical_append_evidence(
     Ok(())
 }
 
-async fn resolve_existing_atomic_terminal_settlement(
+async fn verify_terminal_context_evidence(
     pool: &SharedPool,
-    append: &CanonicalLoopAppend<'_>,
-    state: &AgenticLoopState,
     settlement: CanonicalTerminalSettlement<'_>,
-    expected_receipts: Option<&[AtomicRunTerminalEventReceipt]>,
-) -> Result<
-    Option<(
-        DatabaseRunStateStore,
-        astra_services::runs::AtomicRunTerminalSettlementCommit,
-    )>,
-    String,
-> {
-    let store = DatabaseRunStateStore::new(pool.clone());
-    let resolution = store
-        .resolve_atomic_terminal_settlement(
-            atomic_terminal_request(append, settlement),
-            expected_receipts,
-        )
-        .await?;
-    let Some(commit) = classify_authoritative_terminal_resolution(resolution)? else {
-        return Ok(None);
-    };
-    let expected_cursor = settlement
-        .context_commit
-        .map(PreparedSessionContextCommit::cursor);
-    verify_canonical_append_evidence(pool, append, state, expected_cursor.as_ref()).await?;
-    Ok(Some((store, commit)))
-}
-
-fn classify_authoritative_terminal_resolution(
-    resolution: AtomicRunTerminalSettlementResolution,
-) -> Result<Option<astra_services::runs::AtomicRunTerminalSettlementCommit>, String> {
-    match resolution {
-        AtomicRunTerminalSettlementResolution::NotCommitted => Ok(None),
-        AtomicRunTerminalSettlementResolution::Conflict(reason) => Err(format!(
-            "authoritative atomic terminal resolution conflict: {reason}"
-        )),
-        AtomicRunTerminalSettlementResolution::Exact(commit) => Ok(Some(commit)),
+    receipt: &CanonicalRunTerminalReceipt,
+) -> Result<(), String> {
+    if let CanonicalTerminalContext::Advanced {
+        cursor,
+        commit_hash,
+    } = &receipt.context
+    {
+        DatabaseSessionContextCoordinator::new(pool.clone())
+            .verify_prepared_run_context_commit(
+                settlement
+                    .context_commit
+                    .ok_or("advanced terminal has no prepared Context")?,
+                cursor,
+                commit_hash,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
     }
-}
-
-fn finish_authoritatively_resolved_terminal(
-    terminal: astra_services::runs::AtomicRunTerminalSettlementCommit,
-    append: &CanonicalLoopAppend<'_>,
-    state: &AgenticLoopState,
-    terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
-    context_commit: Option<&PreparedSessionContextCommit>,
-) -> CanonicalTerminalSettlementCommit {
-    if let Some(operation) = terminal_operation {
-        operation.retire();
-    }
-    CanonicalTerminalSettlementCommit {
-        canonical_context_cursor: context_commit.map(PreparedSessionContextCommit::cursor),
-        terminal_events: terminal.committed_events,
-        terminal_assistant_source_event_id: append
-            .include_terminal_assistant
-            .then(|| {
-                terminal_assistant_transcript_item(
-                    append.user_id,
-                    append.session_id,
-                    append.run_id,
-                    append.trace_context.as_ref(),
-                    append.user_message,
-                    state,
-                )
-                .map(|item| item.source_event_id)
-            })
-            .flatten(),
-    }
+    Ok(())
 }
 
 /// Append the complete durable loop record through one transaction for roots
@@ -590,25 +542,6 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     settlement: CanonicalTerminalSettlement<'_>,
     terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    let mut bound_events = settlement.events.to_vec();
-    if let Some(context) = settlement.context_commit {
-        let event = bound_events
-            .iter_mut()
-            .find(|event| {
-                event.get("event_type").and_then(Value::as_str) == Some("run_settlement_finished")
-            })
-            .ok_or_else(|| {
-                "canonical context settlement requires its terminal receipt".to_string()
-            })?;
-        event
-            .as_object_mut()
-            .ok_or_else(|| "invalid terminal receipt".to_string())?
-            .insert("canonical_context".into(), context.terminal_binding());
-    }
-    let settlement = CanonicalTerminalSettlement {
-        events: &bound_events,
-        ..settlement
-    };
     // Once an exact-generation terminal transaction may have reached COMMIT,
     // dropping its future at the lease deadline would bypass the existing
     // lost-acknowledgement resolution and report a committed run as failed.
@@ -625,148 +558,141 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     Ok(commit)
 }
 
+struct PreparedCanonicalTerminal {
+    receipt: CanonicalRunTerminalReceipt,
+    authority: Option<RunContextAuthority>,
+}
+
+async fn prepare_canonical_terminal(
+    pool: &SharedPool,
+    append: &CanonicalLoopAppend<'_>,
+    state: &AgenticLoopState,
+    settlement: CanonicalTerminalSettlement<'_>,
+    items: &[TranscriptPersistItem],
+) -> Result<PreparedCanonicalTerminal, String> {
+    let (opening_hash, authority) = if let Some(context) = settlement.context_commit {
+        let authority = context
+            .run_context_authority()
+            .ok_or("Run terminal cannot borrow Controller authority")?;
+        (
+            context
+                .opening_hash()
+                .ok_or("terminal Context has no opening identity")?
+                .to_owned(),
+            Some(authority.clone()),
+        )
+    } else {
+        // Legitimate empty/no-Context outcomes use immutable opening data. This
+        // is a cold preparation read, never an execution or mutation grant.
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id(settlement.expected_owner_pod_id);
+        let stored = store
+            .load_run_admission(append.user_id, append.run_id)
+            .await?
+            .ok_or("terminal Run is missing")?;
+        let run = stored.run();
+        let mut authority = run
+            .opening
+            .as_ref()
+            .and_then(|opening| opening.root_context())
+            .map(|context| context.authority.clone());
+        if let Some(authority) = &mut authority {
+            authority.generation = settlement.expected_owner_generation;
+        }
+        (
+            run.opening_hash
+                .clone()
+                .ok_or("terminal Run has no immutable opening")?,
+            authority,
+        )
+    };
+    let request = atomic_terminal_request(append, settlement);
+    let outcome = CanonicalRunTerminalReceipt::outcome_for_request(request)?;
+    let context = if authority.is_none() {
+        CanonicalTerminalContext::Unowned
+    } else if matches!(outcome, CanonicalTerminalOutcome::Cancelled { .. }) {
+        CanonicalTerminalContext::Revoked
+    } else if let Some(prepared) = settlement.context_commit {
+        CanonicalTerminalContext::Advanced {
+            cursor: prepared.cursor(),
+            commit_hash: prepared.request_hash().into(),
+        }
+    } else {
+        CanonicalTerminalContext::Unchanged
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"astra.run-terminal-transcript.v1\0");
+    hash.update((items.len() as u64).to_be_bytes());
+    let mut offset = 0;
+    while offset < items.len() {
+        let chunk = transcript_chunk(items, offset).map_err(|error| error.to_string())?;
+        for prepared in &chunk {
+            for field in [
+                prepared.item.source_event_id.as_str(),
+                prepared.item.run_id.as_deref().unwrap_or(""),
+            ] {
+                hash.update((field.len() as u64).to_be_bytes());
+                hash.update(field.as_bytes());
+            }
+            hash.update(
+                transcript_content_hash(
+                    prepared.item.role,
+                    &prepared.item.content,
+                    prepared.payload_identity.as_deref(),
+                )
+                .as_bytes(),
+            );
+        }
+        offset += chunk.len();
+    }
+    let ledger = state
+        .tool_ledger_receipt
+        .receipt(append.run_id, settlement.expected_owner_generation);
+    let receipt = CanonicalRunTerminalReceipt {
+        schema_version: 1,
+        user_id: append.user_id.into(),
+        session_id: append.session_id.into(),
+        run_id: append.run_id.into(),
+        generation: settlement.expected_owner_generation,
+        opening_hash,
+        context_admission_hash: authority
+            .as_ref()
+            .map(RunContextAuthority::admission_fingerprint),
+        outcome,
+        error_hash: CanonicalRunTerminalReceipt::error_hash(settlement.error_message),
+        error_code: request.error_code.map(str::to_owned),
+        error_metadata: settlement.error_metadata.cloned(),
+        context,
+        transcript: CanonicalTerminalTranscript {
+            item_count: u32::try_from(items.len()).map_err(|_| "raw transcript count overflow")?,
+            digest: format!("{:x}", hash.finalize()),
+            assistant_source_event_id: items
+                .iter()
+                .rev()
+                .find(|item| item.role == "assistant")
+                .map(|item| item.source_event_id.clone()),
+        },
+        usage: state.qualified_usage,
+        tool_ledger: (ledger.validate().is_ok() && ledger.attempted == settlement.tool_calls)
+            .then_some(ledger),
+    };
+    receipt.validate()?;
+    Ok(PreparedCanonicalTerminal { receipt, authority })
+}
+
 async fn persist_server_loop_canonical_append_inner(
     pool: &SharedPool,
     append: CanonicalLoopAppend<'_>,
     state: &AgenticLoopState,
-    settlement: Option<CanonicalTerminalSettlement<'_>>,
+    mut settlement: Option<CanonicalTerminalSettlement<'_>>,
     mut terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    if let Some(settlement) = settlement {
-        if append.expected_owner_generation != Some(settlement.expected_owner_generation) {
-            return Err(
-                "canonical append and terminal settlement disagree on execution generation"
-                    .to_string(),
-            );
-        }
+    if let Some(settlement) = settlement
+        && append.expected_owner_generation != Some(settlement.expected_owner_generation)
+    {
+        return Err("canonical append and terminal disagree on execution generation".into());
     }
-    // Root and delegated run tasks are explicitly abortable during shutdown
-    // and ownership loss. Hold the physical checkout outside the SQLx
-    // transaction so cancellation closes it instead of returning a live
-    // session-fence transaction to the shared pool.
-    let mut connection = match CancellationSafePoolConnection::acquire(pool.get()).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            let msg = format!("failed to acquire MO connection: {}", error);
-            tracing::warn!(
-                session_id = %append.session_id,
-                error = %error,
-                "post-loop: failed to acquire canonical MO connection; no persistence attempted"
-            );
-            return Err(msg);
-        }
-    };
-    let mut tx = match connection.begin().await {
-        Ok(tx) => tx,
-        Err(error) => {
-            let msg = format!("failed to begin MO transaction: {}", error);
-            tracing::warn!(
-                session_id = %append.session_id,
-                error = %error,
-                "post-loop: failed to begin canonical MO transaction; no persistence attempted"
-            );
-            return Err(msg);
-        }
-    };
-    let terminal_admission = if settlement.is_some() {
-        Some(
-            DatabaseRunStateStore::new(pool.clone())
-                .admit_mutation_in_transaction(
-                    &mut tx,
-                    append.user_id,
-                    append.session_id,
-                    append.run_id,
-                )
-                .await
-                .map_err(|error| format!("canonical session admission failed: {error}"))?
-                .ok_or_else(|| {
-                    format!(
-                        "canonical session admission failed: {}",
-                        sqlx::Error::RowNotFound
-                    )
-                })?,
-        )
-    } else {
-        if append.expected_owner_generation.is_some() {
-            astra_services::storage::admit_session_execution_write(
-                &mut tx,
-                append.session_id,
-                append.user_id,
-            )
-            .await
-        } else {
-            astra_services::storage::admit_session_scoped_run_write(
-                &mut tx,
-                append.session_id,
-                append.user_id,
-                append.run_id,
-            )
-            .await
-        }
-        .map_err(|error| format!("canonical session admission failed: {error}"))?;
-        None
-    };
-
-    if let Some(expected_owner_generation) = append.expected_owner_generation {
-        let Some(lease_duration) = append.owner_lease_duration else {
-            let _ = tx.rollback().await;
-            return Err(
-                "canonical append has execution authority but no durable lease duration"
-                    .to_string(),
-            );
-        };
-        let lease_micros = i64::try_from(lease_duration.as_micros()).unwrap_or(i64::MAX);
-        let owner_fence_sql =
-            if settlement.is_some_and(|settlement| settlement.status == STATUS_CANCELLED) {
-                "UPDATE agent_runs
-             SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND run_generation = ?
-               AND owner_lease_expires_at >= NOW(6)
-               AND status IN ('running', 'waiting', 'paused')"
-            } else {
-                "UPDATE agent_runs
-             SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND run_generation = ?
-               AND owner_lease_expires_at >= NOW(6)
-               AND status IN ('running', 'waiting')"
-            };
-        let fenced = sqlx::query(owner_fence_sql)
-            .bind(lease_micros)
-            .bind(append.user_id)
-            .bind(append.session_id)
-            .bind(append.run_id)
-            .bind(expected_owner_generation as i64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| format!("canonical execution-authority fence failed: {error}"))?;
-        if fenced.rows_affected() == 0 {
-            let _ = tx.rollback().await;
-            drop(connection);
-            if let Some(settlement) = settlement
-                && let Some((_store, terminal)) = resolve_existing_atomic_terminal_settlement(
-                    pool, &append, state, settlement, None,
-                )
-                .await?
-            {
-                return Ok(finish_authoritatively_resolved_terminal(
-                    terminal,
-                    &append,
-                    state,
-                    terminal_operation.take(),
-                    settlement.context_commit,
-                ));
-            }
-            return Err(format!(
-                "canonical append lost durable execution authority at generation {expected_owner_generation}"
-            ));
-        }
-    }
-
-    // The transcript gets one ordered durable sequence in this same
-    // transaction, including recoverable root terminal assistant evidence.
-    // Cursor promotion later certifies the contiguous committed projection.
-    if let Err(error) = persist_server_loop_transcript_items_in_tx(
-        &mut tx,
+    let items = transcript_items_from_server_loop(
         append.user_id,
         append.session_id,
         append.run_id,
@@ -774,174 +700,285 @@ async fn persist_server_loop_canonical_append_inner(
         append.user_message,
         state,
         append.include_terminal_assistant,
-    )
-    .await
-    {
-        let msg = format!("transcript items tx failed: {error}");
-        tracing::warn!(
-            session_id = %append.session_id,
-            error = %error,
-            "post-loop: transcript item persistence failed, rolling back MO transaction"
-        );
-        if let Err(rb_err) = tx.rollback().await {
-            tracing::error!(
-                session_id = %append.session_id,
-                error = %rb_err,
-                "post-loop: rollback failed after transcript item tx failure"
-            );
+    );
+    let mut plan = match settlement {
+        Some(settlement) => {
+            Some(prepare_canonical_terminal(pool, &append, state, settlement, &items).await?)
         }
-        return Err(msg);
-    }
-
-    let canonical_context_cursor = if let Some(context) = settlement.and_then(|s| s.context_commit)
-    {
-        Some(
-            DatabaseSessionContextCoordinator::new(pool.clone())
-                .commit_turn_in_terminal_transaction(
-                    &mut tx,
-                    context,
-                    terminal_admission
-                        .as_ref()
-                        .expect("context commit owns terminal admission")
-                        .admission(),
-                )
-                .await
-                .map_err(|error| format!("canonical context settlement failed: {error}"))?,
-        )
-    } else {
-        None
+        None => None,
     };
-
-    // Context and the original transcript belong to the same commit. The
-    // cursor was just issued by the coordinator under this Run's Session fence;
-    // a second projection head must not certify it after the terminal is visible.
-    if let Some(cursor) = canonical_context_cursor.as_ref() {
-        bind_run_transcript_to_cursor_in_tx(
+    let store = match settlement {
+        Some(settlement) => DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id(settlement.expected_owner_pod_id),
+        None => DatabaseRunStateStore::new(pool.clone()),
+    };
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut tx = connection
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
+    if append.expected_owner_generation.is_some() {
+        astra_services::storage::admit_session_execution_write(
             &mut tx,
-            append.user_id,
             append.session_id,
-            append.run_id,
-            cursor,
+            append.user_id,
         )
         .await
-        .map_err(|error| format!("canonical transcript settlement failed: {error}"))?;
+    } else {
+        astra_services::storage::admit_session_scoped_run_write(
+            &mut tx,
+            append.session_id,
+            append.user_id,
+            append.run_id,
+        )
+        .await
     }
-
-    let terminal_commit = if let Some(settlement) = settlement {
-        let store = DatabaseRunStateStore::new(pool.clone());
-        match store
-            .settle_terminal_in_admitted_transaction(
-                &mut tx,
-                atomic_terminal_request(&append, settlement),
-                terminal_admission.expect("terminal evidence owns its transaction admission"),
-            )
-            .await
-        {
-            Ok(Some(commit)) => Some((store, commit)),
-            Ok(None) => {
-                let _ = tx.rollback().await;
-                drop(connection);
-                return match resolve_existing_atomic_terminal_settlement(
-                    pool, &append, state, settlement, None,
+    .map_err(|error| format!("canonical session admission failed: {error}"))?;
+    let mut control_events = Vec::new();
+    let mut admission = None;
+    if let (Some(current), Some(prepared)) = (settlement.as_mut(), plan.as_mut()) {
+        // At most one accepted cancellation can change the proposed outcome.
+        // It converges here, under the same fence and transaction as raw/Ctx.
+        for attempt in 0..2 {
+            match store
+                .claim_canonical_terminal_with_controls_in_transaction(
+                    &mut tx,
+                    atomic_terminal_request(&append, *current),
+                    &prepared.receipt,
                 )
                 .await?
-                {
-                    Some((_store, terminal)) => Ok(finish_authoritatively_resolved_terminal(
-                        terminal,
-                        &append,
-                        state,
-                        terminal_operation.take(),
-                        settlement.context_commit,
-                    )),
-                    None => Err(format!(
-                        "canonical terminal settlement lost durable execution authority at generation {}",
-                        settlement.expected_owner_generation
-                    )),
-                };
+            {
+                CanonicalTerminalClaim::Claimed {
+                    admission: proof,
+                    control_events: controls,
+                } => {
+                    admission = Some(proof);
+                    control_events = controls;
+                    break;
+                }
+                CanonicalTerminalClaim::CancellationRequested if attempt == 0 => {
+                    *current = CanonicalTerminalSettlement {
+                        status: STATUS_CANCELLED,
+                        expected_statuses: &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                        context_commit: None,
+                        cancellation_origin: Some(
+                            astra_turn_core::orchestration_types::CancellationOrigin::User,
+                        ),
+                        error_code: None,
+                        error_metadata: None,
+                        ..*current
+                    };
+                    prepared.receipt.outcome = CanonicalTerminalOutcome::Cancelled {
+                        origin: DurableCancellationOrigin::User,
+                    };
+                    prepared.receipt.context = if prepared.authority.is_some() {
+                        CanonicalTerminalContext::Revoked
+                    } else {
+                        CanonicalTerminalContext::Unowned
+                    };
+                    prepared.receipt.error_code = None;
+                    prepared.receipt.error_metadata = None;
+                }
+                CanonicalTerminalClaim::Paused => {
+                    return Err(
+                        "Run paused before canonical terminal; checkpoint custody remains active"
+                            .into(),
+                    );
+                }
+                _ => break,
             }
-            Err(error) => {
-                let rollback_error = tx.rollback().await.err();
-                return Err(if let Some(rollback_error) = rollback_error {
-                    format!(
-                        "canonical terminal settlement failed: {error}; rollback also failed: {rollback_error}"
+        }
+        if admission.is_none() {
+            tx.rollback().await.map_err(|error| error.to_string())?;
+            drop(connection);
+            if store
+                .resolve_canonical_terminal_receipt(
+                    atomic_terminal_request(&append, *current),
+                    &prepared.receipt,
+                )
+                .await?
+                .is_none()
+            {
+                return Err(format!(
+                    "canonical terminal lost durable execution authority at generation {}",
+                    current.expected_owner_generation
+                ));
+            }
+            let cursor = match &prepared.receipt.context {
+                CanonicalTerminalContext::Advanced { cursor, .. } => Some(cursor),
+                _ => None,
+            };
+            verify_canonical_append_evidence(pool, &append, state, cursor).await?;
+            verify_terminal_context_evidence(pool, *current, &prepared.receipt).await?;
+            if let Some(operation) = terminal_operation.take() {
+                operation.retire();
+            }
+            return canonical_terminal_projection(
+                &append,
+                &items,
+                prepared,
+                current.error_message,
+                Vec::new(),
+            );
+        }
+    } else if let Some(generation) = append.expected_owner_generation {
+        let duration = append
+            .owner_lease_duration
+            .ok_or("canonical append has no durable lease duration")?;
+        let affected = sqlx::query("UPDATE agent_runs SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
+            WHERE user_id = ? AND session_id = ? AND run_id = ? AND run_generation = ?
+              AND owner_lease_expires_at >= NOW(6) AND status IN ('running','waiting')")
+            .bind(i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)).bind(append.user_id).bind(append.session_id).bind(append.run_id)
+            .bind(i64::try_from(generation).map_err(|_| "Run generation exceeds BIGINT")?).execute(&mut *tx).await.map_err(|error| error.to_string())?.rows_affected();
+        if affected != 1 {
+            return Err(format!(
+                "canonical append lost durable execution authority at generation {generation}"
+            ));
+        }
+    }
+    let canonical_context_cursor = if let (Some(current), Some(prepared), Some(admission)) =
+        (settlement, plan.as_ref(), admission.as_ref())
+    {
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        match &prepared.receipt.context {
+            CanonicalTerminalContext::Advanced { .. } => Some(
+                coordinator
+                    .commit_turn_in_terminal_transaction(
+                        &mut tx,
+                        current
+                            .context_commit
+                            .ok_or("advanced terminal has no prepared Context")?,
+                        admission,
                     )
-                } else {
-                    format!("canonical terminal settlement failed: {error}")
-                });
+                    .await
+                    .map_err(|error| error.to_string())?,
+            ),
+            CanonicalTerminalContext::Unchanged => {
+                coordinator
+                    .validate_unchanged_run_context_in_terminal_transaction(
+                        &mut tx,
+                        prepared
+                            .authority
+                            .as_ref()
+                            .ok_or("empty terminal has no admitted base")?,
+                        &prepared.receipt.opening_hash,
+                        admission,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                None
             }
+            CanonicalTerminalContext::Revoked | CanonicalTerminalContext::Unowned => None,
         }
     } else {
         None
     };
-
-    // This commit is authoritative. A failure is surfaced to the lifecycle;
-    // there is no independent-write retry path.
+    let fresh = admission.as_ref().map(|admission| FreshTerminalTranscript {
+        admission,
+        run_id: append.run_id,
+        cursor: canonical_context_cursor.as_ref(),
+    });
+    append_session_transcript_items_in_tx(
+        &mut tx,
+        append.user_id,
+        append.session_id,
+        &items,
+        fresh,
+    )
+    .await
+    .map_err(|error| format!("canonical raw append failed: {error}"))?;
     match tx.commit().await {
         Ok(()) => connection.release(),
         Err(error) => {
-            // COMMIT acknowledgement failure leaves protocol and transaction
-            // state ambiguous. Discard this checkout before the authoritative
-            // reread so the reconciliation cannot observe through it.
             drop(connection);
-            let msg = format!("MO transaction commit acknowledgement failed: {error}");
-            if let (Some(settlement), Some((_, staged_terminal))) =
-                (settlement, terminal_commit.as_ref())
-            {
-                match resolve_existing_atomic_terminal_settlement(
-                    pool,
-                    &append,
-                    state,
-                    settlement,
-                    Some(&staged_terminal.event_receipts),
+            let (Some(current), Some(prepared)) = (settlement, plan.as_ref()) else {
+                return Err(format!("canonical commit acknowledgement failed: {error}"));
+            };
+            if store
+                .resolve_canonical_terminal_receipt(
+                    atomic_terminal_request(&append, current),
+                    &prepared.receipt,
                 )
-                .await
-                {
-                    Ok(Some(_)) => {
-                        tracing::warn!(
-                            session_id = %append.session_id,
-                            run_id = %append.run_id,
-                            error = %error,
-                            "post-loop: commit acknowledgement was lost; exact durable settlement resolved authoritatively"
-                        );
-                    }
-                    Ok(None) => return Err(msg),
-                    Err(resolve_error) => {
-                        return Err(format!(
-                            "{msg}; authoritative commit resolution failed: {resolve_error}"
-                        ));
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    session_id = %append.session_id,
-                    error = %error,
-                    "post-loop: MO transaction commit acknowledgement failed"
-                );
-                return Err(msg);
+                .await?
+                .is_none()
+            {
+                return Err(format!(
+                    "canonical commit acknowledgement unresolved: {error}"
+                ));
             }
+            verify_canonical_append_evidence(
+                pool,
+                &append,
+                state,
+                canonical_context_cursor.as_ref(),
+            )
+            .await?;
+            verify_terminal_context_evidence(pool, current, &prepared.receipt).await?;
         }
     }
-    if terminal_commit.is_some()
+    if admission.is_some()
         && let Some(operation) = terminal_operation.take()
     {
         operation.retire();
     }
-    let terminal_assistant_source_event_id = terminal_assistant_transcript_item(
-        append.user_id,
-        append.session_id,
-        append.run_id,
-        append.trace_context.as_ref(),
-        append.user_message,
-        state,
-    )
-    .filter(|_| append.include_terminal_assistant)
-    .map(|item| item.source_event_id);
+    if let (Some(current), Some(prepared)) = (settlement, plan.as_ref()) {
+        canonical_terminal_projection(
+            &append,
+            &items,
+            prepared,
+            current.error_message,
+            control_events,
+        )
+    } else {
+        Ok(CanonicalTerminalSettlementCommit {
+            terminal_status: None,
+            canonical_context_cursor: None,
+            terminal_events: Vec::new(),
+            terminal_assistant_source_event_id: items
+                .iter()
+                .rev()
+                .find(|item| item.role == "assistant")
+                .map(|item| item.source_event_id.clone()),
+        })
+    }
+}
+
+fn canonical_terminal_projection(
+    _append: &CanonicalLoopAppend<'_>,
+    items: &[TranscriptPersistItem],
+    plan: &PreparedCanonicalTerminal,
+    error_message: Option<&str>,
+    mut controls: Vec<Value>,
+) -> Result<CanonicalTerminalSettlementCommit, String> {
+    let assistant = items.iter().find(|item| {
+        Some(&item.source_event_id) == plan.receipt.transcript.assistant_source_event_id.as_ref()
+    });
+    controls.extend(
+        plan.receipt.completion_events(
+            assistant.map(|item| item.content.as_str()),
+            assistant
+                .and_then(|item| item.payload.as_ref())
+                .and_then(|payload| payload.model_item_id.as_deref()),
+            error_message,
+            None,
+            -1,
+            i64::MAX,
+        )?,
+    );
     Ok(CanonicalTerminalSettlementCommit {
-        canonical_context_cursor,
-        terminal_events: terminal_commit
-            .map(|(_, terminal)| terminal.committed_events)
-            .unwrap_or_default(),
-        terminal_assistant_source_event_id,
+        terminal_status: Some(plan.receipt.outcome.status()),
+        canonical_context_cursor: match &plan.receipt.context {
+            CanonicalTerminalContext::Advanced { cursor, .. } => Some(cursor.clone()),
+            _ => None,
+        },
+        terminal_events: controls,
+        terminal_assistant_source_event_id: plan
+            .receipt
+            .transcript
+            .assistant_source_event_id
+            .clone(),
     })
 }
 
@@ -1294,30 +1331,6 @@ fn terminal_assistant_transcript_item(
             }),
         source_event_id: trace_event_id("response", &[run_id, &trace.turn_id]),
     })
-}
-
-async fn persist_server_loop_transcript_items_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    trace_context: Option<&TraceContext>,
-    user_message: &str,
-    state: &AgenticLoopState,
-    include_terminal_assistant: bool,
-) -> Result<(), String> {
-    let items = transcript_items_from_server_loop(
-        user_id,
-        session_id,
-        run_id,
-        trace_context,
-        user_message,
-        state,
-        include_terminal_assistant,
-    );
-    append_session_transcript_items_admitted_in_tx(tx, user_id, session_id, &items)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 /// Persist accepted input under the enclosing Session/Run transaction.
@@ -1794,16 +1807,11 @@ fn transcript_cursor_i64(field: &'static str, value: u64) -> Result<i64, sqlx::E
         .map_err(|_| sqlx::Error::Protocol(format!("{field} exceeds MatrixOne BIGINT")))
 }
 
-/// Bind original raw history to the Context cursor issued in this transaction.
-/// The caller owns the Session fence and the canonical commit; this helper does
-/// not derive conversation truth from trace, a display row, or a second head.
-async fn bind_run_transcript_to_cursor_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+fn validated_transcript_cursor<'a>(
     user_id: &str,
     session_id: &str,
-    run_id: &str,
-    cursor: &SessionCursorV1,
-) -> Result<(), sqlx::Error> {
+    cursor: &'a SessionCursorV1,
+) -> Result<(i64, i64, &'a str), sqlx::Error> {
     if cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION
         || cursor.owner_id != user_id
         || cursor.session_id != session_id
@@ -1824,6 +1832,25 @@ async fn bind_run_transcript_to_cursor_in_tx(
     }
     let completed_turn = i64::from(cursor.completed_turn);
     let conversation_seq = transcript_cursor_i64("conversation_seq", cursor.conversation_seq)?;
+    Ok((
+        completed_turn,
+        conversation_seq,
+        cursor.canonical_root_hash.as_str(),
+    ))
+}
+
+/// Bind original raw history to the Context cursor issued in this transaction.
+/// The caller owns the Session fence and the canonical commit; this helper does
+/// not derive conversation truth from trace, a display row, or a second head.
+async fn bind_run_transcript_to_cursor_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    cursor: &SessionCursorV1,
+) -> Result<(), sqlx::Error> {
+    let (completed_turn, conversation_seq, root) =
+        validated_transcript_cursor(user_id, session_id, cursor)?;
     sqlx::query(
         "UPDATE session_transcript_items
          SET canonical_completed_turn = ?, canonical_conversation_seq = ?,
@@ -1833,7 +1860,7 @@ async fn bind_run_transcript_to_cursor_in_tx(
     )
     .bind(completed_turn)
     .bind(conversation_seq)
-    .bind(&cursor.canonical_root_hash)
+    .bind(root)
     .bind(user_id)
     .bind(session_id)
     .bind(run_id)
@@ -1865,27 +1892,6 @@ const TRANSCRIPT_INSERT_BINDS: usize = 6;
 
 /// A raw identity is immutable. Reasoning is a separate presentation enrichment;
 /// all other JSON fields, including unknown fields, remain part of identity.
-fn transcript_payload_identity(
-    role: &str,
-    payload: Option<&str>,
-) -> Result<Option<String>, sqlx::Error> {
-    let Some(payload) = payload else {
-        return Ok(None);
-    };
-    let mut value: Value = serde_json::from_str(payload)
-        .map_err(|error| sqlx::Error::Protocol(format!("invalid transcript payload: {error}")))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| sqlx::Error::Protocol("transcript payload must be an object".into()))?;
-    if role == "assistant" {
-        object.remove("reasoning");
-        object.remove("reasoning_status");
-    }
-    if object.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(astra_core::canonical_json_string(&value)))
-}
 
 struct PreparedTranscriptItem<'a> {
     item: &'a TranscriptPersistItem,
@@ -1904,7 +1910,8 @@ impl<'a> PreparedTranscriptItem<'a> {
             .map_err(|error| {
                 sqlx::Error::Protocol(format!("serialize transcript payload: {error}"))
             })?;
-        let payload_identity = transcript_payload_identity(item.role, payload_json.as_deref())?;
+        let payload_identity = transcript_payload_identity(item.role, payload_json.as_deref())
+            .map_err(sqlx::Error::Protocol)?;
         let bytes = item.source_event_id.len()
             + item.run_id.as_ref().map_or(0, String::len)
             + item.role.len()
@@ -1940,7 +1947,8 @@ impl<'a> PreparedTranscriptItem<'a> {
                     stored.payload_json.as_deref(),
                 )
             && self.payload_identity
-                == transcript_payload_identity(&stored.role, stored.payload_json.as_deref())?)
+                == transcript_payload_identity(&stored.role, stored.payload_json.as_deref())
+                    .map_err(sqlx::Error::Protocol)?)
     }
 }
 
@@ -2075,12 +2083,54 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
     session_id: &str,
     items: &[TranscriptPersistItem],
 ) -> Result<(), sqlx::Error> {
+    append_session_transcript_items_in_tx(tx, user_id, session_id, items, None).await
+}
+
+struct FreshTerminalTranscript<'a> {
+    admission: &'a astra_services::runs::RunMutationAdmission,
+    run_id: &'a str,
+    cursor: Option<&'a SessionCursorV1>,
+}
+
+/// The one raw writer. Native UNIQUE source identities and a freshly claimed
+/// terminal authorize a direct append; generic producers retain D14's complete
+/// immutable-membership validation. Every chunk still allocates inline from
+/// the current Session tail, including child interleaving.
+async fn append_session_transcript_items_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    items: &[TranscriptPersistItem],
+    fresh: Option<FreshTerminalTranscript<'_>>,
+) -> Result<(), sqlx::Error> {
+    let cursor_columns = if let Some(fresh) = &fresh {
+        if !fresh
+            .admission
+            .authorizes_terminal_transcript(user_id, session_id, fresh.run_id)
+            || items
+                .iter()
+                .any(|item| item.run_id.as_deref() != Some(fresh.run_id))
+        {
+            return Err(sqlx::Error::Protocol(
+                "raw append requires this Run's exact terminal proof".into(),
+            ));
+        }
+        fresh
+            .cursor
+            .map(|cursor| validated_transcript_cursor(user_id, session_id, cursor))
+            .transpose()?
+    } else {
+        None
+    };
     let mut offset = 0;
     while offset < items.len() {
         let chunk = transcript_chunk(items, offset)?;
         let end = offset + chunk.len();
-        let ordinals =
-            validate_transcript_chunk(&mut **tx, user_id, session_id, &chunk, None).await?;
+        let ordinals = if fresh.is_some() {
+            (0..chunk.len()).collect()
+        } else {
+            validate_transcript_chunk(&mut **tx, user_id, session_id, &chunk, None).await?
+        };
         let mut pending = Vec::new();
         let mut pending_bytes = 0_usize;
         for ordinal in ordinals {
@@ -2095,7 +2145,7 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
         while start < pending.len() {
             let mut stop = start;
             while stop < pending.len()
-                && (stop - start + 1) * TRANSCRIPT_INSERT_BINDS + 4 <= TRANSCRIPT_BATCH_BINDS
+                && (stop - start + 1) * TRANSCRIPT_INSERT_BINDS + 7 <= TRANSCRIPT_BATCH_BINDS
             {
                 let item_bytes = pending[stop].2;
                 if stop > start && pending_bytes.saturating_add(item_bytes) > TRANSCRIPT_BATCH_BYTES
@@ -2108,7 +2158,8 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
             let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
                 "INSERT INTO session_transcript_items
                  (session_id, item_seq, user_id, run_id, role, content, payload_json,
-                  source_event_id, content_hash, created_at) ",
+                  source_event_id, content_hash, canonical_completed_turn,
+                  canonical_conversation_seq, canonical_root_hash, created_at) ",
             );
             // Session admission serializes this namespace. Allocate from its
             // current tail inside the INSERT, including across bounded chunks;
@@ -2116,7 +2167,11 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
             insert.push("SELECT ").push_bind(session_id)
                 .push(", base.seq + candidates.ordinal, ").push_bind(user_id)
                 .push(", candidates.run_id, candidates.role, candidates.content, candidates.payload_json,
-                    candidates.source_event_id, candidates.content_hash, NOW(6)
+                    candidates.source_event_id, candidates.content_hash, ")
+                .push_bind(cursor_columns.map(|(turn, _, _)| turn)).push(", ")
+                .push_bind(cursor_columns.map(|(_, sequence, _)| sequence)).push(", ")
+                .push_bind(cursor_columns.map(|(_, _, root)| root))
+                .push(", NOW(6)
                     FROM (SELECT COALESCE(MAX(item_seq), 0) AS seq FROM session_transcript_items
                           WHERE user_id = ")
                 .push_bind(user_id).push(" AND session_id = ").push_bind(session_id)
@@ -2149,9 +2204,11 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
             insert.push(") candidates(ordinal, run_id, role, content, payload_json, source_event_id, content_hash)
                 WHERE base.seq <= ").push(i64::MAX - (stop - start) as i64);
             insert.push(astra_core::matrixone_null_shape_comment(
-                pending[start..stop]
-                    .iter()
-                    .flat_map(|(item, payload, _)| [item.run_id.is_some(), payload.is_some()]),
+                [cursor_columns.is_some(); 3].into_iter().chain(
+                    pending[start..stop]
+                        .iter()
+                        .flat_map(|(item, payload, _)| [item.run_id.is_some(), payload.is_some()]),
+                ),
             ));
             let affected = insert.build().execute(&mut **tx).await?.rows_affected();
             if affected != (stop - start) as u64 {
@@ -2165,18 +2222,6 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
         offset = end;
     }
     Ok(())
-}
-
-fn transcript_content_hash(role: &str, content: &str, payload_json: Option<&str>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(role.as_bytes());
-    hasher.update([0]);
-    hasher.update(content.as_bytes());
-    hasher.update([0]);
-    if let Some(payload_json) = payload_json {
-        hasher.update(payload_json.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 /// Persist the existing skill-selection telemetry after the server loop.
@@ -2475,49 +2520,6 @@ mod tests {
         recorded
     }
 
-    fn resolved_terminal_fixture() -> astra_services::runs::AtomicRunTerminalSettlementCommit {
-        astra_services::runs::AtomicRunTerminalSettlementCommit {
-            committed_events: vec![json!({
-                "event_type": "run_finished",
-                "data": {"status": "completed"}
-            })],
-            event_receipts: vec![AtomicRunTerminalEventReceipt {
-                event_idx: 7,
-                event_type: "run_finished".to_string(),
-                event_id: "terminal-event-7".to_string(),
-                idempotency_key: Some("terminal:run-1:completed".to_string()),
-                event_hash: "event-hash".to_string(),
-                settlement_batch_id: Some("settlement-batch".to_string()),
-            }],
-            last_event_idx: 7,
-            latest_event_type: Some("run_finished".to_string()),
-        }
-    }
-
-    #[test]
-    fn commit_ack_lost_accepts_only_exact_authoritative_resolution() {
-        let expected = resolved_terminal_fixture();
-        let resolved = classify_authoritative_terminal_resolution(
-            AtomicRunTerminalSettlementResolution::Exact(expected.clone()),
-        )
-        .expect("exact durable facts resolve a lost commit acknowledgement")
-        .expect("commit is authoritative");
-
-        assert_eq!(resolved, expected);
-    }
-
-    #[test]
-    fn commit_ack_lost_mismatch_fails_closed() {
-        let error = classify_authoritative_terminal_resolution(
-            AtomicRunTerminalSettlementResolution::Conflict(
-                "terminal event receipt mismatch".to_string(),
-            ),
-        )
-        .expect_err("a mismatched durable terminal must remain ambiguous");
-
-        assert!(error.contains("terminal event receipt mismatch"));
-    }
-
     async fn setup_pool() -> astra_core::SharedPool {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
@@ -2653,6 +2655,7 @@ mod tests {
             expected_owner_generation: None,
             owner_lease_duration: None,
             terminal_authority: None,
+            owner_pod_id: None,
 
             user_message: "work".to_string(),
             hook_db_writer: None,
@@ -4216,7 +4219,7 @@ mod tests {
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("core-persist-deferred-owner"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &user_id, &session_id)
             .await
@@ -4279,6 +4282,7 @@ mod tests {
             expected_owner_generation: Some(authority.owner_generation),
             owner_lease_duration: Some(Duration::from_secs(45)),
             terminal_authority: None,
+            owner_pod_id: None,
 
             user_message: "initial one".to_string(),
             hook_db_writer: None,
@@ -4454,14 +4458,6 @@ mod tests {
             (&user, &other_session),
             (&foreign, &foreign_session),
         ] {
-            sqlx::query(
-                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(owner)
-            .bind(session)
-            .execute(db)
-            .await
-            .unwrap();
             cleanup_core_persist_fixture_for_owner(db, session, owner).await;
         }
         for table in ["agent_run_events", "agent_runs"] {
@@ -4498,7 +4494,7 @@ mod tests {
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("canonical-owner-a"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &user_id, &session_id)
             .await
@@ -4525,10 +4521,6 @@ mod tests {
         .fetch_one(&db)
         .await
         .expect("count baseline durable run events");
-        let terminal_events = vec![json!({
-            "event_type": "run_finished",
-            "data": { "status": astra_core::STATUS_COMPLETED }
-        })];
         let error = persist_server_loop_canonical_terminal_settlement(
             &pool,
             CanonicalLoopAppend {
@@ -4543,12 +4535,15 @@ mod tests {
             },
             &state,
             CanonicalTerminalSettlement {
+                expected_owner_pod_id: store.owner_pod_id(),
                 expected_statuses: &[astra_core::STATUS_RUNNING],
                 expected_owner_generation: authority.owner_generation,
                 status: astra_core::STATUS_COMPLETED,
                 waiting_for: None,
                 error_message: None,
-                events: &terminal_events,
+                error_code: None,
+                error_metadata: None,
+                cancellation_origin: None,
                 prompt_tokens: 11,
                 completion_tokens: 7,
                 tool_calls: 3,
@@ -4620,14 +4615,6 @@ mod tests {
             .execute(&db)
             .await
             .expect("cleanup durable run events");
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(&db)
-        .await
-        .expect("cleanup execution slot");
         sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
             .bind(&user_id)
             .bind(&run_id)
@@ -4659,7 +4646,7 @@ mod tests {
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("canonical-terminal-rollback-owner"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &user_id, &session_id)
             .await
@@ -4675,10 +4662,6 @@ mod tests {
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "must roll back with the terminal conflict".into();
-        let terminal_events = vec![json!({
-            "event_type": "run_finished",
-            "data": { "status": astra_core::STATUS_COMPLETED }
-        })];
         let error = persist_server_loop_canonical_terminal_settlement(
             &pool,
             CanonicalLoopAppend {
@@ -4693,6 +4676,7 @@ mod tests {
             },
             &state,
             CanonicalTerminalSettlement {
+                expected_owner_pod_id: store.owner_pod_id(),
                 // The outer generation fence accepts the running owner. This
                 // deliberately conflicts only after canonical rows have been
                 // staged, proving the shared transaction rolls every class back.
@@ -4701,7 +4685,9 @@ mod tests {
                 status: astra_core::STATUS_COMPLETED,
                 waiting_for: None,
                 error_message: None,
-                events: &terminal_events,
+                error_code: None,
+                error_metadata: None,
+                cancellation_origin: None,
                 prompt_tokens: 31,
                 completion_tokens: 13,
                 tool_calls: 5,
@@ -4779,14 +4765,6 @@ mod tests {
             .execute(&db)
             .await
             .expect("cleanup durable run events");
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(&db)
-        .await
-        .expect("cleanup execution slot");
         sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
             .bind(&user_id)
             .bind(&run_id)
@@ -4799,760 +4777,511 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_success_commits_evidence_usage_and_terminal_together() {
-        for with_buffer in [false, true] {
-            assert_canonical_terminal_replay(
-                with_buffer,
-                None,
-                astra_core::STATUS_COMPLETED,
-                false,
-            )
-            .await;
-        }
+        assert_canonical_terminal(TerminalCase::Completed).await;
     }
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_rejects_colliding_evidence_before_settlement() {
-        for event_type in ["user_query", "llm_response"] {
-            assert_canonical_terminal_replay(
-                true,
-                Some(event_type),
-                astra_core::STATUS_COMPLETED,
-                false,
-            )
-            .await;
-        }
+        assert_canonical_terminal(TerminalCase::RawCollision).await;
     }
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-    async fn canonical_paused_cancellation_preserves_evidence_and_replay() {
-        assert_canonical_terminal_replay(false, None, astra_core::STATUS_CANCELLED, false).await;
+    async fn canonical_user_cancellation_converges_with_raw_in_same_transaction() {
+        assert_canonical_terminal(TerminalCase::UserCancellation).await;
     }
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_returns_late_guidance_without_claiming_model_application() {
-        assert_canonical_terminal_replay(false, None, astra_core::STATUS_COMPLETED, true).await;
+        assert_canonical_terminal(TerminalCase::LateGuidance).await;
     }
 
-    async fn assert_canonical_terminal_replay(
-        with_buffer: bool,
-        collision: Option<&str>,
-        terminal_status: &str,
-        late_guidance: bool,
-    ) {
-        let pool = setup_pool().await;
-        let db = pool.get().clone();
-        let user_id = Uuid::new_v4().to_string();
-        let session_id = Uuid::new_v4().to_string();
-        let run_id = Uuid::new_v4().to_string();
-        cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
-        sqlx::query(
-            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
-             VALUES (?, ?, 'canonical-terminal-success-it', 'active', 0)",
-        )
-        .bind(&session_id)
-        .bind(&user_id)
-        .execute(&db)
-        .await
-        .expect("insert owner session");
-        let store = Arc::new(
-            astra_services::runs::DatabaseRunStateStore::new(pool.clone())
-                .with_owner_pod_id("canonical-terminal-success-owner"),
-        );
-        let engine = crate::server::run::engine::RunEngine::new(store.clone());
-        let authority = engine
-            .start_run(&run_id, &user_id, &session_id)
-            .await
-            .expect("start durable run");
-        store
-            .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
-                user_id: &user_id,
-                expected_session_id: &session_id,
-                run_id: &run_id,
-                checkpoint_json: r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"fixture-terminal-projection"}"#,
-                authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane,
-            })
-            .await
-            .expect("persist pre-terminal checkpoint");
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn canonical_terminal_cannot_promote_an_accepted_pause() {
+        assert_canonical_terminal(TerminalCase::Paused).await;
+    }
 
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.final_text = "atomically committed answer".into();
-        state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
-            qualified_usage: None,
-            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-            turn: 1,
-            round: 1,
-            provider: "test".into(),
-            model: "test-model".into(),
-            prompt_tokens: 37,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            completion_tokens: 17,
-            tool_calls_returned: 1,
-            tool_call_names: vec!["read_file".into()],
-            start_offset_ms: 1,
-            duration_ms: 2,
-            finish_reason: Some("tool_calls".into()),
-        });
-        // The same provider ID in successive rounds must yield independent
-        // immutable evidence, then replay the exact terminal transaction.
-        for round in 0..2 {
-            let accepted = crate::turn::agentic::tool_interception::accept_provider_tool_calls(
-                vec![json!({"id":"terminal-evidence-tool", "type":"function", "function":{"name":"read_file","arguments":"{}"}})],
-                &user_id, &session_id, Some(&run_id), Some("terminal-chain"), round,
-            ).unwrap();
-            state
-                .stall
-                .tool_call_records
-                .push(astra_services::session_journal::ToolCallRecord {
-                    tool_call_id: accepted[0]["id"].as_str().map(str::to_owned),
-                    name: "read_file".into(),
-                    ok: true,
-                    ms: 1,
-                    start_offset_ms: Some(3 + u64::from(round)),
-                    round: Some(round),
-                    ..Default::default()
-                });
-        }
-        state.user_intents.record_applied_user_intents(&[
-            crate::turn::agentic_loop::host::AppliedUserIntent {
-                intent_id: "terminal-evidence-intent".into(),
-                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                status: astra_turn_types::UserIntentStatus::Applied,
-                event_index: 1,
-                content: "include the evidence".into(),
-            },
-        ]);
-        let persist = PostLoopPersistContext {
-            matrixone: MatrixOneSettings::from_env(),
-            shared_pool: Some(pool.clone()),
-            user_id: user_id.clone(),
-            session_id: session_id.clone(),
-            run_id: run_id.clone(),
-            expected_owner_generation: Some(authority.owner_generation),
-            owner_lease_duration: Some(Duration::from_secs(45)),
-            terminal_authority: None,
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TerminalCase {
+        Completed,
+        LateGuidance,
+        RawCollision,
+        UserCancellation,
+        Paused,
+    }
 
-            user_message: "produce an answer".to_string(),
-            hook_db_writer: None,
-            observer_worker: None,
-            metrics_registry: None,
+    async fn assert_canonical_terminal(case: TerminalCase) {
+        use super::super::{
+            AgenticRunLifecycleService, RootTurnStartParticipant, durable_event_type,
         };
-        let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
-        persist_root_turn_input(
-            &pool,
-            &user_id,
-            &session_id,
-            TranscriptPersistItem {
-                run_id: Some(run_id.clone()),
-                role: "user",
-                content: persist.user_message.clone(),
-                payload: None,
-                source_event_id: trace.root_event_id,
-            },
+        use astra_services::{SessionContextCoordinator, runs::RunLifecycleService};
+        let pool = setup_pool().await;
+        let (user, session, run_id) = (
+            Uuid::new_v4().to_string(),
+            Uuid::new_v4().to_string(),
+            Uuid::new_v4().to_string(),
+        );
+        crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+        let owner = "canonical-terminal-owner";
+        let service = super::super::tests::db_backed_test_service(&pool, owner);
+        let request = super::super::tests::prepared_test_request("accepted question");
+        let mut participant = RootTurnStartParticipant {
+            service: &service,
+            user_id: &user,
+            session_id: &session,
+            run_id: &run_id,
+            request: &request,
+            admission: None,
+            prepared: None,
+            rejection: None,
+        };
+        assert!(matches!(
+            service
+                .run_engine
+                .admit_run_with_context(
+                    &run_id,
+                    &user,
+                    &session,
+                    Some(&session),
+                    Default::default(),
+                    true,
+                    &mut participant
+                )
+                .await
+                .unwrap(),
+            astra_services::runs::DurableRunStartClaim::Started { .. }
+        ));
+        let admitted = participant.admission.take().unwrap();
+        let generation = admitted.authority.generation;
+        let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(owner);
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "committed answer 中文🙂".into();
+        state.final_text_model_item_id = Some("answer-model-item".into());
+        state.messages = vec![
+            json!({"role":"user","content":request.message}),
+            json!({"role":"assistant","content":state.final_text}),
+        ];
+        state.total_prompt = 101;
+        state.total_cache_read = 202;
+        state.total_cache_creation = 303;
+        state.total_completion = 404;
+        state.qualified_usage = Some(
+            astra_turn_types::CanonicalTokenUsage::new(Some(101), Some(202), Some(303), Some(404))
+                .unwrap(),
+        );
+        let context = AgenticRunLifecycleService::prepare_canonical_turn_commit(
+            Some(&admitted),
+            &state.messages,
+            None,
+            false,
+            &run_id,
         )
-        .await
-        .expect("persist admission-time input");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        if with_buffer {
-            state.turn_event_buffer = Some(
-                astra_services::session_journal::TurnEventBuffer::begin_turn(Some(&session_id), 1),
+        .unwrap()
+        .unwrap();
+        let trace = server_trace_context(&user, &session, &run_id, state.session_turn);
+        if case == TerminalCase::LateGuidance {
+            store.append_event(&user, &session, &run_id, json!({"event_type":"user_intent", "idempotency_key":"user_intent:late",
+                "data":{"intent_id":"late", "delivery":"guide_current_run", "input":{"content":"late guidance"}}})).await.unwrap();
+        }
+        if case == TerminalCase::UserCancellation {
+            assert!(
+                store
+                    .request_run_cancellation(&user, &run_id)
+                    .await
+                    .unwrap()
             );
         }
-        let mut terminal_events = vec![
-            json!({
-                "event_type": "text_done",
-                "data": { "full_text": state.final_text }
-            }),
-            json!({
-                "event_type": "run_finished",
-                "data": { "status": terminal_status }
-            }),
-        ];
-        let initial_status = if terminal_status == astra_core::STATUS_CANCELLED {
-            sqlx::query("UPDATE agent_runs SET status = 'paused' WHERE user_id = ? AND run_id = ?")
-                .bind(&user_id)
-                .bind(&run_id)
-                .execute(&db)
+        if case == TerminalCase::RawCollision {
+            persist_root_turn_input(
+                &pool,
+                &user,
+                &session,
+                TranscriptPersistItem {
+                    run_id: Some(run_id.clone()),
+                    role: "user",
+                    content: "conflicting input".into(),
+                    payload: None,
+                    source_event_id: trace.root_event_id,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        if case == TerminalCase::Paused {
+            service
+                .pause_run(run_id.clone(), user.clone())
                 .await
                 .unwrap();
-            terminal_events[1]["data"]["cancellation_origin"] = json!("runtime");
-            terminal_events[1]["data"]["cancelled"] = json!(true);
-            astra_core::STATUS_PAUSED
-        } else {
-            astra_core::STATUS_RUNNING
+        }
+        let settlement = CanonicalTerminalSettlement {
+            expected_owner_pod_id: owner,
+            expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
+            expected_owner_generation: generation,
+            status: astra_core::STATUS_COMPLETED,
+            waiting_for: None,
+            error_message: None,
+            error_code: None,
+            error_metadata: None,
+            cancellation_origin: None,
+            prompt_tokens: 606,
+            completion_tokens: 404,
+            tool_calls: 0,
+            context_commit: Some(&context),
         };
-        terminal_events.push(crate::server::run::lifecycle::AgenticRunLifecycleService::settlement_finished_test_event(authority.owner_generation));
         let append = || CanonicalLoopAppend {
-            user_id: &user_id,
-            session_id: &session_id,
+            user_id: &user,
+            session_id: &session,
             run_id: &run_id,
-            expected_owner_generation: Some(authority.owner_generation),
+            expected_owner_generation: Some(generation),
             owner_lease_duration: Some(Duration::from_secs(45)),
             trace_context: None,
-            user_message: "produce an answer",
+            user_message: &request.message,
             include_terminal_assistant: true,
         };
-        use astra_services::SessionContextCoordinator;
-        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-        let key =
-            astra_turn_types::SessionKeyV1::owner_session("server", &user_id, &session_id, "main");
-        let actor = astra_turn_types::ActorContextV1::owner_user(
-            &user_id,
-            "terminal-context-it",
-            astra_turn_types::ActorKindV1::Server,
-            astra_turn_types::SessionSurfaceV1::Server,
+        let result = persist_server_loop_canonical_terminal_settlement(
+            &pool,
+            append(),
+            &state,
+            settlement,
             None,
-            astra_turn_types::AuthorityEpochsV1::default(),
-        );
-        let reservation = match coordinator
-            .acquire_writer_and_reserve_turn(
-                &key,
-                None,
-                &actor,
-                Duration::from_secs(120),
-                "context-writer",
-                "context-turn",
+        )
+        .await;
+        let current = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        let slot: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))")
+            .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let head = coordinator
+            .load_head(&admitted.authority.key)
+            .await
+            .unwrap();
+        if matches!(case, TerminalCase::RawCollision | TerminalCase::Paused) {
+            assert!(result.is_err());
+            assert_eq!(
+                current.status,
+                if case == TerminalCase::Paused {
+                    STATUS_PAUSED
+                } else {
+                    STATUS_RUNNING
+                }
+            );
+            assert!(current.terminal_receipt_json.is_none());
+            assert!(current.owner_pod_id.is_some());
+            assert_eq!(slot, 1);
+            assert!(
+                head.is_none(),
+                "raw failure must roll Context and terminal back together"
+            );
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ? AND session_id = ?")
+                .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                count, 0,
+                "failed transaction must not leak immutable Context nodes"
+            );
+        } else {
+            let commit = result.unwrap();
+            let expected_status = if case == TerminalCase::UserCancellation {
+                STATUS_CANCELLED
+            } else {
+                astra_core::STATUS_COMPLETED
+            };
+            assert_eq!(commit.terminal_status, Some(expected_status));
+            assert_eq!(current.status, expected_status);
+            assert!(current.owner_pod_id.is_none());
+            assert_eq!(slot, 0);
+            let expected_cursor =
+                (case != TerminalCase::UserCancellation).then(|| context.cursor());
+            assert_eq!(
+                head.as_ref().map(|head| head.cursor.clone()),
+                expected_cursor
+            );
+            let raw = sqlx::query("SELECT role,content,canonical_completed_turn,canonical_root_hash FROM session_transcript_items WHERE user_id=? AND session_id=? ORDER BY item_seq")
+                .bind(&user).bind(&session).fetch_all(pool.get()).await.unwrap();
+            assert_eq!(raw.len(), 2);
+            assert_eq!(
+                raw[0].try_get::<String, _>("content").unwrap(),
+                request.message
+            );
+            assert_eq!(
+                raw[1].try_get::<String, _>("content").unwrap(),
+                state.final_text
+            );
+            assert_eq!(
+                raw[1]
+                    .try_get::<Option<String>, _>("canonical_root_hash")
+                    .unwrap(),
+                expected_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.canonical_root_hash.clone())
+            );
+            let physical: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_run_events WHERE user_id=? AND run_id=? AND event_type IN ('text_done','run_finished','run_settlement_started','run_settlement_finished','run_accounting_finalized')")
+                .bind(&user).bind(&run_id).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                physical, 0,
+                "completion has one C0/C1 owner, without mirrored event payloads or markers"
+            );
+            let completion = current
+                .events
+                .iter()
+                .filter(|event| durable_event_type(event) == Some("run_finished"))
+                .collect::<Vec<_>>();
+            assert_eq!(completion.len(), 1);
+            assert_eq!(completion[0]["data"]["status"], expected_status);
+            let text = current
+                .events
+                .iter()
+                .find(|event| durable_event_type(event) == Some("text_done"))
+                .unwrap();
+            assert_eq!(text["data"]["full_text"], state.final_text);
+            assert_eq!(text["data"]["model_item_id"], "answer-model-item");
+            let delta = store
+                .load_run_event_delta(&user, &run_id, text["index"].as_i64().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                delta
+                    .events
+                    .iter()
+                    .all(|event| durable_event_type(event) != Some("text_done")),
+                "reconnect after the answer must not replay it"
+            );
+            assert!(
+                delta
+                    .events
+                    .iter()
+                    .any(|event| durable_event_type(event) == Some("run_finished"))
+            );
+            let replay = persist_server_loop_canonical_terminal_settlement(
+                &pool,
+                append(),
+                &state,
+                settlement,
                 None,
             )
             .await
-            .unwrap()
-        {
-            astra_services::AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } => {
-                reservation
-            }
-            other => panic!("unexpected context admission: {other:?}"),
-        };
-        let delta = astra_turn_types::CanonicalTurnDeltaV1 {
-            schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-            completed_turn: reservation.reserved_turn,
-            journal_event_seq: 1,
-            conversation_seq: 1,
-            compaction_generation: 0,
-            config_version_id: None,
-            mode: astra_turn_types::CanonicalDeltaModeV1::Append,
-            logical_segments: vec![vec![
-                json!({"role":"user", "content":persist.user_message}),
-                json!({"role":"assistant", "content":state.final_text}),
-            ]],
-        };
-        let context_commit =
-            PreparedSessionContextCommit::new(&reservation, delta.clone(), "context-commit", true)
-                .unwrap();
-        terminal_events.last_mut().unwrap()["canonical_context"] =
-            context_commit.terminal_binding();
-        let settlement = CanonicalTerminalSettlement {
-            expected_statuses: &[initial_status],
-            expected_owner_generation: authority.owner_generation,
-            status: terminal_status,
-            waiting_for: None,
-            error_message: None,
-            events: &terminal_events,
-            prompt_tokens: 37,
-            completion_tokens: 17,
-            tool_calls: 6,
-            context_commit: Some(&context_commit),
-        };
-        if let Some(event_type) = collision {
-            persist
-                .persist_canonical_transcript_in_transaction(&state, true)
-                .await
-                .unwrap();
-            let event_id = if event_type == "user_query" {
-                server_trace_context(&user_id, &session_id, &run_id, state.session_turn)
-                    .root_event_id
-            } else {
-                terminal_assistant_transcript_item(&user_id, &session_id, &run_id, None, "", &state)
+            .unwrap();
+            assert_eq!(replay.terminal_status, commit.terminal_status);
+            assert_eq!(
+                store
+                    .load_run(&user, &run_id)
+                    .await
                     .unwrap()
-                    .source_event_id
-            };
-            let original_hash: String = sqlx::query_scalar("SELECT content_hash FROM session_transcript_items WHERE user_id=? AND session_id=? AND source_event_id=?")
-                .bind(&user_id).bind(&session_id).bind(&event_id).fetch_one(&db).await.unwrap();
-            sqlx::query("UPDATE session_transcript_items SET content_hash=? WHERE user_id=? AND session_id=? AND source_event_id=?")
-                .bind("0".repeat(64)).bind(&user_id).bind(&session_id).bind(&event_id).execute(&db).await.unwrap();
-            for _ in 0..2 {
-                let error = persist_server_loop_canonical_terminal_settlement(
+                    .unwrap()
+                    .last_event_idx,
+                current.last_event_idx
+            );
+            if case == TerminalCase::LateGuidance {
+                assert!(
+                    current
+                        .events
+                        .iter()
+                        .any(|event| durable_event_type(event) == Some("user_intent_returned"))
+                );
+                assert!(
+                    !current
+                        .events
+                        .iter()
+                        .any(|event| durable_event_type(event) == Some("user_intent_applied"))
+                );
+            }
+            if case == TerminalCase::Completed {
+                use astra_services::AcquireWriterAndReserveTurnOutcome;
+                use astra_turn_types::{
+                    ActorContextV1, ActorKindV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                    CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionSurfaceV1,
+                };
+                let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+                let authority = context.run_context_authority().unwrap();
+                let key = &authority.key;
+                let old_cursor = context.cursor();
+                let old_manifest = head.as_ref().unwrap().latest_manifest_root.clone();
+                let actor = ActorContextV1::owner_user(
+                    &user,
+                    "later-controller",
+                    ActorKindV1::Server,
+                    SessionSurfaceV1::Server,
+                    None,
+                    authority.authority_epochs,
+                );
+                let AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } = coordinator
+                    .acquire_writer_and_reserve_turn(
+                        key,
+                        Some(&old_cursor),
+                        &actor,
+                        Duration::from_secs(30),
+                        "later-writer",
+                        "later-turn",
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("later independent controller must own its turn")
+                };
+                coordinator
+                    .commit_turn_and_release_writer(
+                        &reservation,
+                        CanonicalTurnDeltaV1 {
+                            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                            completed_turn: old_cursor.completed_turn + 1,
+                            journal_event_seq: old_cursor.journal_event_seq + 1,
+                            conversation_seq: old_cursor.conversation_seq + 1,
+                            compaction_generation: old_cursor.compaction_generation,
+                            config_version_id: None,
+                            mode: CanonicalDeltaModeV1::Append,
+                            logical_segments: vec![vec![
+                                json!({"role":"assistant","content":"later turn"}),
+                            ]],
+                        },
+                        "later-commit",
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    coordinator.load_head(key).await.unwrap().unwrap().cursor,
+                    old_cursor
+                );
+                assert!(
+                    persist_server_loop_canonical_terminal_settlement(
+                        &pool,
+                        append(),
+                        &state,
+                        settlement,
+                        None,
+                    )
+                    .await
+                    .is_ok(),
+                    "a genuine later turn cannot invalidate the earlier exact commit"
+                );
+
+                let manifest: String = sqlx::query_scalar("SELECT manifest_json FROM conversation_manifest_nodes WHERE owner_user_id=? AND session_id=? AND manifest_root=?")
+                    .bind(&user).bind(&session).bind(&old_manifest).fetch_one(pool.get()).await.unwrap();
+                let segment = sqlx::query("SELECT s.segment_hash,s.segment_json FROM conversation_segments s JOIN conversation_manifest_segments r ON r.isolation_domain=s.isolation_domain AND r.owner_user_id=s.owner_user_id AND r.segment_hash=s.segment_hash WHERE r.owner_user_id=? AND r.session_id=? AND r.manifest_root=? ORDER BY r.segment_position LIMIT 1")
+                    .bind(&user).bind(&session).bind(&old_manifest).fetch_one(pool.get()).await.unwrap();
+                let segment_hash: String = segment.try_get("segment_hash").unwrap();
+                let segment_json: String = segment.try_get("segment_json").unwrap();
+                // Each failure leaves C0 and all original raw rows intact.
+                // Resolution must inspect the actual immutable Context objects.
+                for fault in ["manifest", "references", "segment", "totals"] {
+                    let (break_sql, restore_sql, saved) = match fault {
+                        "manifest" => (
+                            "UPDATE conversation_manifest_nodes SET manifest_json=? WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
+                            "UPDATE conversation_manifest_nodes SET manifest_json=? WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
+                            manifest.as_str(),
+                        ),
+                        "segment" => (
+                            "UPDATE conversation_segments SET segment_json=? WHERE owner_user_id=? AND segment_hash=?",
+                            "UPDATE conversation_segments SET segment_json=? WHERE owner_user_id=? AND segment_hash=?",
+                            segment_json.as_str(),
+                        ),
+                        "references" => (
+                            "UPDATE conversation_manifest_segments SET segment_position=segment_position+100 WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
+                            "UPDATE conversation_manifest_segments SET segment_position=segment_position-100 WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
+                            "",
+                        ),
+                        _ => (
+                            "UPDATE conversation_manifest_nodes SET total_message_count=total_message_count+1 WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
+                            "UPDATE conversation_manifest_nodes SET total_message_count=total_message_count-1 WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
+                            "",
+                        ),
+                    };
+                    let mut broken = sqlx::query(break_sql);
+                    if !saved.is_empty() {
+                        broken = broken.bind("{}");
+                    }
+                    broken = broken.bind(&user);
+                    if fault == "segment" {
+                        broken = broken.bind(&segment_hash);
+                    } else {
+                        broken = broken.bind(&session).bind(&old_manifest);
+                    }
+                    assert!(broken.execute(pool.get()).await.unwrap().rows_affected() > 0);
+                    assert!(
+                        persist_server_loop_canonical_terminal_settlement(
+                            &pool,
+                            append(),
+                            &state,
+                            settlement,
+                            None,
+                        )
+                        .await
+                        .is_err(),
+                        "{fault} corruption cannot resolve as an exact commit"
+                    );
+                    let mut restore = sqlx::query(restore_sql);
+                    if !saved.is_empty() {
+                        restore = restore.bind(saved);
+                    }
+                    restore = restore.bind(&user);
+                    if fault == "segment" {
+                        restore = restore.bind(&segment_hash);
+                    } else {
+                        restore = restore.bind(&session).bind(&old_manifest);
+                    }
+                    restore.execute(pool.get()).await.unwrap();
+                }
+                assert!(
+                    persist_server_loop_canonical_terminal_settlement(
+                        &pool,
+                        append(),
+                        &state,
+                        settlement,
+                        None,
+                    )
+                    .await
+                    .is_ok(),
+                    "only the unchanged, fully stored immutable commit may resolve"
+                );
+            }
+            state.final_text = "changed answer".into();
+            assert!(
+                persist_server_loop_canonical_terminal_settlement(
                     &pool,
                     append(),
                     &state,
                     settlement,
-                    None,
+                    None
                 )
                 .await
-                .expect_err("raw conflict must abort the whole canonical terminal");
-                assert!(error.contains(&event_id), "{error}");
-            }
-            let run_row = sqlx::query(
-                "SELECT status, total_prompt_tokens, total_completion_tokens, total_tool_calls
-                 FROM agent_runs WHERE user_id = ? AND run_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&run_id)
-            .fetch_one(&db)
-            .await
-            .unwrap();
-            assert_eq!(
-                run_row.try_get::<String, _>("status").unwrap(),
-                astra_core::STATUS_RUNNING
-            );
-            for column in [
-                "total_prompt_tokens",
-                "total_completion_tokens",
-                "total_tool_calls",
-            ] {
-                assert_eq!(run_row.try_get::<i64, _>(column).unwrap(), 0, "{column}");
-            }
-            let terminals: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?
-                 AND event_type IN ('text_done', 'run_finished')",
-            )
-            .bind(&user_id)
-            .bind(&run_id)
-            .fetch_one(&db)
-            .await
-            .unwrap();
-            assert_eq!(terminals, 0);
-            // Restore the fixture; the same state must now commit, replay, and
-            // resolve a lost acknowledgement through the checks below.
-            sqlx::query("UPDATE session_transcript_items SET content_hash=? WHERE user_id=? AND session_id=? AND source_event_id=?")
-                .bind(original_hash).bind(&user_id).bind(&session_id).bind(&event_id).execute(&db).await.unwrap();
-        }
-        if collision.is_none() {
-            let mut invalid_delta = delta.clone();
-            invalid_delta.completed_turn += 1;
-            let invalid_context = PreparedSessionContextCommit::new(
-                &reservation,
-                invalid_delta,
-                "context-commit",
-                true,
-            )
-            .unwrap();
-            let error = persist_server_loop_canonical_terminal_settlement(
-                &pool,
-                append(),
-                &state,
-                CanonicalTerminalSettlement {
-                    context_commit: Some(&invalid_context),
-                    ..settlement
-                },
-                None,
-            )
-            .await
-            .expect_err("context rejection must roll back the entire terminal");
-            assert!(
-                error.contains("canonical context settlement failed"),
-                "{error}"
-            );
-            assert!(coordinator.load_head(&key).await.unwrap().is_none());
-            assert!(
-                coordinator
-                    .load_active_writer(&key)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-            let status: String = sqlx::query_scalar(
-                "SELECT status FROM agent_runs WHERE user_id = ? AND run_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&run_id)
-            .fetch_one(&db)
-            .await
-            .unwrap();
-            assert_eq!(status, initial_status);
-            let terminal_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'llm_response'")
-                .bind(&user_id).bind(&session_id).fetch_one(&db).await.unwrap();
-            assert_eq!(terminal_rows, 0);
-
-            // Context was successfully staged here; rejecting the Run terminal
-            // must undo its immutable objects, head, writer release and receipt.
-            let error = persist_server_loop_canonical_terminal_settlement(
-                &pool,
-                append(),
-                &state,
-                CanonicalTerminalSettlement {
-                    expected_statuses: &["incompatible"],
-                    ..settlement
-                },
-                None,
-            )
-            .await
-            .expect_err("terminal rejection must roll back staged Context");
-            assert!(
-                error.contains("authoritative atomic terminal resolution conflict"),
-                "{error}"
-            );
-            assert!(coordinator.load_head(&key).await.unwrap().is_none());
-            assert!(
-                coordinator
-                    .load_active_writer(&key)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-            let immutable_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ? AND session_id = ?")
-                .bind(&user_id).bind(&session_id).fetch_one(&db).await.unwrap();
-            assert_eq!(immutable_rows, 0);
-        }
-        let diagnostic_id =
-            terminal_assistant_transcript_item(&user_id, &session_id, &run_id, None, "", &state)
-                .unwrap()
-                .source_event_id;
-        sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,run_id,event_type,content,payload_hash,ingestion_write_id) VALUES (?,?,?,?,'llm_response','conflicting optional diagnostic',?,'diagnostic-poison-fixture')")
-            .bind(&diagnostic_id).bind(&user_id).bind(&session_id).bind(&run_id).bind("0".repeat(64))
-            .execute(&db).await.unwrap();
-        sqlx::query("UPDATE agent_sessions SET event_count=1 WHERE user_id=? AND session_id=?")
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(&db)
-            .await
-            .unwrap();
-        let late_event = json!({"event_type":"user_intent", "idempotency_key":"user_intent:late-final-input",
-            "data":{"intent_id":"late-final-input", "delivery":"guide_current_run",
-                "input":{"content":"This input arrived after the model finished."}}});
-        let guidance_store = DatabaseRunStateStore::new(pool.clone());
-        let late_request = astra_services::runs::AtomicRunGuidanceAdmissionRequest {
-            user_id: &user_id,
-            expected_session_id: &session_id,
-            run_id: &run_id,
-            intent_id: "late-final-input",
-            event: &late_event,
-            process_local_execution_live: false,
-        };
-        if late_guidance {
-            assert!(matches!(
-                guidance_store
-                    .admit_run_guidance(late_request)
-                    .await
-                    .unwrap(),
-                astra_services::runs::AtomicRunGuidanceAdmission::Committed { .. }
-            ));
-        }
-        let queries = PersistenceQueries::default();
-        let subscriber = tracing_subscriber::registry().with(queries.clone());
-        let started = std::time::Instant::now();
-        let commit = persist_server_loop_canonical_terminal_settlement(
-            &pool,
-            append(),
-            &state,
-            settlement,
-            None,
-        )
-        .with_subscriber(subscriber)
-        .await
-        .expect("commit canonical terminal settlement");
-        let expected_cursor = context_commit.cursor();
-        assert_eq!(
-            commit.canonical_context_cursor,
-            Some(expected_cursor.clone())
-        );
-        assert_eq!(
-            coordinator.load_head(&key).await.unwrap().unwrap().cursor,
-            expected_cursor
-        );
-        assert!(
-            coordinator
-                .load_active_writer(&key)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            coordinator
-                .materialize(&coordinator.load_head(&key).await.unwrap().unwrap())
-                .await
-                .unwrap()
-                .messages,
-            delta
-                .logical_segments
-                .iter()
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>()
-        );
-
-        {
-            let statements = queries.0.lock().unwrap();
-            assert!(
-                !statements.is_empty(),
-                "SQL capture must observe the real writer"
-            );
-            assert_eq!(
-                statements
-                    .iter()
-                    .filter(|sql| sql.as_str() == "BEGIN")
-                    .count(),
-                1,
-                "Run and Context must share one transaction"
-            );
-
-            assert!(
-                !statements
-                    .iter()
-                    .any(|sql| sql.trim_start().starts_with("SELECT 1 FROM agent_runs")),
-                "owner fence must replace the preflight existence read"
-            );
-            eprintln!(
-                "canonical_terminal statements={} elapsed_us={}",
-                statements.len(),
-                started.elapsed().as_micros()
+                .is_err(),
+                "changed raw identity cannot resolve as an exact commit"
             );
         }
-        let committed_count = assert_session_event_count(&db, &user_id, &session_id).await;
-        assert_eq!(
-            committed_count, 1,
-            "settlement leaves the preexisting diagnostic untouched"
-        );
-        let committed_terminal_events = if late_guidance {
-            assert_eq!(commit.terminal_events.len(), terminal_events.len() + 1);
-            let returned = &commit.terminal_events[0];
-            assert_eq!(returned["event_type"], "user_intent_returned");
-            assert_eq!(returned["data"]["intent_id"], "late-final-input");
-            assert_eq!(&commit.terminal_events[1..], terminal_events);
-            assert!(
-                matches!(
-                    guidance_store
-                        .admit_run_guidance(late_request)
-                        .await
-                        .unwrap(),
-                    astra_services::runs::AtomicRunGuidanceAdmission::Duplicate { .. }
-                ),
-                "a lost acceptance ACK reconciles its original identity after terminal"
-            );
-            let fresh = json!({"event_type":"user_intent", "idempotency_key":"user_intent:after-terminal",
-                "data":{"intent_id":"after-terminal", "delivery":"guide_current_run",
-                    "input":{"content":"must be a new turn"}}});
-            assert!(matches!(
-                guidance_store
-                    .admit_run_guidance(astra_services::runs::AtomicRunGuidanceAdmissionRequest {
-                        intent_id: "after-terminal",
-                        event: &fresh,
-                        ..late_request
-                    })
-                    .await
-                    .unwrap(),
-                astra_services::runs::AtomicRunGuidanceAdmission::Inactive { .. }
-            ));
-            let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent_applied'")
-                .bind(&user_id).bind(&run_id).fetch_one(&db).await.unwrap();
-            assert_eq!(
-                applied, 0,
-                "late input was returned, never applied to a completed model request"
-            );
-            commit.terminal_events.clone()
-        } else {
-            assert_eq!(commit.terminal_events, terminal_events);
-            terminal_events.clone()
-        };
-        assert!(commit.terminal_assistant_source_event_id.is_some());
-        let canonical_store = DatabaseRunStateStore::new(pool.clone());
-        let canonical = canonical_store
-            .load_run(&user_id, &run_id)
+        for table in [
+            "conversation_manifest_segments",
+            "conversation_manifest_nodes",
+            "session_context_heads",
+            "session_context_operation_receipts",
+            "session_context_authority_events",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE owner_user_id = ? AND session_id = ?"
+            )))
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(canonical.status, terminal_status);
-        assert!(canonical.waiting_for.is_none());
-        assert!(canonical.last_event_idx > 0);
-        assert_eq!(
-            canonical
-                .events
-                .last()
-                .map(astra_services::extract_event_type)
-                .as_deref(),
-            Some("run_settlement_finished")
-        );
-        assert_eq!(
-            (
-                canonical.total_prompt_tokens,
-                canonical.total_completion_tokens,
-                canonical.total_tool_calls
-            ),
-            (37, 17, 6)
-        );
-        let checkpoint = canonical_store
-            .load_latest_checkpoint(&user_id, &run_id, None)
+        }
+        for table in ["agent_run_events", "agent_runs"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+            )))
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.checkpoint_kind, "resume");
-        assert_eq!(checkpoint.checkpoint_version, "checkpoint_v1");
-
-        // Exercise the same authoritative resolver used after a lost COMMIT
-        // acknowledgement, including its receipt and canonical-evidence checks.
-        let request_append = append();
-        let receipts = DatabaseRunStateStore::new(pool.clone())
-            .resolve_atomic_terminal_settlement(
-                atomic_terminal_request(&request_append, settlement),
-                None,
-            )
+        }
+        sqlx::query("DELETE FROM conversation_segments WHERE owner_user_id = ?")
+            .bind(&user)
+            .execute(pool.get())
             .await
-            .expect("read committed terminal receipts");
-        let receipts = classify_authoritative_terminal_resolution(receipts)
-            .unwrap()
-            .expect("terminal was committed")
-            .event_receipts;
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let (_, resolved) = resolve_existing_atomic_terminal_settlement(
-            &pool,
-            &append(),
-            &state,
-            settlement,
-            Some(&receipts),
-        )
-        .await
-        .expect("delayed lost-ack resolution retains the original capture")
-        .expect("commit must remain authoritative");
-        assert_eq!(resolved.committed_events, committed_terminal_events);
-        assert_eq!(
-            assert_session_event_count(&db, &user_id, &session_id).await,
-            committed_count
-        );
-
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let replay = persist_server_loop_canonical_terminal_settlement(
-            &pool,
-            append(),
-            &state,
-            settlement,
-            None,
-        )
-        .await
-        .expect("delayed terminal replay is idempotent");
-        assert_eq!(
-            assert_session_event_count(&db, &user_id, &session_id).await,
-            committed_count
-        );
-        assert_eq!(replay.terminal_events, commit.terminal_events);
-        assert_eq!(
-            replay.terminal_assistant_source_event_id,
-            commit.terminal_assistant_source_event_id
-        );
-
-        // A matching Run terminal and trace is insufficient when its canonical
-        // history request differs. The immutable terminal receipt binds both.
-        let mut changed_delta = delta.clone();
-        changed_delta.logical_segments[0][1]["content"] = json!("different canonical history");
-        let changed_context =
-            PreparedSessionContextCommit::new(&reservation, changed_delta, "context-commit", true)
-                .unwrap();
-        let error = persist_server_loop_canonical_terminal_settlement(
-            &pool,
-            append(),
-            &state,
-            CanonicalTerminalSettlement {
-                context_commit: Some(&changed_context),
-                ..settlement
-            },
-            None,
-        )
-        .await
-        .expect_err("a different context must not resolve as the committed Run");
-        assert!(
-            error.contains("authoritative atomic terminal resolution conflict"),
-            "{error}"
-        );
-        assert_eq!(
-            coordinator.load_head(&key).await.unwrap().unwrap().cursor,
-            expected_cursor
-        );
-
-        // Freezing time must not accept changed content under the same identity.
-        state.final_text = "conflicting answer".into();
-        let error = resolve_existing_atomic_terminal_settlement(
-            &pool,
-            &append(),
-            &state,
-            settlement,
-            Some(&receipts),
-        )
-        .await
-        .err()
-        .expect("changed capture must still conflict");
-        assert!(error.contains("conflicting transcript identity"), "{error}");
-
-        let canonical_event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&run_id)
-        .fetch_one(&db)
-        .await
-        .expect("count committed canonical events");
-        let transcript_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session_transcript_items
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&run_id)
-        .fetch_one(&db)
-        .await
-        .expect("count committed transcript items");
-        let terminal_event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_type IN ('text_done', 'run_finished')",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .fetch_one(&db)
-        .await
-        .expect("count committed terminal events");
-        let run_row = sqlx::query(
-            "SELECT status, total_prompt_tokens, total_completion_tokens, total_tool_calls
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .fetch_one(&db)
-        .await
-        .expect("load committed durable run");
-        assert_eq!(canonical_event_count, 1);
-        assert_eq!(
-            transcript_count, 3,
-            "original input, applied guidance and final answer"
-        );
-        assert_eq!(terminal_event_count, 2);
-        assert_eq!(
-            run_row.try_get::<String, _>("status").unwrap(),
-            terminal_status
-        );
-        assert_eq!(
-            run_row.try_get::<i64, _>("total_prompt_tokens").unwrap(),
-            37
-        );
-        assert_eq!(
-            run_row
-                .try_get::<i64, _>("total_completion_tokens")
-                .unwrap(),
-            17
-        );
-        assert_eq!(run_row.try_get::<i64, _>("total_tool_calls").unwrap(), 6);
-
-        sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
-            .bind(&user_id)
-            .bind(&run_id)
-            .execute(&db)
-            .await
-            .expect("cleanup durable run events");
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(&db)
-        .await
-        .expect("cleanup execution slot");
-        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
-            .bind(&user_id)
-            .bind(&run_id)
-            .execute(&db)
-            .await
-            .expect("cleanup durable run");
-        cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
+            .unwrap();
+        cleanup_core_persist_fixture_for_owner(pool.get(), &session, &user).await;
     }
 
     #[tokio::test]
@@ -6332,7 +6061,7 @@ mod tests {
         let store = Arc::new(
             DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("transcript-chunk-rollback"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &owner_user_id, &session_id)
             .await

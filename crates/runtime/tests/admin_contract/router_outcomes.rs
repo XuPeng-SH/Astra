@@ -193,7 +193,6 @@ impl OutcomeFixture {
     async fn cleanup(self) {
         for table in [
             "agent_run_events",
-            "agent_session_execution_slots",
             "agent_runs",
             "agent_sessions",
             "model_router_deployments",

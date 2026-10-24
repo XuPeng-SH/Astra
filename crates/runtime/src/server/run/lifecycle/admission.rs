@@ -148,41 +148,8 @@ pub(super) fn classified_terminal_error_code(error: &astra_core::ClassifiedError
 pub(super) fn classified_terminal_error_metadata(
     error: &astra_core::ClassifiedError,
 ) -> Map<String, Value> {
-    let Some(details) = error
-        .details_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| value.as_object().cloned())
-    else {
-        return Map::new();
-    };
-    if details.get("source").and_then(Value::as_str)
-        != Some(astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE)
-    {
-        return Map::new();
-    }
-    let mut metadata = Map::from_iter([(
-        "source".to_string(),
-        Value::String(astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE.to_string()),
-    )]);
-    if let Some(retryable) = details.get("retryable").and_then(Value::as_bool) {
-        metadata.insert("retryable".to_string(), Value::Bool(retryable));
-    }
-    if let Some(action) = details
-        .get("action")
-        .and_then(Value::as_str)
-        .filter(|value| astra_services::models::is_safe_moi_model_gateway_error_code(value))
-    {
-        metadata.insert("action".to_string(), Value::String(action.to_string()));
-    }
-    if let Some(status) = details
-        .get("http_status")
-        .and_then(Value::as_u64)
-        .filter(|status| (400..=599).contains(status))
-    {
-        metadata.insert("http_status".to_string(), Value::from(status));
-    }
-    metadata
+    astra_services::models::ModelGatewayErrorMetadata::from_error(error)
+        .map_or_else(Map::new, |metadata| metadata.wire_fields())
 }
 
 pub(super) fn register_run_admission_metrics(

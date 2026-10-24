@@ -2642,7 +2642,6 @@ mod tests {
 
     async fn cleanup(pool: &SharedPool, key: &SessionKeyV1) {
         for table in [
-            "agent_session_execution_slots",
             "run_checkpoints",
             "tool_invocation_ledger",
             "agent_run_events",
@@ -2919,28 +2918,22 @@ mod tests {
         // Controller leases are absent here. Actual execution still blocks
         // changing control, including a terminal executor which is unwinding.
         let run_id = format!("controller-run-{suffix}");
-        for (status, waiting, live_owner, occupied_slot) in [
-            ("running", None, false, false),
-            ("paused", Some("approval"), false, false),
-            ("completed", None, true, false),
-            ("completed", None, false, true),
+        for (status, waiting, live_owner) in [
+            ("running", None, false),
+            ("paused", Some("approval"), false),
+            ("completed", None, true),
         ] {
             sqlx::query("INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status, waiting_for, owner_pod_id, owner_lease_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL 60 SECOND))")
                 .bind(&key.owner_user_id).bind(&key.session_id).bind(&run_id)
                 .bind(&run_id).bind(&run_id).bind(status).bind(waiting).bind(live_owner.then_some("live-executor"))
                 .execute(pool.get()).await.unwrap();
-            if occupied_slot {
-                sqlx::query("INSERT INTO agent_session_execution_slots (user_id, session_id, run_id) VALUES (?, ?, ?)")
-                    .bind(&key.owner_user_id).bind(&key.session_id).bind(&run_id)
-                    .execute(pool.get()).await.unwrap();
-            }
             assert_eq!(
                 service
                     .take_idle_controller(&key, &source.attachment_id)
                     .await
                     .unwrap(),
                 ClaimSessionControllerOutcomeV1::Conflict,
-                "Run {status}/{waiting:?}/slot={occupied_slot}"
+                "Run {status}/{waiting:?}/live_owner={live_owner}"
             );
             assert_eq!(
                 service
@@ -2957,7 +2950,7 @@ mod tests {
                     .mode,
                 SessionAttachmentModeV1::Controller
             );
-            for table in ["agent_session_execution_slots", "agent_runs"] {
+            for table in ["agent_runs"] {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
                 )))
@@ -2983,7 +2976,7 @@ mod tests {
             ReleaseSessionControllerOutcomeV1::AlreadyReleased(_)
         ));
 
-        sqlx::query("INSERT INTO agent_session_execution_slots (user_id, session_id, run_id) VALUES (?, ?, 'unsettled-execution')")
+        sqlx::query("INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status, owner_pod_id, owner_lease_expires_at) VALUES (?, ?, 'unsettled-execution', 'unsettled-execution', 'unsettled-execution', 'completed', 'unwinding-owner', DATE_ADD(NOW(6), INTERVAL 60 SECOND))")
             .bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
         assert_eq!(
             service
@@ -2991,16 +2984,10 @@ mod tests {
                 .await
                 .unwrap(),
             ClaimSessionControllerOutcomeV1::Conflict,
-            "no writer or controller does not prove the execution slot is idle"
+            "no writer or controller does not prove the executor has retired"
         );
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&key.owner_user_id)
-        .bind(&key.session_id)
-        .execute(pool.get())
-        .await
-        .unwrap();
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = 'unsettled-execution'")
+            .bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
         assert!(matches!(
             service
                 .claim_idle_controller(&key, &source.attachment_id)

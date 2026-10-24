@@ -223,16 +223,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_messaging::db_transport",
         product_owner="distributed agent mailbox discovery and lease recovery",
     ),
-    "agent_session_execution_slots": TableMetadata(
-        semantic_owner="astra_services::runs::DatabaseRunStateStore",
-        state_class="session-scoped execution exclusion fact",
-        primary_query="single active run claim and stale-owner recovery by user_id, session_id, run_id, and updated_at",
-        retention_policy="retain only while a session run owns the execution slot; release on terminal transition and remove with session hard delete",
-        rebuildability="not safely rebuildable from run status during concurrent execution because it is the serialization authority",
-        merge_guidance="keep separate from agent_runs; the composite session key is the storage-enforced exclusivity boundary across competing run rows",
-        migration_owner="astra_services::runs",
-        product_owner="session run exclusivity, resume, and crash recovery",
-    ),
     "session_execution_bindings": TableMetadata(
         semantic_owner="astra_services::session_context_coordinator",
         state_class="durable canonical Session execution-provider authority",

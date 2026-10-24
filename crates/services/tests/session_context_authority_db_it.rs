@@ -1814,6 +1814,16 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
         .commit_turn(&next, plain, "plain-commit")
         .await
         .unwrap();
+    // A captured snapshot must not read or validate manifests appended after
+    // its cursor. Corrupting the newer generation member must not poison the
+    // still-valid earlier snapshot.
+    sqlx::query("UPDATE conversation_manifest_nodes SET manifest_json = '{}' WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND conversation_seq = 2")
+        .bind(&key.isolation_domain).bind(&key.owner_user_id).bind(&key.session_id)
+        .execute(pool.get()).await.unwrap();
+    assert_eq!(
+        coordinator.materialize(&head).await.unwrap().messages,
+        messages
+    );
     // The first receipt has now been archived; replay must still bind the
     // same canonical idempotency record.
     let mut changed = delta.clone();

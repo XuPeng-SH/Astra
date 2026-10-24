@@ -753,8 +753,8 @@ impl AppState {
         }
     }
 
-    /// Passively drain server-owned run tasks before removing their durable
-    /// resources or closing database pools.
+    /// Begin graceful Run shutdown and drain tasks before removing durable
+    /// resources or closing pools. New Run admissions stop during this drain.
     pub async fn drain_background_runs(&self, timeout: std::time::Duration) -> bool {
         let drained = self
             .execution

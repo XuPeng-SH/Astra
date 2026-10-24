@@ -358,7 +358,6 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("work_branch_creation_operations", "owner_id"),
         ("work_branch_control_operations", "owner_id"),
         ("work_branch_deletion_operations", "owner_id"),
-        ("agent_session_execution_slots", "user_id"),
         ("tool_invocation_ledger", "user_id"),
         ("agent_runs", "user_id"),
         ("work_item_attempts", "owner_id"),
@@ -5833,18 +5832,9 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
         .expect("existing session fixture");
     }
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'active-run')",
-    )
-    .bind(&owner_id)
-    .bind(&busy_session_id)
-    .execute(pool.get())
-    .await
-    .expect("active run fixture");
-    sqlx::query(
         "INSERT INTO agent_runs
-         (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status)
-         VALUES ('active-run', ?, ?, 'active-run', 'active-run', 0, 'running')",
+         (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status, owner_pod_id, owner_lease_expires_at)
+         VALUES ('active-run', ?, ?, 'active-run', 'active-run', 0, 'running', 'live-work-owner', DATE_ADD(NOW(6), INTERVAL 60 SECOND))",
     )
     .bind(&owner_id)
     .bind(&busy_session_id)
@@ -5852,14 +5842,17 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     .await
     .expect("active durable run fixture");
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'missing-durable-run')",
+        "INSERT INTO tool_invocation_ledger
+         (user_id, session_id, run_id, turn_chain_id, invocation_id, identity_key,
+          fingerprint_json, decision_json, state, dispatch_certainty, attempt_count)
+         VALUES (?, ?, 'missing-durable-run', 'orphan-turn', 'orphan-call', 'orphan-effect',
+                 '{}', '{}', 'outcome_unknown', 'unknown', 1)",
     )
     .bind(&owner_id)
     .bind(&orphan_run_session_id)
     .execute(pool.get())
     .await
-    .expect("orphan execution slot fixture");
+    .expect("orphan unresolved effect fixture");
 
     let request = serde_json::json!({
         "request_id": "promote-current-session",
@@ -5928,8 +5921,8 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     assert_eq!(second["code"], "work_session_already_bound");
 
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'later-run')",
+        "INSERT INTO agent_runs (user_id, session_id, run_id, status)
+         VALUES (?, ?, 'later-run', 'running')",
     )
     .bind(&owner_id)
     .bind(&session_id)
@@ -5940,12 +5933,6 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
         post_work_session_binding(app.clone(), &owner_id, &session_id, request.clone()).await;
     assert_eq!(busy_replay_status, StatusCode::CREATED);
     assert_eq!(busy_replay, left.1, "exact replay survives a later run");
-    sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
-        .bind(&owner_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("remove later active run fixture");
     sqlx::query("UPDATE agent_sessions SET status = 'closed' WHERE user_id = ? AND session_id = ?")
         .bind(&owner_id)
         .bind(&session_id)
@@ -6020,7 +6007,7 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     let running_created = repository
         .create_genesis_in_running_session(running_genesis, "active-run")
         .await
-        .expect("the exact slot-owning run may establish Work");
+        .expect("the exact live coordinator may establish Work");
     assert_eq!(
         running_created.delivery_branch.parts().session_id.as_str(),
         busy_session_id

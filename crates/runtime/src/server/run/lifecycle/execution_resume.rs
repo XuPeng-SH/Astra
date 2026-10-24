@@ -741,6 +741,7 @@ impl AgenticRunLifecycleService {
             host,
             loop_state: state,
             execution_owner_generation: run.run_generation,
+            opening_control_tail: None,
             owner_lease_heartbeat: None,
             canonical_turn: None,
             root_runtime_context_guard: Some(wiring.root_runtime_context_guard),

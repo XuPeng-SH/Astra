@@ -26,6 +26,22 @@ impl PermissionModeObservation {
         self.snapshot = None;
     }
 
+    /// The opening ACK proves empty permission history, not an applied mode.
+    /// Initial restrictions still come from the admitted request; later changes
+    /// require their existing durable application acknowledgement.
+    pub(crate) fn bind_opening_wake(
+        &mut self,
+        mut wake: tokio::sync::watch::Receiver<i64>,
+        tail: i64,
+    ) {
+        self.snapshot = Some(astra_turn_types::RunPermissionModeSnapshot::default());
+        let observed = *wake.borrow_and_update();
+        if observed > tail {
+            wake.mark_changed();
+        }
+        self.wake = Some(wake);
+    }
+
     async fn read(
         &mut self,
         control: &dyn crate::turn::run_control::RunControlProvider,
@@ -338,6 +354,48 @@ mod tests {
             state,
         )
     }
+    #[tokio::test]
+    async fn opening_ack_skips_only_empty_permission_history_and_keeps_late_requests() {
+        use std::sync::atomic::Ordering;
+        let control = Control::default();
+        let (send, receive) = tokio::sync::watch::channel(2);
+        let mut observation = PermissionModeObservation::default();
+        observation.bind_opening_wake(receive, 2);
+        assert_eq!(
+            observation
+                .read(&control, "owner", "session", "run")
+                .await
+                .unwrap(),
+            Some(RunPermissionModeSnapshot::default())
+        );
+        assert_eq!(control.reads.load(Ordering::Relaxed), 0);
+        control.request(PermissionMode::Prompt, 3);
+        send.send_replace(3);
+        let current = observation
+            .read(&control, "owner", "session", "run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.requested.unwrap().mode, PermissionMode::Prompt);
+        assert!(
+            current.applied.is_none(),
+            "observing a request cannot apply its permission mode"
+        );
+        assert_eq!(control.reads.load(Ordering::Relaxed), 1);
+        let mut attached_late = PermissionModeObservation::default();
+        attached_late.bind_opening_wake(send.subscribe(), 2);
+        assert!(
+            attached_late
+                .read(&control, "owner", "session", "run")
+                .await
+                .unwrap()
+                .unwrap()
+                .requested
+                .is_some()
+        );
+        assert_eq!(control.reads.load(Ordering::Relaxed), 2);
+    }
+
     #[tokio::test]
     async fn permission_mode_pending_selection_yields_to_cancellation() {
         let (mut host, mut state) = fixture(PermissionMode::Bypass);

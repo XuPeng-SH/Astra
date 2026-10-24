@@ -201,6 +201,8 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
     INDEX idx_agent_runs_owner_retry_of (user_id, retry_of),
     INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
+    INDEX idx_agent_runs_session_lease (user_id, session_id, owner_lease_expires_at),
+    INDEX idx_agent_runs_session_activity (user_id, session_id, status, waiting_for),
     INDEX idx_agent_runs_binding (agent_binding_id, created_at),
     INDEX idx_agent_runs_model_offering (model_offering_id, created_at),
     INDEX idx_agent_runs_owner_work_branch_created (
@@ -1006,30 +1008,17 @@ impl SessionWriteAdmissionFacts {
     }
 }
 
-/// Facts established by the canonical session -> execution-slot admission
-/// order. The slot tuple is already protected by the transaction's row/key
-/// lock and can be reused by the immediate run mutation for this exact
-/// session. It must not outlive that transaction or be reused after the slot
-/// is mutated.
+/// Transaction-local identity and status protected by lifecycle -> Session
+/// admission. Actual Runs and invocation custody own execution occupancy.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionExecutionAdmissionFacts {
     user_id: String,
     session_id: String,
-    session_status: Option<String>,
-    slot: Option<(String, chrono::NaiveDateTime)>,
 }
 
 impl SessionExecutionAdmissionFacts {
     pub(crate) fn belongs_to(&self, user_id: &str, session_id: &str) -> bool {
         self.user_id == user_id && self.session_id == session_id
-    }
-
-    pub(crate) fn session_is_active(&self) -> bool {
-        self.session_status.as_deref() == Some("active")
-    }
-
-    pub(crate) fn slot(&self) -> Option<&(String, chrono::NaiveDateTime)> {
-        self.slot.as_ref()
     }
 }
 
@@ -1129,8 +1118,7 @@ where
 /// run and any session-scoped execution authority derived from it.
 ///
 /// The caller supplies the session identity it already owns. We first fence
-/// the active, non-deleted session, then the session execution slot, and
-/// only then may the caller lock run rows. Sessions without an active run
+/// the active, non-deleted session, then may the caller lock or mutate Run rows. Sessions without an active run
 /// still use this fence, so run creation cannot race an idle handoff check.
 pub async fn admit_session_execution_write<T>(
     tx: &mut T,
@@ -1145,9 +1133,8 @@ where
         .map(|_| ())
 }
 
-/// Establish the session and execution-slot locks once and return the facts
-/// needed by the immediate mutation. The returned slot is not a cache; it is
-/// a transaction-local snapshot protected by the locks acquired below.
+/// Establish lifecycle and owned Session admission once. Ordinary mutations
+/// do not rediscover occupancy; independent creation checks actual owners.
 pub(crate) async fn admit_session_execution_write_with_facts<T>(
     tx: &mut T,
     session_id: &str,
@@ -1156,14 +1143,16 @@ pub(crate) async fn admit_session_execution_write_with_facts<T>(
 where
     T: TransactionConnection,
 {
-    let session = admit_session_event_write_with_facts(tx, session_id, user_id, false).await?;
+    admit_session_event_write(tx, session_id, user_id, false).await?;
 
-    lock_execution_slot_with_session_status(tx, session_id, user_id, Some(session.session_status))
-        .await
+    Ok(SessionExecutionAdmissionFacts {
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+    })
 }
 
 /// A standalone Context root need not have a Server display Session. Lock an
-/// existing display row when present, preserving the same deletion/slot order;
+/// existing display row when present, preserving the same deletion/Session order;
 /// absence never becomes an active-Session proof usable to create a Run.
 pub(crate) async fn admit_context_execution_write_with_facts<T>(
     tx: &mut T,
@@ -1184,45 +1173,120 @@ where
     if status.as_deref() == Some("deleting") {
         return Err(sqlx::Error::RowNotFound);
     }
-    lock_execution_slot_with_session_status(tx, session_id, user_id, status).await
-}
-
-async fn lock_execution_slot_with_session_status<T>(
-    tx: &mut T,
-    session_id: &str,
-    user_id: &str,
-    session_status: Option<String>,
-) -> Result<SessionExecutionAdmissionFacts, sqlx::Error>
-where
-    T: TransactionConnection,
-{
-    // Lock the derived slot before any run row. A missing slot is a valid
-    // state; the SELECT still establishes the canonical access order for
-    // engines that protect the key range on FOR UPDATE.
-    let slot = query(
-        "SELECT run_id, updated_at FROM agent_session_execution_slots
-         WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .map(|row| {
-        Ok::<_, sqlx::Error>((
-            row.try_get::<String, _>("run_id")?,
-            row.try_get::<chrono::NaiveDateTime, _>("updated_at")?,
-        ))
-    })
-    .transpose()?;
     Ok(SessionExecutionAdmissionFacts {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
-        session_status,
-        slot,
     })
 }
 
-/// Admit a session/slot and require an exact run when the caller has no
+/// Read the actual execution owners for one explicit user/Session. Each inner
+/// query must bind its own scope: MatrixOne may otherwise apply LIMIT before
+/// decorrelating an EXISTS, letting another Session hide this one's owner.
+/// Callers retain the lifecycle/Session fence and current-read locks.
+fn push_session_execution_activity(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) {
+    query.push("CAST((EXISTS (SELECT 1 FROM agent_runs activity WHERE activity.user_id = ")
+        .push_bind(user_id).push(" AND activity.session_id = ").push_bind(session_id)
+        .push(" AND (activity.status IN ('running', 'waiting') OR (activity.status = 'paused' AND activity.waiting_for IS NOT NULL))");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND activity.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE) OR EXISTS (SELECT 1 FROM agent_runs executor WHERE executor.user_id = ")
+        .push_bind(user_id).push(" AND executor.session_id = ").push_bind(session_id)
+        .push(" AND executor.owner_lease_expires_at >= NOW(6) AND executor.owner_pod_id IS NOT NULL");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND executor.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active, CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ")
+        .push_bind(user_id).push(" AND custody.session_id = ").push_bind(session_id)
+        .push(" AND custody.state IN ('prepared', 'dispatched', 'outcome_unknown')");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND custody.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE) AS SIGNED) AS execution_debt");
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionExecutionActivity {
+    pub(crate) active_run: bool,
+    pub(crate) unresolved_invocations: bool,
+}
+
+impl SessionExecutionActivity {
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.active_run && !self.unresolved_invocations
+    }
+
+    fn from_row(row: &sqlx::mysql::MySqlRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            active_run: row.try_get::<i64, _>("execution_active")? != 0,
+            unresolved_invocations: row.try_get::<i64, _>("execution_debt")? != 0,
+        })
+    }
+}
+
+/// New independent executions check occupancy in their existing owned Session
+/// read, before inserting a Run. Excluding the requested Run key permits only
+/// the unique-key replay path; a duplicate never returns a new execution grant.
+pub(crate) async fn admit_independent_run_creation<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+    run_id: &str,
+) -> Result<bool, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    lock_agent_session_write_fence(tx, session_id, user_id)
+        .await
+        .map_err(|error| match error {
+            sqlx::Error::Protocol(message) if message == "session has a durable deletion fence" => {
+                sqlx::Error::RowNotFound
+            }
+            error => error,
+        })?;
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT session.status, ");
+    push_session_execution_activity(&mut query, user_id, session_id, Some(run_id));
+    query
+        .push(" FROM agent_sessions session WHERE session.user_id = ")
+        .push_bind(user_id)
+        .push(" AND session.session_id = ")
+        .push_bind(session_id)
+        .push(" LIMIT 1 FOR UPDATE");
+    let row = query
+        .build()
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+    let status: String = row.try_get("status")?;
+    if status != "active" {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(SessionExecutionActivity::from_row(&row)?.is_idle())
+}
+
+/// Read actual Run/lease/effect custody under an already held Session fence.
+/// Resume may exclude its exact Run only after checkpoint/custody validation.
+pub(crate) async fn session_execution_activity<T>(
+    tx: &mut T,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) -> Result<SessionExecutionActivity, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT ");
+    push_session_execution_activity(&mut query, user_id, session_id, except_run_id);
+    let row = query.build().fetch_one(&mut **tx).await?;
+    SessionExecutionActivity::from_row(&row)
+}
+
+/// Admit a Session and require an exact run when the caller has no
 /// authoritative run lookup of its own. Callers that read the run should use
 /// session/execution admission followed by that locking read, not both.
 pub async fn admit_session_scoped_run_write<T>(
@@ -2203,6 +2267,14 @@ async fn verify_agent_runs_canonical_schema(
         (
             "idx_agent_runs_owner_lease",
             &["owner_pod_id", "owner_lease_expires_at"],
+        ),
+        (
+            "idx_agent_runs_session_activity",
+            &["user_id", "session_id", "status", "waiting_for"],
+        ),
+        (
+            "idx_agent_runs_session_lease",
+            &["user_id", "session_id", "owner_lease_expires_at"],
         ),
         (
             "idx_agent_runs_binding",
@@ -3596,23 +3668,6 @@ async fn ensure_core_schema_while_leased(
     core_schema_create!(pool, "agent_runs", AGENT_RUNS_CREATE_SQL)
         .execute(&pool)
         .await?;
-
-    core_schema_create!(
-        pool,
-        "agent_session_execution_slots",
-        "CREATE TABLE IF NOT EXISTS agent_session_execution_slots (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            acquired_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id),
-            INDEX idx_session_execution_slots_run (user_id, run_id),
-            INDEX idx_session_execution_slots_updated (updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(
         pool,
@@ -6097,24 +6152,6 @@ async fn verify_core_schema_shape(
         &[("trigger_event_id", AGENT_EVENT_ID_LEN as u64)],
     )
     .await?;
-    ensure_index_shape(
-        &indexes,
-        "agent_session_execution_slots",
-        "PRIMARY",
-        &["user_id", "session_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "agent_session_execution_slots",
-        "idx_session_execution_slots_run",
-        &["user_id", "run_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "agent_session_execution_slots",
-        "idx_session_execution_slots_updated",
-        &["updated_at"],
-    )?;
     ensure_index_shape(
         &indexes,
         "conversation_manifest_nodes",

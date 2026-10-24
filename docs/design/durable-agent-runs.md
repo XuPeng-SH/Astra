@@ -132,7 +132,7 @@ or evidence that same-run recovery is implemented.
   typed authority and settlement flow, never a status-only write.
 - Lease expiry enables recovery.
 - Fresh creation returns one process-local receipt for the owner generation
-  and initial lease committed with the run, session slot and opening events.
+  and initial lease committed with the Run and immutable opening.
   Initial activation consumes that receipt instead of renewing through another
   pooled connection, whose MatrixOne CN snapshot may predate the creation.
   Its monotonic lease bound starts before the creation operation, including
@@ -176,10 +176,16 @@ or evidence that same-run recovery is implemented.
   post-commit timeout refreshes the display projection on that exceptional
   path; ordinary commits do not add a second refresh.
 - Recovery must avoid double execution of non-idempotent actions.
-- Session execution slots prevent conflicting root runs when required by product semantics.
+- Independent execution admission uses lifecycle fence -> owned Session ->
+  actual Run/custody mutations. Blocking Run status, any live execution lease
+  (including a terminal executor still exiting), and prepared/dispatched/unknown
+  tool custody prevent conflicting admission, Controller reuse and destructive
+  maintenance. There is no derived execution-slot table or reclamation clock.
+  Expired running records wait for canonical recovery rather than allowing a
+  fresh Run to hide unsettled execution.
 - Recovery discovery is only a candidate list. A claim returns the new run
   snapshot and the previous generation observed under the write lock. Database
-  claims keep canonical session/slot/run locks through batch update, frontier
+  claims keep canonical lifecycle/Session/Run locks through batch update, frontier
   readback and commit; neither a pod identifier nor a lease timestamp identifies
   the winning invocation. Collision retries exclude identities already examined
   by that invocation. Generation exhaustion must not partially update a batch.
@@ -246,7 +252,7 @@ Resume should validate:
 - pending side-effect safety;
 - user intent.
 
-Buffered completion may finalize without resuming execution when the answer is already durable.
+A buffered answer does not authorize completion. Resume uses current authorization, custody, execution-slot and Context guards; only the execution owner can commit a terminal outcome.
 
 ### Process restart is not a new user turn
 
@@ -623,10 +629,16 @@ own event/trace surface rather than an extra copy in ordinary root history.
 Tool starts, routing and transport progress are live presentation. They do not
 open Run event transactions. The process-local replay buffer retains bounded
 outcomes for attached observers; another process may lag during execution.
-Tool outcomes are saved with the terminal event batch. A private live delivery
-watermark only suppresses duplicate attached-stream events and is never stored,
-exposed, or accepted as effect-settlement evidence. Approval requests and actual
-side effects retain their existing canonical admission and ledger boundaries.
+Generic tool cards, output previews and artifact-card reconstruction are not
+promised by cold Run replay. Missing optional cards must not delay completion
+or imply tool success; Web and SDK remove cards that have no own ending when
+the Run closes. Live endings retain bounded delivery and duplicate suppression.
+A private live watermark is never stored, exposed, or accepted as effect
+settlement evidence. Governed results and uncertainty stay in the invocation
+ledger/archive; canonical Context retains structured tool messages for model
+continuation. Approval and authenticated Runner evidence keep their existing
+owners. Tool names, provider output and an absent ledger entry never establish
+that an execution is readonly.
 
 Root runs persist optional model-round diagnostic traces only when the existing
 `explain` request is enabled. Resumed roots retain that original choice. Ordinary

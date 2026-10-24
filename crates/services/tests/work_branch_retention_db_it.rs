@@ -238,9 +238,8 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
             .is_none()
     );
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots
-         (user_id, session_id, run_id, acquired_at, updated_at)
-         VALUES (?, ?, ?, NOW(6), NOW(6))",
+        "INSERT INTO agent_runs (user_id, session_id, run_id, status)
+         VALUES (?, ?, ?, 'running')",
     )
     .bind(&owner_id)
     .bind(&session_id)
@@ -271,12 +270,12 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         .unwrap(),
         "active"
     );
-    sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?")
         .bind(&owner_id)
         .bind(&session_id)
         .execute(pool.get())
         .await
-        .expect("settle active run");
+        .unwrap();
     let fenced = deletion
         .fence_session(
             &WorkOwnerId::parse(&owner_id).unwrap(),
@@ -1177,9 +1176,8 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
     ));
 
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots
-         (user_id, session_id, run_id, acquired_at, updated_at)
-         VALUES (?, ?, ?, NOW(6), NOW(6))",
+        "INSERT INTO agent_runs (user_id, session_id, run_id, status)
+         VALUES (?, ?, ?, 'running')",
     )
     .bind(&owner_id)
     .bind(&session_id)
@@ -1200,13 +1198,13 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         repository.change_branch_retention(active_archive).await,
         Err(WorkRepositoryError::BranchActive)
     ));
-    sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?")
         .bind(&owner_id)
         .bind(&session_id)
         .execute(pool.get())
         .await
-        .expect("release branch session");
-
+        .unwrap();
     let stale_archive = retention_change(
         &owner_id,
         &work_id,

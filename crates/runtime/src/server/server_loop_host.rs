@@ -1281,7 +1281,7 @@ enum AuxiliaryLlmPolicy {
     CapacityAware,
     Always,
     Disabled,
-    /// Explicit low-latency opt-out: only typed effect/topology boundaries
+    /// Default: only typed effect/topology boundaries
     /// trigger Work admission; ordinary text stays on the primary request.
     BoundaryOnly,
 }
@@ -1292,7 +1292,7 @@ impl AuxiliaryLlmPolicy {
             .ok()
             .as_deref()
             .map(parse_auxiliary_llm_policy)
-            .unwrap_or(Self::CapacityAware)
+            .unwrap_or(Self::BoundaryOnly)
     }
 
     fn as_label(self) -> &'static str {
@@ -1311,11 +1311,9 @@ fn parse_auxiliary_llm_policy(raw: &str) -> AuxiliaryLlmPolicy {
         "disabled" | "disable" | "off" | "false" | "0" => AuxiliaryLlmPolicy::Disabled,
         "capacity_aware" | "capacity-aware" | "auto" => AuxiliaryLlmPolicy::CapacityAware,
         "boundary_only" | "boundary-only" => AuxiliaryLlmPolicy::BoundaryOnly,
-        // Empty and unknown values must not silently disable the semantic
-        // Work classifier. Fail safe to the adaptive product default so a
-        // typo cannot turn a durable user request into an untracked turn.
-        "" => AuxiliaryLlmPolicy::CapacityAware,
-        _ => AuxiliaryLlmPolicy::CapacityAware,
+        // Keep required Work classification at real boundaries without
+        // enabling unrelated optional inference for an unset or mistyped value.
+        _ => AuxiliaryLlmPolicy::BoundaryOnly,
     }
 }
 
@@ -1342,12 +1340,12 @@ fn auxiliary_llm_policy_label() -> &'static str {
     AuxiliaryLlmPolicy::from_env().as_label()
 }
 
-/// Work admission is the semantic lifecycle classifier. The capacity-aware
+/// Work admission is the semantic lifecycle classifier. The boundary-only
 /// default spends a bounded decision at an existing typed effect/topology
 /// boundary, where the result has an immediate admission consumer. It does
 /// not speculate beside an ordinary unbound primary turn. `always` is the
-/// explicit high-frequency mode for deployments that want that speculation;
-/// `boundary_only` additionally suppresses unrelated optional auxiliaries.
+/// explicit high-frequency mode for deployments that want that speculation.
+/// `capacity_aware` opts into unrelated optional auxiliaries when capacity permits.
 /// A provider `start_work` carrier is a typed payload; any available decision
 /// is settled before canonical admission. With no configured judge or no
 /// usable result, normal typed admission remains.
@@ -10491,6 +10489,12 @@ impl ServerAgenticLoopHost {
         });
         self.work_establishment_hydrated = true;
         Ok(())
+    }
+
+    /// Fresh ordinary chat has no admitted Work operation to recover. The
+    /// explicit Work and checkpoint paths keep their existing durable recovery.
+    pub(crate) fn skip_implicit_work_recovery(&mut self) {
+        self.work_establishment_hydrated = true;
     }
 
     /// Rehydrate a pending lifecycle carrier that was durably admitted by a
@@ -22003,7 +22007,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .iter()
             .map(|result| result.request_id.as_str())
             .collect::<std::collections::HashSet<_>>();
-        let pre_execution_rejections = invocations
+        let mut pre_execution_rejections = invocations
             .iter()
             .filter_map(|invocation| {
                 let result = blocked.iter().find(|result| {
@@ -22041,7 +22045,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 })
             })
             .collect::<Vec<_>>();
-        let executable = tool_calls
+        let mut executable = tool_calls
             .iter()
             .filter(|call| {
                 !call
@@ -22051,6 +22055,41 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let inbox_calls = invocations
+            .iter()
+            .filter(|invocation| {
+                !invocation
+                    .provider_call_id()
+                    .is_some_and(|id| blocked_ids.contains(id))
+                    && state
+                        .runtime_tool_executor
+                        .as_ref()
+                        .is_some_and(|executor| {
+                            executor.invocation_requires_receive_inbox(invocation)
+                        })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !inbox_calls.is_empty()
+            && let Err(error) = state.messaging.ensure_mailbox().await
+        {
+            let rejected_ids = inbox_calls
+                .iter()
+                .filter_map(|call| call.provider_call_id())
+                .collect::<std::collections::HashSet<_>>();
+            executable.retain(|call| {
+                !call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| rejected_ids.contains(id))
+            });
+            pre_execution_rejections.extend(inbox_calls.into_iter().map(|invocation| {
+                    crate::turn::agentic_loop::host::RejectedToolCall {
+                        invocation,
+                        result: json!({"status":"failed","error_kind":"mailbox_unavailable", "error":error, "advisory":{"executed":false}}).to_string(),
+                    }
+                }));
+        }
         let mut result = self.handle_admitted_tool_calls(state, &executable).await;
         result
             .pre_execution_rejections
@@ -24736,8 +24775,7 @@ mod tests {
             .await
             .unwrap();
             let slot: Option<String> = sqlx::query_scalar(
-                "SELECT run_id FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
+                "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
             )
             .bind(&user)
             .bind(session)
@@ -49621,6 +49659,7 @@ mod tests {
             ProviderObservationsFixture, loop_state, server_host_builder,
         };
         for (policy, admission_mode) in [
+            ("", "disabled"),
             ("boundary_only", "disabled"),
             ("capacity_aware", "db_fixed_window"),
             ("disabled", "disabled"),
@@ -51335,7 +51374,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn maybe_pre_turn_compact_skips_gateway_when_provider_admission_is_enabled() {
-        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "capacity_aware");
         let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
         let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
 
@@ -53191,10 +53230,12 @@ mod tests {
                 parse_auxiliary_llm_policy("boundary_only"),
                 AuxiliaryLlmPolicy::BoundaryOnly
             );
-            assert_eq!(
-                parse_auxiliary_llm_policy("surprise"),
-                AuxiliaryLlmPolicy::CapacityAware
-            );
+            for value in ["", "  ", "surprise"] {
+                assert_eq!(
+                    parse_auxiliary_llm_policy(value),
+                    AuxiliaryLlmPolicy::BoundaryOnly
+                );
+            }
         }
 
         #[test]
@@ -53205,7 +53246,11 @@ mod tests {
 
             assert_eq!(
                 AuxiliaryLlmPolicy::from_env(),
-                AuxiliaryLlmPolicy::CapacityAware
+                AuxiliaryLlmPolicy::BoundaryOnly
+            );
+            assert_eq!(
+                should_skip_auxiliary_llm_for_capacity(),
+                Some("boundary_only")
             );
             assert_eq!(
                 should_skip_work_admission_judge(false, false),
