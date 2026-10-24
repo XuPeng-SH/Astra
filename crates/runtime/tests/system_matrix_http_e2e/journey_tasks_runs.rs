@@ -723,7 +723,7 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let requests = ctx.native_provider_requests().await;
         assert_eq!(requests.len(), 2, "one physical request before and after restart");
         let messages = requests[1].body["messages"].as_array().unwrap();
-        assert_eq!(original.opening.as_ref().unwrap().root_context().unwrap().original_input, message);
+        assert_eq!(original.opening.as_ref().unwrap().input().unwrap().original_input, message);
         assert_eq!(requests[0].body["messages"].as_array().unwrap().iter()
             .filter(|m| m["role"] == "user" && m["content"] == message.trim()).count(), 1);
         assert_eq!(messages.iter().filter(|m| m["role"] == "user" && m["content"] == message.trim()).count(), 1);

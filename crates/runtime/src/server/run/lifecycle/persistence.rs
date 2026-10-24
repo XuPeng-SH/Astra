@@ -594,8 +594,8 @@ async fn prepare_canonical_terminal(
         let mut authority = run
             .opening
             .as_ref()
-            .and_then(|opening| opening.root_context())
-            .map(|context| context.authority.clone());
+            .and_then(|opening| opening.context_authority())
+            .cloned();
         if let Some(authority) = &mut authority {
             authority.generation = settlement.expected_owner_generation;
         }

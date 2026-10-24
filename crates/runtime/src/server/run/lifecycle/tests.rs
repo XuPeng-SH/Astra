@@ -11787,7 +11787,10 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
                 &user,
                 &session,
                 Some(&session),
-                Default::default(),
+                RunStartContext {
+                    original_input: Some(request.message.clone()),
+                    ..Default::default()
+                },
                 true,
                 if reject {
                     &mut participant
@@ -11817,7 +11820,10 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
                         &user,
                         &session,
                         Some(&session),
-                        Default::default(),
+                        RunStartContext {
+                            original_input: Some(request.message.clone()),
+                            ..Default::default()
+                        },
                         true,
                         &mut replay,
                     )
@@ -11841,7 +11847,10 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
                     &user,
                     &session,
                     Some(&session),
-                    Default::default(),
+                    RunStartContext {
+                        original_input: Some(request.message.clone()),
+                        ..Default::default()
+                    },
                     true,
                     &mut loser,
                 )
@@ -11873,14 +11882,14 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
                 .await
                 .unwrap()
                 .unwrap();
-            let opening = stored.opening.as_ref().unwrap().root_context().unwrap();
+            let opening = stored.opening.as_ref().unwrap().input().unwrap();
             assert_eq!(
                 opening.original_input, request.message,
                 "original input must survive before workspace/provider work"
             );
             assert_eq!(
-                opening.authority,
-                participant.0.admission.as_ref().unwrap().authority
+                opening.context_authority.as_ref(),
+                Some(&participant.0.admission.as_ref().unwrap().authority)
             );
             assert_eq!(
                 stored.opening_hash,

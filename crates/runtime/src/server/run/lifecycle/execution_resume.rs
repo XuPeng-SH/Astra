@@ -732,7 +732,7 @@ impl AgenticRunLifecycleService {
             user_message: run
                 .opening
                 .as_ref()
-                .and_then(astra_services::runs::DurableRunOpening::root_context)
+                .and_then(astra_services::runs::DurableRunOpening::input)
                 .ok_or_else(|| invalid_resume("original user input is missing"))?
                 .original_input
                 .clone(),

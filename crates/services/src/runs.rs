@@ -1751,14 +1751,14 @@ impl DurableWorkItemRunBinding {
 pub struct DurableRunOpening {
     schema_version: u32,
     events: Vec<serde_json::Value>,
-    root_context: Option<RunContextOpening>,
+    input: Option<RunInputOpening>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RunContextOpening {
-    pub authority: crate::session_context_coordinator::RunContextAuthority,
+pub struct RunInputOpening {
     pub original_input: String,
+    pub context_authority: Option<crate::session_context_coordinator::RunContextAuthority>,
 }
 
 fn is_run_opening_fact(event: &serde_json::Value) -> bool {
@@ -1771,9 +1771,9 @@ fn is_run_opening_fact(event: &serde_json::Value) -> bool {
 impl DurableRunOpening {
     pub fn new(events: Vec<serde_json::Value>) -> Result<Self, String> {
         let opening = Self {
-            schema_version: 1,
+            schema_version: 2,
             events,
-            root_context: None,
+            input: None,
         };
         opening.validate()?;
         Ok(opening)
@@ -1781,7 +1781,7 @@ impl DurableRunOpening {
 
     fn validate(&self) -> Result<(), String> {
         let mut kinds = HashSet::new();
-        if self.schema_version != 1
+        if self.schema_version != 2
             || self
                 .events
                 .first()
@@ -1816,9 +1816,8 @@ impl DurableRunOpening {
     }
 
     fn context_fingerprint(&self) -> Option<String> {
-        self.root_context
-            .as_ref()
-            .map(|context| context.authority.admission_fingerprint())
+        self.context_authority()
+            .map(crate::session_context_coordinator::RunContextAuthority::admission_fingerprint)
     }
 
     fn indexed_events(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
@@ -1829,16 +1828,44 @@ impl DurableRunOpening {
         })
     }
 
-    pub fn bind_root_context(&mut self, context: RunContextOpening) -> Result<(), String> {
-        if self.root_context.is_some() {
-            return Err("Run opening Context has already been admitted".into());
+    /// Data only: creation normalizes this input before any authority is bound.
+    pub fn bind_input(&mut self, original_input: String) -> Result<(), String> {
+        if self.input.is_some() {
+            return Err("Run opening input has already been captured".into());
         }
-        self.root_context = Some(context);
+        self.input = Some(RunInputOpening {
+            original_input,
+            context_authority: None,
+        });
         Ok(())
     }
 
-    pub fn root_context(&self) -> Option<&RunContextOpening> {
-        self.root_context.as_ref()
+    /// Only a creation participant may bind the Context grant it established
+    /// in that transaction. Generic creation rejects prebound authority.
+    pub fn bind_context_authority(
+        &mut self,
+        authority: crate::session_context_coordinator::RunContextAuthority,
+        expected_input: &str,
+    ) -> Result<(), String> {
+        let input = self
+            .input
+            .as_mut()
+            .ok_or("Root opening has no original input")?;
+        if input.original_input != expected_input || input.context_authority.is_some() {
+            return Err("Root opening input or Context authority conflicts".into());
+        }
+        input.context_authority = Some(authority);
+        Ok(())
+    }
+
+    pub fn input(&self) -> Option<&RunInputOpening> {
+        self.input.as_ref()
+    }
+
+    pub fn context_authority(
+        &self,
+    ) -> Option<&crate::session_context_coordinator::RunContextAuthority> {
+        self.input.as_ref()?.context_authority.as_ref()
     }
 
     pub fn events(&self) -> &[serde_json::Value] {
@@ -1850,7 +1877,7 @@ impl DurableRunOpening {
         let events = serde_json::to_value(&self.events).map_err(|error| error.to_string())?;
         let events_json = astra_core::canonical_json_string(&events);
         let context_json = self
-            .root_context
+            .input
             .as_ref()
             .map(|context| {
                 serde_json::to_value(context)
@@ -1862,9 +1889,9 @@ impl DurableRunOpening {
         let parts = [
             "{\"events\":",
             &events_json,
-            ",\"root_context\":",
+            ",\"input\":",
             context,
-            ",\"schema_version\":1}",
+            ",\"schema_version\":2}",
         ];
         let size = parts
             .iter()
@@ -1874,7 +1901,7 @@ impl DurableRunOpening {
             return Err("Run opening exceeds the bounded snapshot size".into());
         }
         let mut digest = Sha256::new();
-        digest.update(b"astra.run-opening.v1\0");
+        digest.update(b"astra.run-opening.v2\0");
         for part in parts {
             digest.update(part.as_bytes());
         }
@@ -1909,6 +1936,27 @@ struct EncodedRunOpening {
     events_json: String,
     context_json: Option<String>,
     hash: String,
+}
+
+fn normalize_run_opening(record: &mut DurableRunRecord) -> Result<(), String> {
+    let input = record.opening.take().and_then(|opening| opening.input);
+    if input
+        .as_ref()
+        .is_some_and(|input| input.context_authority.is_some())
+    {
+        return Err("Run Context authority must be admitted by the creation transaction".into());
+    }
+    record.opening = DurableRunOpening::capture(&record.events)?;
+    record.opening_hash = None;
+    record.context_admission_hash = None;
+    if let Some(input) = input {
+        record
+            .opening
+            .as_mut()
+            .ok_or("Run input requires an immutable opening")?
+            .bind_input(input.original_input)?;
+    }
+    Ok(())
 }
 
 fn finalize_run_opening(
@@ -7204,7 +7252,7 @@ impl InMemoryRunStateStore {
         claim_existing: bool,
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String> {
-        record.opening = DurableRunOpening::capture(&record.events)?;
+        normalize_run_opening(&mut record)?;
         if let Some(opening) = &record.opening {
             record.opening_hash = Some(opening.encode()?.hash);
             record.context_admission_hash = opening.context_fingerprint();
@@ -14032,7 +14080,7 @@ impl DatabaseRunStateStore {
         &self,
         record: &mut DurableRunRecord,
     ) -> Result<Vec<RunEventInsertRow>, String> {
-        record.opening = DurableRunOpening::capture(&record.events)?;
+        normalize_run_opening(record)?;
         let mut events = std::mem::take(&mut record.events);
         if events.is_empty() {
             events.push(run_created_receipt_event(
@@ -15264,7 +15312,7 @@ impl DatabaseRunStateStore {
         if record
             .opening
             .as_ref()
-            .and_then(DurableRunOpening::root_context)
+            .and_then(DurableRunOpening::context_authority)
             .is_none()
         {
             crate::session_context_coordinator::ensure_run_execution_binding_ready_in_tx(
@@ -24214,10 +24262,11 @@ fn run_list_cursor_from_row(row: &impl RunStateDbRow) -> DbStoreResult<RunListCu
     Ok(RunListCursor { updated_at, run_id })
 }
 
-fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<DurableRunRecord> {
+fn decode_run_opening_from_row(
+    row: &impl RunStateDbRow,
+) -> DbStoreResult<Option<DurableRunOpening>> {
     let operation = "decode_run_row";
     let table = "agent_runs";
-    let run_id = run_row_string(row, operation, table, "run_id")?;
     let opening_hash = run_row_optional_string(row, operation, table, "opening_hash")?;
     let context_admission_hash =
         run_row_optional_string(row, operation, table, "context_admission_hash")?;
@@ -24246,17 +24295,17 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
                 }
                 let events = serde_json::from_str(&events)
                     .map_err(|_| invalid("invalid Run opening events"))?;
-                let root_context = context
+                let input = context
                     .as_deref()
                     .map(|json| {
-                        serde_json::from_str::<RunContextOpening>(json)
+                        serde_json::from_str::<RunInputOpening>(json)
                             .map_err(|_| invalid("invalid Run opening Context"))
                     })
                     .transpose()?;
                 let opening = DurableRunOpening {
-                    schema_version: 1,
+                    schema_version: 2,
                     events,
-                    root_context,
+                    input,
                 };
                 let encoded = opening.encode().map_err(|message| invalid(&message))?;
                 if opening_hash.as_deref() != Some(encoded.hash.as_str())
@@ -24272,6 +24321,17 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
         },
         _ => return Err(invalid("invalid or conflicting Run opening projection")),
     };
+    Ok(opening)
+}
+
+fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<DurableRunRecord> {
+    let operation = "decode_run_row";
+    let table = "agent_runs";
+    let run_id = run_row_string(row, operation, table, "run_id")?;
+    let opening_hash = run_row_optional_string(row, operation, table, "opening_hash")?;
+    let context_admission_hash =
+        run_row_optional_string(row, operation, table, "context_admission_hash")?;
+    let opening = decode_run_opening_from_row(row)?;
     Ok(DurableRunRecord {
         opening,
         opening_hash,
@@ -27788,9 +27848,9 @@ mod tests {
         }
     }
 
-    fn opening_context_fixture(input: String) -> RunContextOpening {
-        RunContextOpening {
-            authority: crate::session_context_coordinator::RunContextAuthority {
+    fn opening_context_fixture(input: String) -> RunInputOpening {
+        RunInputOpening {
+            context_authority: Some(crate::session_context_coordinator::RunContextAuthority {
                 key: SessionKeyV1::owner_session("server", "owner", "session", "main"),
                 run_id: "run".into(),
                 generation: 0,
@@ -27800,8 +27860,70 @@ mod tests {
                 writer_epoch: 0,
                 authority_epochs: Default::default(),
                 binding: crate::session_context_coordinator::RunContextBinding::Absent,
-            },
+            }),
             original_input: input,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_creation_preserves_exact_input_without_granting_context_authority() {
+        for input in [None, Some(String::new()), Some("子任务🙂\n\t\"\\\0".into())] {
+            let store = InMemoryRunStateStore::new();
+            let mut run = durable_run_record("input-run");
+            run.events = vec![make_event("run_started", json!({"run_id":"input-run"}))];
+            run.opening = DurableRunOpening::capture(&run.events).unwrap();
+            if let Some(input) = &input {
+                run.opening
+                    .as_mut()
+                    .unwrap()
+                    .bind_input(input.clone())
+                    .unwrap();
+            }
+            run.opening_hash = Some("caller supplied hash".into());
+            run.context_admission_hash = Some("caller supplied grant".into());
+            store.insert_run(run).await.unwrap();
+            let loaded = store.load_run("u1", "input-run").await.unwrap().unwrap();
+            let opening = loaded.opening.as_ref().unwrap();
+            assert_eq!(
+                opening.input().map(|value| &value.original_input),
+                input.as_ref()
+            );
+            assert!(opening.context_authority().is_none());
+            assert!(loaded.context_admission_hash.is_none());
+            assert_eq!(
+                loaded.opening_hash.as_deref(),
+                Some(opening.encode().unwrap().hash.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_creation_rejects_prebound_authority_or_input_without_admission() {
+        for prebound in [false, true] {
+            let store = InMemoryRunStateStore::new();
+            let mut run = durable_run_record("forged-input");
+            let mut opening =
+                DurableRunOpening::new(vec![make_event("run_started", json!({}))]).unwrap();
+            opening.input = Some(opening_context_fixture("exact input".into()));
+            if prebound {
+                run.events = opening.events.clone();
+            } else {
+                opening.input.as_mut().unwrap().context_authority = None;
+            }
+            run.opening = Some(opening);
+            let error = store.insert_run(run).await.unwrap_err();
+            assert!(error.contains(if prebound {
+                "creation transaction"
+            } else {
+                "immutable opening"
+            }));
+            assert!(
+                store
+                    .load_run("u1", "forged-input")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -27814,10 +27936,10 @@ mod tests {
             let mut opening = DurableRunOpening::new(vec![json!({
                 "event_type":"run_started", "data":{"z":[null,true,1.0],"a":{"z":2,"a":"中文🙂\n\0"}}
             })]).unwrap();
-            opening.root_context = context;
+            opening.input = context;
             let whole = astra_core::canonical_json_string(&serde_json::to_value(&opening).unwrap());
             let mut expected = Sha256::new();
-            expected.update(b"astra.run-opening.v1\0");
+            expected.update(b"astra.run-opening.v2\0");
             expected.update(whole.as_bytes());
             let encoded = opening.encode().unwrap();
             assert_eq!(encoded.hash, format!("{:x}", expected.finalize()));
@@ -27829,10 +27951,10 @@ mod tests {
                 encoded
                     .context_json
                     .as_deref()
-                    .map(serde_json::from_str::<RunContextOpening>)
+                    .map(serde_json::from_str::<RunInputOpening>)
                     .transpose()
                     .unwrap(),
-                opening.root_context
+                opening.input
             );
         }
         let mut opening =
@@ -27851,7 +27973,7 @@ mod tests {
             "canonical framing counts toward the byte limit"
         );
         opening.events[0]["data"]["text"] = json!("x".repeat(MAX_RUN_CHECKPOINT_BYTES / 2));
-        opening.root_context = Some(opening_context_fixture(
+        opening.input = Some(opening_context_fixture(
             "x".repeat(MAX_RUN_CHECKPOINT_BYTES / 2),
         ));
         assert!(
@@ -29363,7 +29485,7 @@ mod tests {
             });
     }
 
-    struct RunContextOpeningFixture {
+    struct RunInputOpeningFixture {
         coordinator: crate::session_context_coordinator::DatabaseSessionContextCoordinator,
         key: SessionKeyV1,
         run_id: String,
@@ -29373,7 +29495,7 @@ mod tests {
         expected_binding_generation: Option<u64>,
     }
 
-    impl RunContextOpeningFixture {
+    impl RunInputOpeningFixture {
         fn new(
             pool: astra_core::SharedPool,
             user: &str,
@@ -29392,10 +29514,15 @@ mod tests {
                 expected_binding_generation: None,
             }
         }
+        fn capture_input(&self, run: &mut DurableRunRecord) {
+            let mut opening = DurableRunOpening::capture(&run.events).unwrap().unwrap();
+            opening.bind_input(self.original_input.clone()).unwrap();
+            run.opening = Some(opening);
+        }
     }
 
     #[async_trait]
-    impl RunStartTransactionParticipant for RunContextOpeningFixture {
+    impl RunStartTransactionParticipant for RunInputOpeningFixture {
         async fn stage(
             &mut self,
             tx: &mut Transaction<'_, MySql>,
@@ -29414,12 +29541,8 @@ mod tests {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            opening
-                .ok_or("missing Run opening")?
-                .bind_root_context(RunContextOpening {
-                    authority: authority.clone(),
-                    original_input: self.original_input.clone(),
-                })?;
+            let opening = opening.ok_or("missing Run opening")?;
+            opening.bind_context_authority(authority.clone(), &self.original_input)?;
             self.authority = Some(authority);
             Ok(())
         }
@@ -29440,10 +29563,7 @@ mod tests {
             ActorContextV1, ActorKindV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalDeltaModeV1,
             CanonicalTurnDeltaV1, CoordinatorMutationV1, SessionSurfaceV1,
         };
-        struct AnnouncedOpening(
-            RunContextOpeningFixture,
-            std::sync::Arc<tokio::sync::Notify>,
-        );
+        struct AnnouncedOpening(RunInputOpeningFixture, std::sync::Arc<tokio::sync::Notify>);
         #[async_trait]
         impl RunStartTransactionParticipant for AnnouncedOpening {
             async fn prepare(&mut self) -> Result<(), String> {
@@ -29552,13 +29672,14 @@ mod tests {
             };
             let announced = std::sync::Arc::new(tokio::sync::Notify::new());
             let mut fixture =
-                RunContextOpeningFixture::new(pool.clone(), &user, &session, &run_id, "hi".into());
+                RunInputOpeningFixture::new(pool.clone(), &user, &session, &run_id, "hi".into());
             fixture.expected_binding_generation = Some(0);
             let mut participant = AnnouncedOpening(fixture, announced.clone());
             let mut run = durable_run_record(&run_id);
             run.user_id = user.clone();
             run.session_id = session.clone();
             run.events = vec![json!({"event_type":"run_started", "data":{}})];
+            participant.0.capture_input(&mut run);
             let task_store = store.clone();
             let run_session = session.clone();
             let waiter = tokio::spawn(async move {
@@ -29643,7 +29764,7 @@ mod tests {
         let session = format!("expired-controller-s-{nonce}");
         let run_id = format!("expired-controller-r-{nonce}");
         insert_active_database_session_fixture(&pool, &user, &session).await;
-        let mut participant = RunContextOpeningFixture::new(
+        let mut participant = RunInputOpeningFixture::new(
             pool.clone(),
             &user,
             &session,
@@ -29681,6 +29802,7 @@ mod tests {
         run.user_id = user.clone();
         run.session_id = session.clone();
         run.events = vec![json!({"event_type":"run_started", "data":{}})];
+        participant.capture_input(&mut run);
         assert!(
             store
                 .insert_run_with_participant(run.clone(), true, Some(&session), &mut participant)
@@ -29717,9 +29839,8 @@ mod tests {
             .opening
             .as_ref()
             .unwrap()
-            .root_context()
-            .unwrap()
-            .authority;
+            .context_authority()
+            .unwrap();
         assert!(authority.row_exists);
         assert_eq!(
             authority.writer_epoch, lease.writer_epoch,
@@ -29768,7 +29889,7 @@ mod tests {
             None,
             Default::default(),
         );
-        let mut participant = RunContextOpeningFixture::new(
+        let mut participant = RunInputOpeningFixture::new(
             pool.clone(),
             user,
             session,
@@ -29780,6 +29901,7 @@ mod tests {
         run.session_id = session.into();
         run.last_event_idx = 0;
         run.events = vec![json!({"event_type":"run_started", "data":{}})];
+        participant.capture_input(&mut run);
         assert!(matches!(
             store
                 .insert_run_with_participant(run, true, Some(session), &mut participant)
@@ -34666,11 +34788,12 @@ mod tests {
         let run_id = format!("terminal-run-{suffix}");
         insert_active_database_session_fixture(&pool, &user, &session).await;
         let mut participant =
-            RunContextOpeningFixture::new(pool.clone(), &user, &session, &run_id, "input".into());
+            RunInputOpeningFixture::new(pool.clone(), &user, &session, &run_id, "input".into());
         let mut run = durable_run_record(&run_id);
         run.user_id = user.clone();
         run.session_id = session.clone();
         run.events = vec![json!({"event_type":"run_started", "data":{}})];
+        participant.capture_input(&mut run);
         assert!(matches!(
             store
                 .insert_run_with_participant(run, true, Some(&session), &mut participant)
@@ -34895,7 +35018,13 @@ mod tests {
             json!({"type":"executor_bound", "executor":{"kind":"server_local"}, "transport":"server_local"}),
         ];
         let expected_opening = run.events.clone();
-        let mut participant = RunContextOpeningFixture::new(
+        run.opening = DurableRunOpening::capture(&run.events).unwrap();
+        run.opening
+            .as_mut()
+            .unwrap()
+            .bind_input("x".repeat(6 * 1024 * 1024))
+            .unwrap();
+        let mut participant = RunInputOpeningFixture::new(
             pool.clone(),
             &user,
             &session,
@@ -34934,7 +35063,7 @@ mod tests {
                 .opening
                 .as_ref()
                 .unwrap()
-                .root_context()
+                .input()
                 .unwrap()
                 .original_input
                 .len(),
