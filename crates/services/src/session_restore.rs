@@ -211,7 +211,8 @@ fn apply_restore_cache_token_usage(
 
 // ─── Restored Session State ─────────────────────────────────────────────────
 
-/// The reconstructed state needed to resume a session.
+/// Reconstructed Session state. The resumable directory returns only its summary
+/// fields; execution requires the separate selected-Session restore and admission.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RestoredSession {
     /// Session ID being restored.
@@ -348,7 +349,9 @@ pub trait SessionRestoreService: Send + Sync {
         session_id: &str,
     ) -> Result<Vec<RestoredCheckpoint>, String>;
 
-    /// List resumable sessions for a user (active or paused).
+    /// List active or paused Session metadata/head summaries without recovery details.
+    /// Zero usage
+    /// and empty detail fields mean they were not loaded, rather than absent.
     async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String>;
 }
 
@@ -1620,34 +1623,16 @@ impl SessionRestoreService for HybridRestoreService {
             None => return Ok(Vec::new()),
         };
 
+        // A directory item selects a Session; it is not a hydrated resume bundle.
+        // Detail recovery and its evidence checks run only after that selection.
         let mut select = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "SELECT s.session_id, s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
-         COALESCE(event_summary.turn_count, 0) AS turn_count, \
-         latest_model.llm_model_used AS latest_model \
-         FROM ",
+             s.context_completed_turn AS turn_count FROM ",
         );
         crate::auth::session::push_session_activity_source(&mut select, user_id);
         select.push(
-            " LEFT JOIN ( \
-           SELECT user_id, session_id, COALESCE(MAX(CASE WHEN parent_run_id IS NULL THEN turn_seq END), 0) AS turn_count \
-           FROM agent_events \
-           GROUP BY user_id, session_id \
-         ) event_summary \
-           ON event_summary.user_id = s.user_id AND event_summary.session_id = s.session_id \
-         LEFT JOIN ( \
-           SELECT user_id, session_id, llm_model_used \
-           FROM ( \
-             SELECT user_id, session_id, llm_model_used, \
-                    ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
-             FROM agent_events \
-             WHERE parent_run_id IS NULL \
-               AND llm_model_used IS NOT NULL AND llm_model_used != '' \
-           ) ranked_models \
-           WHERE rn = 1 \
-         ) latest_model \
-           ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
-         WHERE s.status IN ('active', 'paused') \
-         ORDER BY s.activity_at DESC, s.session_id DESC LIMIT 20",
+            " WHERE s.status IN ('active', 'paused') \
+              ORDER BY s.activity_at DESC, s.session_id DESC LIMIT 20",
         );
         let rows = select
             .build()
@@ -1655,64 +1640,26 @@ impl SessionRestoreService for HybridRestoreService {
             .await
             .map_err(|e| format!("list_resumable: {e}"))?;
 
-        let mut sessions = Vec::new();
+        let mut sessions = Vec::with_capacity(rows.len());
         for row in &rows {
-            let session_id = mysql_string(row, "list_resumable_sessions", "session_id")?;
-            let title = mysql_optional_string(row, "list_resumable_sessions", "title")?;
-            let status = mysql_string(row, "list_resumable_sessions", "status")?;
-            let turn_count = mysql_i64(row, "list_resumable_sessions", "turn_count")?;
             let metadata_json =
                 mysql_optional_string(row, "list_resumable_sessions", "metadata_json")?;
-            let metadata_state = metadata_json_state(metadata_json.as_deref())?;
-            let latest_model = astra_core::model_override::normalize_model_override_owned(
-                mysql_optional_string(row, "list_resumable_sessions", "latest_model")?,
-            );
-            let model = metadata_state.model.clone().or(latest_model);
-            let mut restored = if let Some(workspace) =
-                self.restore_cloud_workspace(user_id, &session_id).await?
-            {
-                let mut recent_tools = self.restore_recent_tools(user_id, &session_id).await?;
-                if recent_tools.is_empty() {
-                    recent_tools = recent_tools_from_context_trace(
-                        workspace.metadata.last_context_trace.as_ref(),
-                    );
-                }
-                let checkpoint_count = self
-                    .cloud_checkpoint_count(user_id, &session_id)
-                    .await
-                    .map_err(|e| format!("list_resumable_sessions checkpoint count: {e}"))?;
-                restored_session_from_workspace(
-                    workspace.metadata,
-                    None,
-                    recent_tools,
-                    checkpoint_count,
-                    true,
-                )
-            } else {
-                RestoredSession {
-                    session_id: session_id.clone(),
-                    restored_from_cloud: true,
-                    ..Default::default()
-                }
-            };
-            restored.turn_count = restored.turn_count.max(non_negative_i64_to_u32(
-                turn_count,
-                "list_resumable_sessions",
-                "turn_count",
-            )?);
-            restored.last_status = status;
-            restored.title = restored.title.or(title);
-            if restored.git_branch.is_none() {
-                restored.git_branch = metadata_state.git_branch.clone();
-            }
-            if restored.model.is_none() {
-                restored.model = model;
-            }
-            if restored.permission_mode.is_none() {
-                restored.permission_mode = metadata_state.permission_mode.clone();
-            }
-            restored.restored_from_cloud = true;
-            sessions.push(restored);
+            let metadata = metadata_json_state(metadata_json.as_deref())?;
+            sessions.push(RestoredSession {
+                session_id: mysql_string(row, "list_resumable_sessions", "session_id")?,
+                title: mysql_optional_string(row, "list_resumable_sessions", "title")?,
+                last_status: mysql_string(row, "list_resumable_sessions", "status")?,
+                turn_count: non_negative_i64_to_u32(
+                    mysql_i64(row, "list_resumable_sessions", "turn_count")?,
+                    "list_resumable_sessions",
+                    "turn_count",
+                )?,
+                git_branch: metadata.git_branch,
+                model: metadata.model,
+                permission_mode: metadata.permission_mode,
+                restored_from_cloud: true,
+                ..Default::default()
+            });
         }
         Ok(sessions)
     }

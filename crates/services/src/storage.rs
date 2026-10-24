@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v109";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v110";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1162,7 +1162,16 @@ pub(crate) async fn admit_context_execution_write_with_facts<T>(
 where
     T: TransactionConnection,
 {
-    lock_agent_session_write_fence(tx, session_id, user_id).await?;
+    match lock_agent_session_write_fence_state(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Writable => {}
+        AgentSessionWriteFenceState::PendingDelete
+        | AgentSessionWriteFenceState::CompletedDelete => return Err(sqlx::Error::RowNotFound),
+        AgentSessionWriteFenceState::Missing => {
+            return Err(sqlx::Error::Protocol(
+                "session lifecycle fence disappeared before it could be locked".into(),
+            ));
+        }
+    }
     let status: Option<String> = sqlx::query_scalar(
         "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
@@ -3352,25 +3361,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "conversation_segments",
-        "CREATE TABLE IF NOT EXISTS conversation_segments (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            segment_hash CHAR(64) NOT NULL,
-            canonical_root_hash CHAR(64) NOT NULL,
-            canonical_bytes BIGINT NOT NULL,
-            message_count BIGINT NOT NULL,
-            segment_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, segment_hash),
-            INDEX idx_conversation_segments_created (created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
         "session_forks",
         "CREATE TABLE IF NOT EXISTS session_forks (
             isolation_domain VARCHAR(128) NOT NULL,
@@ -3465,42 +3455,12 @@ async fn ensure_core_schema_while_leased(
             canonical_segment_bytes BIGINT NOT NULL,
             total_canonical_bytes BIGINT NOT NULL,
             total_message_count BIGINT NOT NULL,
-            reachable TINYINT NOT NULL DEFAULT 0,
+            reachable TINYINT NOT NULL DEFAULT 1,
             manifest_json LONGTEXT NOT NULL,
+            content_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, manifest_root),
-            INDEX idx_context_manifest_parent (isolation_domain, owner_user_id, session_id, branch_id, parent_manifest_root),
-            INDEX idx_context_manifest_sequence (isolation_domain, owner_user_id, session_id, branch_id, conversation_seq),
-            INDEX idx_context_manifest_reachable_sequence (isolation_domain, owner_user_id, session_id, branch_id, reachable, conversation_seq),
-            INDEX idx_context_manifest_generation_sequence (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, reachable, conversation_seq)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "conversation_manifest_segments",
-        "CREATE TABLE IF NOT EXISTS conversation_manifest_segments (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            manifest_root CHAR(64) NOT NULL,
-            segment_position BIGINT NOT NULL,
-            segment_hash CHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (
-                isolation_domain, owner_user_id, session_id, branch_id,
-                manifest_root, segment_position
-            ),
-            INDEX idx_manifest_segments_hash (
-                isolation_domain, owner_user_id, segment_hash, manifest_root
-            ),
-            INDEX idx_manifest_segments_session (
-                owner_user_id, session_id, branch_id, manifest_root
-            ),
-            INDEX idx_manifest_segments_created (created_at)
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, conversation_seq),
+            UNIQUE KEY uq_context_manifest_root (manifest_root)
         )",
     )
     .execute(&pool)
@@ -5430,6 +5390,7 @@ async fn verify_core_schema_shape(
         (
             "conversation_manifest_nodes",
             &[
+                "content_json",
                 "total_canonical_bytes",
                 "total_message_count",
                 "reachable",
@@ -5526,6 +5487,14 @@ async fn verify_core_schema_shape(
         {
             return Err(sqlx::Error::Protocol(
                 "transcript source identity requires a unique owner/session/source constraint; recreate the database".into(),
+            ));
+        }
+        if table == "conversation_manifest_nodes"
+            && index == "uq_context_manifest_root"
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 0
+        {
+            return Err(sqlx::Error::Protocol(
+                "conversation_manifest_nodes.uq_context_manifest_root must be unique; recreate the database".into(),
             ));
         }
         indexes
@@ -5689,29 +5658,21 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "conversation_manifest_nodes",
-        "idx_context_manifest_reachable_sequence",
-        &[
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "reachable",
-            "conversation_seq",
-        ],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "conversation_manifest_nodes",
-        "idx_context_manifest_generation_sequence",
+        "PRIMARY",
         &[
             "isolation_domain",
             "owner_user_id",
             "session_id",
             "branch_id",
             "compaction_generation",
-            "reachable",
             "conversation_seq",
         ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "conversation_manifest_nodes",
+        "uq_context_manifest_root",
+        &["manifest_root"],
     )?;
     for (index, expected_columns) in [
         ("uq_run_event_idx", &["user_id", "run_id", "event_idx"][..]),

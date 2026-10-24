@@ -173,7 +173,7 @@ Retention is a product contract:
   conversation turns or user-visible messages.
 - Fresh root admission commits one immutable Run opening containing the
   original input, admitted execution contract and Context base identity, plus
-  its execution slot. It does not borrow a Controller writer or reservation,
+  its original execution lease. It does not borrow a Controller writer or reservation,
   or materialize a second raw input before execution. Exact opening identity
   resolves a lost acknowledgement. Resume reuses this original admission.
 - Raw conversation history stores original input, applied user guidance and the
@@ -188,21 +188,37 @@ Retention is a product contract:
   presentation enrichment. Unknown JSON fields remain immutable identity.
   Conflicts in any chunk roll back the entire transaction, including earlier
   siblings. Exact replay allocates no new sequence and preserves enrichment.
-- Root execution commits canonical Context (segments, manifest and head),
+- Root execution commits canonical Context (one manifest/content row and head),
   original raw transcript, one bounded Run completion receipt, semantic usage
   and execution-slot release together. It needs no Controller operation receipt,
   writer release, settlement markers or mirrored terminal event payloads. Context rejection leaves the Run active; Run rejection rolls back
   Context too. Lost acknowledgement resolves the exact generation-scoped Run
   receipt and verifies full raw identities and the exact immutable Context
-  manifest, ordered references and segment contents. A later Session head or
+  manifest metadata, indexed coordinates and its ordered inline contents. A later Session head or
   compaction does not invalidate a retained historical commit. Recovery
   cannot repair absent history or accept conflicting facts.
 - Session list/GET/resumable recency is the later of explicit Session metadata
-  activity and the current server/default-branch reachable manifest's immutable
-  creation time. It does not use mutable Context controller timestamps or Run
-  history aggregation. Seek cursors and ordering use the same full-precision
-  timestamp, with Session ID breaking ties. Missing/fork-inherited Context
-  falls back to Session metadata; no read repairs or activity writes occur.
+  activity and the established server/default-branch Context head's update time.
+  Existing head writes, including Controller leases, renewal, authority cleanup
+  and fork activation, may promote a Session; recency is not a commit-only clock.
+  The shared list/GET/resumable query does not read immutable conversation nodes
+  or aggregate Run history, and adds no activity writes or read repairs. Empty
+  or missing heads fall back to Session metadata. Seek cursors and ordering use
+  the same full-precision timestamp, with Session ID breaking ties. Static
+  directories paginate stably; concurrent activity does not provide a snapshot
+  or an exactly-once traversal. Listing may still scan and sort the owner's
+  Session directory; it must not scan global conversation history.
+- The resumable Session directory is one owner-scoped metadata/head query,
+  limited to 20 active or paused Sessions. Its `turn_count` is the current
+  canonical head's completed turn, or zero without an established head. Model,
+  Git branch and permission mode are metadata hints only. It does not aggregate
+  diagnostic events or hydrate workspace artifacts, tools or checkpoints per
+  row. Usage/checkpoint counts are zero and detail fields remain empty because
+  they are not loaded. The response structure is unchanged; selecting an ID
+  still invokes the separate detailed restore and authority checks. Sessions
+  with diagnostic or workspace history alone no longer qualify for automatic
+  CLI selection based on a positive directory turn count; explicit ID selection
+  still reaches detailed restore. Directory hints never authorize execution.
 - Optional `agent_events` diagnostics neither authorize nor gate conversation
   admission, settlement or replay. Ordinary root/resumed execution and children
   do not write diagnostic copies during execution or terminal cleanup. Explicit
@@ -414,6 +430,43 @@ not authorize a Run or replace generic immutable-content validation; admitted
 Run writes can omit source membership probes only after their complete opening
 and terminal authority path is installed.
 
+
+## Canonical Context content storage
+
+Each immutable `conversation_manifest_nodes` row stores small `manifest_json`
+metadata and one non-null `content_json LONGTEXT` containing only that node's
+ordered message segments. Existing ordered segment hashes bind the body; no
+second hash or mutable projection is stored. Ordinary append writes this turn's
+content and advances the existing head in the same transaction. Fork prefixes
+and pins continue to share their parent's rows. Repeated content in different
+nodes is stored independently, so cross-node content deduplication is retired.
+
+Nodes use the existing scope, compaction generation and conversation sequence
+as their physical primary key. Range reads therefore visit only the captured
+generation and sequence interval. The existing manifest hash binds the complete
+scope and coordinates and has one unique index. Hash-only reads select that
+index explicitly while retaining scope predicates; known-coordinate proofs use
+the full primary key. These two access paths replace four redundant secondary
+indexes without changing any cursor, authority or wire contract.
+
+Common preparation limits a commit to 256 segments, 8 MiB per segment and
+32 MiB for the encoded content frame, including JSON framing. Encoding happens
+before the transaction. A post-inference resource failure preserves the full
+answer, usage and effect disposition in the existing failed Run terminal while
+leaving Context unchanged; it never claims success or retries an effect.
+Integrity and authority failures retain their distinct rejection paths.
+
+Full reads validate metadata, indexed coordinates and each ordered content
+reference. Inherited reads follow the retained fork records, including deleted
+ancestors, and enforce captured generation/sequence bounds before reading a body.
+Metadata-only attach, fork and delta reads omit the body. Cold ACK
+verification reads the exact immutable node, independently of a newer head.
+Node deletion removes its body under the existing head/pin/lineage rules.
+There are no separate segment or manifest-reference tables, upload staging,
+background orphan-body cleanup, historical conversion or old-layout readers.
+The non-frozen `segments:batchGet` transport takes a `manifest_root` locator;
+standalone `segments:upload` is retired. Frozen MOI wire contracts remain intact.
+These per-node bounds do not bound the size of a fully materialized Context.
 
 ## Ordinary conversation admission and finish
 

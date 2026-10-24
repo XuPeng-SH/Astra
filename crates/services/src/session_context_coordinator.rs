@@ -7,9 +7,7 @@
 use std::{collections::HashSet, time::Duration};
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
-use astra_core::{
-    SharedPool, matrixone_statement_with_null_shape, push_matrixone_bound_string_set,
-};
+use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use astra_turn_types::{
     ActorContextV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalDeltaModeV1,
     CanonicalTurnDeltaV1, ContextManifestNodeV1, ConversationSegmentV1, ConversationWriterLeaseV1,
@@ -21,6 +19,7 @@ use astra_turn_types::{
     canonical_conversation_root, canonical_conversation_serialized_len,
 };
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -89,8 +88,8 @@ impl SessionExecutionBlocker {
 }
 const COORDINATOR_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_SEGMENT_BATCH: usize = 256;
-const MAX_STAGED_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_STAGED_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CONTEXT_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CONTEXT_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_RESERVATION_TTL: Duration = Duration::from_secs(15 * 60);
 // Execution-binding generations are strictly positive in durable rows. Zero
@@ -106,6 +105,8 @@ pub enum SessionContextCoordinatorError {
     Unauthorized,
     #[error("invalid coordinator request: {0}")]
     Invalid(String),
+    #[error("canonical Context resource limit: {0}")]
+    ResourceLimit(&'static str),
     #[error("writer authority was fenced by a newer epoch")]
     Fenced,
     #[error("session is being deleted or is no longer writable")]
@@ -547,25 +548,13 @@ pub trait SessionContextCoordinator: Send + Sync {
         after_manifest_root: Option<&str>,
     ) -> Result<ManifestDeltaV1, SessionContextCoordinatorError>;
 
-    /// Fetch an explicitly requested, bounded set of immutable payloads.
-    /// Request order is preserved so clients can checkpoint resumable
-    /// hydration without loading unrelated history.
-    async fn load_segments(
+    /// Read a complete node's payloads through its authenticated manifest
+    /// locator. A retained fork prefix may supply an inherited node.
+    async fn load_manifest_content(
         &self,
         key: &SessionKeyV1,
-        segment_hashes: &[String],
+        manifest_root: &str,
     ) -> Result<Vec<ConversationSegmentV1>, SessionContextCoordinatorError>;
-
-    /// Idempotently stage a bounded batch of owner-scoped immutable payloads.
-    ///
-    /// Staging never changes a branch head or writer authority. A separate
-    /// canonical journal import must prove the ordered lineage before any
-    /// staged payload becomes reachable from a head.
-    async fn store_segments(
-        &self,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError>;
 
     async fn load_authority_epochs(
         &self,
@@ -807,6 +796,7 @@ pub struct PreparedSessionContextCommit {
     request_hash: String,
     segments: Vec<ConversationSegmentV1>,
     node: ContextManifestNodeV1,
+    content_json: String,
 }
 
 impl PreparedSessionContextCommit {
@@ -858,6 +848,7 @@ impl PreparedSessionContextCommit {
             .validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         validate_idempotency_key(idempotency_key)?;
+        let content_json = encode_manifest_content(&delta.logical_segments)?;
         let key = authority.key();
         let segments = delta
             .logical_segments
@@ -897,6 +888,7 @@ impl PreparedSessionContextCommit {
             request_hash,
             segments,
             node,
+            content_json,
         })
     }
 
@@ -1275,8 +1267,8 @@ impl DatabaseSessionContextCoordinator {
         self.persist_database_immutables_in_tx(
             tx,
             key,
-            &prepared.segments,
             &prepared.node,
+            &prepared.content_json,
             bytes,
             messages,
         )
@@ -1588,8 +1580,8 @@ impl DatabaseSessionContextCoordinator {
         self.persist_database_immutables_in_tx(
             tx,
             &reservation.key,
-            segments,
             node,
+            &prepared.content_json,
             total_canonical_bytes,
             total_message_count,
         )
@@ -2523,90 +2515,37 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         head: &SessionContextHeadV1,
     ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
         validate_head(head)?;
-        let fork_base = self.load_fork_prefix(&head.key).await?;
-        let mut rows = sqlx::query(
-            "SELECT manifest_json FROM conversation_manifest_nodes
-             WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ?
-               AND compaction_generation = ? AND reachable = 1
-               AND conversation_seq <= ?",
-        )
-        .bind(&head.key.isolation_domain)
-        .bind(&head.key.owner_user_id)
-        .bind(&head.key.session_id)
-        .bind(&head.key.branch_id)
-        .bind(i64_from_u64(
-            "head compaction generation",
+        let mut nodes = std::collections::HashMap::new();
+        self.load_manifest_contents_through(
+            &head.key,
             head.cursor.compaction_generation,
-        )?)
-        .bind(i64_from_u64(
-            "head conversation sequence",
             head.cursor.conversation_seq,
-        )?)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| database_error("load_manifests", source))?;
-        if let Some(prefix) = &fork_base
-            && prefix.parent_cursor.compaction_generation == head.cursor.compaction_generation
-        {
-            rows.extend(
-                sqlx::query(
-                    "SELECT manifest_json FROM conversation_manifest_nodes
-                     WHERE isolation_domain = ? AND owner_user_id = ?
-                       AND session_id = ? AND branch_id = ?
-                       AND compaction_generation = ? AND reachable = 1
-                       AND conversation_seq <= ?",
-                )
-                .bind(&prefix.parent_key.isolation_domain)
-                .bind(&prefix.parent_key.owner_user_id)
-                .bind(&prefix.parent_key.session_id)
-                .bind(&prefix.parent_key.branch_id)
-                .bind(i64_from_u64(
-                    "fork parent compaction generation",
-                    prefix.parent_cursor.compaction_generation,
-                )?)
-                .bind(i64_from_u64(
-                    "fork parent conversation sequence",
-                    prefix.parent_cursor.conversation_seq,
-                )?)
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| database_error("load_fork_parent_manifests", source))?,
-            );
-        }
-        let mut nodes = std::collections::HashMap::with_capacity(rows.len());
-        for row in rows {
-            let json = row
-                .try_get::<String, _>("manifest_json")
-                .map_err(|source| database_error("decode_manifest_row", source))?;
-            let node: ContextManifestNodeV1 = database_json("manifest", &json)?;
-            node.validate()
-                .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-            if node.key != head.key
-                && fork_base
-                    .as_ref()
-                    .is_none_or(|prefix| node.key != prefix.parent_key)
-            {
+            &mut nodes,
+        )
+        .await?;
+        let mut scope = head.key.clone();
+        let mut through = head.cursor.conversation_seq;
+        let mut visited = HashSet::from([scope.clone()]);
+        while let Some(prefix) = self.load_fork_prefix(&scope).await? {
+            if prefix.parent_cursor.compaction_generation != head.cursor.compaction_generation {
+                break;
+            }
+            if !visited.insert(prefix.parent_key.clone()) {
                 return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "database manifest owner or branch mismatch".into(),
+                    "cyclic fork lineage".into(),
                 ));
             }
-            nodes.insert(node.manifest_root.clone(), node);
-        }
-
-        let ordered_nodes = order_manifest_chain(head, nodes)?;
-        let mut unique_hashes = HashSet::new();
-        for node in &ordered_nodes {
-            unique_hashes.extend(
-                node.appended_segments
-                    .iter()
-                    .map(|segment| segment.segment_hash.clone()),
-            );
-        }
-        let mut segment_map = self
-            .load_database_segments(&head.key, unique_hashes.into_iter().collect())
+            through = through.min(prefix.parent_cursor.conversation_seq);
+            self.load_manifest_contents_through(
+                &prefix.parent_key,
+                prefix.parent_cursor.compaction_generation,
+                through,
+                &mut nodes,
+            )
             .await?;
-        materialize_nodes(head, ordered_nodes, &mut segment_map)
+            scope = prefix.parent_key;
+        }
+        materialize_nodes(head, order_manifest_chain(head, nodes)?)
     }
 
     async fn load_manifest_delta(
@@ -2654,6 +2593,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 } else {
                     let row = sqlx::query(
                         "SELECT conversation_seq FROM conversation_manifest_nodes
+                         FORCE INDEX (uq_context_manifest_root)
                          WHERE isolation_domain = ? AND owner_user_id = ?
                            AND session_id = ? AND branch_id = ?
                            AND manifest_root = ? AND reachable = 1",
@@ -2751,32 +2691,50 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         )
     }
 
-    async fn load_segments(
+    async fn load_manifest_content(
         &self,
         key: &SessionKeyV1,
-        segment_hashes: &[String],
+        manifest_root: &str,
     ) -> Result<Vec<ConversationSegmentV1>, SessionContextCoordinatorError> {
-        validate_segment_batch(key, segment_hashes)?;
-        let mut segments = self
-            .load_database_segments(key, segment_hashes.to_vec())
-            .await?;
-        segment_hashes
-            .iter()
-            .map(|hash| {
-                segments
-                    .remove(hash)
-                    .ok_or(SessionContextCoordinatorError::SegmentNotFound)
-            })
-            .collect()
-    }
-
-    async fn store_segments(
-        &self,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError> {
-        validate_segment_upload(key, segments)?;
-        self.persist_database_segments(key, segments).await
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        validate_optional_manifest_root(Some(manifest_root))?;
+        if let Some(content) = self
+            .load_manifest_content_at(key, manifest_root, None)
+            .await?
+        {
+            return Ok(content.segments);
+        }
+        // A fork retains its captured parent prefix even after the parent
+        // Session is deleted. The prefix, not a caller-supplied owner/key,
+        // scopes this inherited read.
+        let mut scope = key.clone();
+        let mut bounds: Option<(u64, u64)> = None;
+        let mut visited = HashSet::from([scope.clone()]);
+        while let Some(prefix) = self.load_fork_prefix(&scope).await? {
+            let generation = prefix.parent_cursor.compaction_generation;
+            let mut through = prefix.parent_cursor.conversation_seq;
+            if let Some((prior_generation, prior_through)) = bounds {
+                if generation != prior_generation {
+                    break;
+                }
+                through = through.min(prior_through);
+            }
+            if !visited.insert(prefix.parent_key.clone()) {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "cyclic fork lineage".into(),
+                ));
+            }
+            bounds = Some((generation, through));
+            if let Some(content) = self
+                .load_manifest_content_at(&prefix.parent_key, manifest_root, bounds)
+                .await?
+            {
+                return Ok(content.segments);
+            }
+            scope = prefix.parent_key;
+        }
+        Err(SessionContextCoordinatorError::SegmentNotFound)
     }
 
     async fn load_authority_epochs(
@@ -2868,9 +2826,9 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         key.validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         let row = sqlx::query(
-            "SELECT fork_base_json FROM session_context_heads
+            "SELECT manifest_json FROM session_forks
              WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ?",
+               AND child_session_id = ? AND child_branch_id = ? AND state = 'active'",
         )
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
@@ -2879,22 +2837,25 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         .fetch_optional(self.pool.get())
         .await
         .map_err(|source| database_error("load_fork_prefix", source))?;
-        let prefix = row
-            .map(|row| {
-                row.try_get::<Option<String>, _>("fork_base_json")
-                    .map_err(|source| database_error("decode_fork_prefix", source))?
-                    .as_deref()
-                    .map(|json| database_json::<SharedManifestPrefixV1>("fork_prefix", json))
-                    .transpose()
-            })
-            .transpose()?
-            .flatten();
-        if let Some(prefix) = &prefix {
-            prefix
-                .validate_for_child(key)
+        // Fork records and their ancestor pins survive Session deletion while
+        // an active descendant still uses them. Heads do not, so lineage reads
+        // use the existing fork owner and its unique child key.
+        row.map(|row| {
+            let json: String = row
+                .try_get("manifest_json")
+                .map_err(|source| database_error("decode_fork_prefix", source))?;
+            let manifest: SessionForkManifestV1 = database_json("fork_prefix", &json)?;
+            manifest
+                .validate()
                 .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-        }
-        Ok(prefix)
+            if manifest.child_key != *key || manifest.state != SessionForkStateV1::Active {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "fork lineage identity or state mismatch".into(),
+                ));
+            }
+            Ok(manifest.shared_prefix())
+        })
+        .transpose()
     }
 
     async fn activate_fork(
@@ -2982,12 +2943,21 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             "SELECT manifest_json FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
                AND session_id = ? AND branch_id = ?
+               AND compaction_generation = ? AND conversation_seq = ?
                AND manifest_root = ? AND reachable = 1",
         )
         .bind(&manifest.parent_key.isolation_domain)
         .bind(&manifest.parent_key.owner_user_id)
         .bind(&manifest.parent_key.session_id)
         .bind(&manifest.parent_key.branch_id)
+        .bind(i64_from_u64(
+            "fork parent compaction generation",
+            manifest.parent_head.cursor.compaction_generation,
+        )?)
+        .bind(i64_from_u64(
+            "fork parent conversation sequence",
+            manifest.parent_head.cursor.conversation_seq,
+        )?)
         .bind(&manifest.parent_head.latest_manifest_root)
         .fetch_optional(&mut *tx)
         .await
@@ -3874,15 +3844,24 @@ impl DatabaseSessionContextCoordinator {
         let stored = sqlx::query(
             "SELECT parent_manifest_root, completed_turn, conversation_seq,
                     compaction_generation, canonical_segment_bytes, total_canonical_bytes,
-                    total_message_count, manifest_json
+                    total_message_count, manifest_root, manifest_json, content_json, reachable
              FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ? AND manifest_root = ?",
+               AND session_id = ? AND branch_id = ?
+               AND compaction_generation = ? AND conversation_seq = ? AND manifest_root = ?",
         )
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
         .bind(&key.branch_id)
+        .bind(i64_from_u64(
+            "manifest compaction generation",
+            node.compaction_generation,
+        )?)
+        .bind(i64_from_u64(
+            "manifest conversation sequence",
+            node.conversation_seq,
+        )?)
         .bind(&node.manifest_root)
         .fetch_optional(self.pool.get())
         .await
@@ -3893,120 +3872,117 @@ impl DatabaseSessionContextCoordinator {
             )
         })?;
         validate_stored_manifest(&stored, node, canonical_segment_bytes, bytes, messages)?;
-        let references = sqlx::query(
-            "SELECT segment_position, segment_hash FROM conversation_manifest_segments
+        let content = decode_stored_manifest_content(&stored, key)?;
+        if content.segments != prepared.segments {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "committed Context differs from its prepared content".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn load_manifest_content_at(
+        &self,
+        key: &SessionKeyV1,
+        manifest_root: &str,
+        inherited_bounds: Option<(u64, u64)>,
+    ) -> Result<Option<StoredManifestContent>, SessionContextCoordinatorError> {
+        let mut sql = format!(
+            "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes FORCE INDEX (uq_context_manifest_root)
              WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
-               AND branch_id = ? AND manifest_root = ? ORDER BY segment_position ASC",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .bind(&key.session_id)
-        .bind(&key.branch_id)
-        .bind(&node.manifest_root)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| database_error("verify_committed_Run_references", source))?;
-        validate_stored_manifest_references(&references, node)?;
-        let segments = self
-            .load_database_segments(
-                key,
-                prepared
-                    .segments
-                    .iter()
-                    .map(|segment| segment.segment_hash.clone())
-                    .collect(),
-            )
-            .await?;
-        for expected in &prepared.segments {
-            if segments.get(&expected.segment_hash) != Some(expected) {
+               AND branch_id = ? AND manifest_root = ? AND reachable = 1"
+        );
+        if inherited_bounds.is_some() {
+            sql.push_str(" AND compaction_generation = ? AND conversation_seq <= ?");
+        }
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&key.isolation_domain)
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&key.branch_id)
+            .bind(manifest_root);
+        if let Some((generation, through)) = inherited_bounds {
+            query = query
+                .bind(i64_from_u64("inherited compaction generation", generation)?)
+                .bind(i64_from_u64("inherited conversation sequence", through)?);
+        }
+        let row = query
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| database_error("load_manifest_content", source))?;
+        row.map(|row| decode_stored_manifest_content(&row, key))
+            .transpose()
+    }
+
+    async fn load_manifest_contents_through(
+        &self,
+        key: &SessionKeyV1,
+        generation: u64,
+        through: u64,
+        nodes: &mut std::collections::HashMap<String, StoredManifestContent>,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        let sql = format!(
+            "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+               AND branch_id = ? AND compaction_generation = ? AND reachable = 1
+               AND conversation_seq <= ?"
+        );
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&key.isolation_domain)
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&key.branch_id)
+            .bind(i64_from_u64("head compaction generation", generation)?)
+            .bind(i64_from_u64("head conversation sequence", through)?);
+        // Consume each bounded body once rather than retaining every SQL row
+        // and then allocating a second global segment-hash projection.
+        let mut rows = query.fetch(self.pool.get());
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|source| database_error("load_manifest_contents", source))?
+        {
+            let content = decode_stored_manifest_content(&row, key)?;
+            if nodes
+                .insert(content.node.manifest_root.clone(), content)
+                .is_some()
+            {
                 return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "committed Context segment is missing or differs from its prepared content"
-                        .into(),
+                    "duplicate manifest identity".into(),
                 ));
             }
         }
         Ok(())
     }
 
-    async fn load_database_segments(
-        &self,
-        key: &SessionKeyV1,
-        hashes: Vec<String>,
-    ) -> Result<
-        std::collections::HashMap<String, ConversationSegmentV1>,
-        SessionContextCoordinatorError,
-    > {
-        let mut segments = std::collections::HashMap::with_capacity(hashes.len());
-        for chunk in hashes.chunks(256) {
-            let mut query = QueryBuilder::<MySql>::new(
-                "SELECT segment_hash, segment_json FROM conversation_segments \
-                 INNER JOIN ",
-            );
-            push_matrixone_bound_string_set(&mut query, chunk.iter().map(String::as_str));
-            query
-                .push(" AS requested_segment ON requested_segment.value = segment_hash")
-                .push(" WHERE isolation_domain = ")
-                .push_bind(&key.isolation_domain)
-                .push(" AND owner_user_id = ")
-                .push_bind(&key.owner_user_id);
-            let rows = query
-                .build()
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| database_error("load_segments", source))?;
-            for row in rows {
-                let stored_hash = row
-                    .try_get::<String, _>("segment_hash")
-                    .map_err(|source| database_error("decode_segment_hash", source))?;
-                let json = row
-                    .try_get::<String, _>("segment_json")
-                    .map_err(|source| database_error("decode_segment_json", source))?;
-                let segment: ConversationSegmentV1 = database_json("segment", &json)?;
-                segment.validate_for(key).map_err(|error| {
-                    SessionContextCoordinatorError::NeedsRepair(error.to_string())
-                })?;
-                if segment.segment_hash != stored_hash {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "database segment key does not match content".into(),
-                    ));
-                }
-                segments.insert(stored_hash, segment);
-            }
-        }
-        Ok(segments)
-    }
-
     async fn persist_database_immutables_in_tx(
         &self,
         tx: &mut Transaction<'_, MySql>,
         key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
         node: &ContextManifestNodeV1,
+        content_json: &str,
         total_canonical_bytes: u64,
         total_message_count: u64,
     ) -> Result<(), SessionContextCoordinatorError> {
-        self.persist_database_segments_in_tx(tx, key, segments)
-            .await?;
-        let canonical_segment_bytes =
-            node.appended_segments
-                .iter()
-                .try_fold(0_u64, |total, segment| {
-                    total.checked_add(segment.canonical_bytes).ok_or_else(|| {
-                        SessionContextCoordinatorError::Invalid(
-                            "manifest segment byte count overflow".into(),
-                        )
-                    })
-                })?;
-        let manifest_insert_sql = matrixone_statement_with_null_shape(
+        let canonical_segment_bytes = node
+            .appended_segments
+            .iter()
+            .try_fold(0_u64, |sum, segment| {
+                sum.checked_add(segment.canonical_bytes)
+            })
+            .ok_or_else(|| {
+                SessionContextCoordinatorError::Invalid("manifest byte count overflow".into())
+            })?;
+        let sql = matrixone_statement_with_null_shape(
             "INSERT INTO conversation_manifest_nodes
              (isolation_domain, owner_user_id, session_id, branch_id, manifest_root,
-              parent_manifest_root, completed_turn, conversation_seq,
-              compaction_generation, canonical_segment_bytes, total_canonical_bytes,
-              total_message_count, manifest_json, reachable)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+              parent_manifest_root, completed_turn, conversation_seq, compaction_generation,
+              canonical_segment_bytes, total_canonical_bytes, total_message_count,
+              manifest_json, content_json, reachable)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             [node.parent_manifest_root.is_some()],
         );
-        let manifest_already_exists = match sqlx::query(manifest_insert_sql)
+        let result = sqlx::query(sql)
             .bind(&key.isolation_domain)
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
@@ -4026,251 +4002,63 @@ impl DatabaseSessionContextCoordinator {
                 "manifest segment bytes",
                 canonical_segment_bytes,
             )?)
+            .bind(i64_from_u64("manifest total bytes", total_canonical_bytes)?)
             .bind(i64_from_u64(
-                "manifest total canonical bytes",
-                total_canonical_bytes,
-            )?)
-            .bind(i64_from_u64(
-                "manifest total message count",
+                "manifest total messages",
                 total_message_count,
             )?)
             .bind(database_to_json("manifest", node)?)
+            .bind(content_json)
             .execute(&mut **tx)
-            .await
-        {
-            Ok(_) => false,
-            Err(source) if astra_core::is_duplicate_key_error(&source) => true,
-            Err(source) => return Err(database_error("persist_manifest", source)),
-        };
-        let existing_manifest_reachable = if manifest_already_exists {
-            let stored = sqlx::query(
-                "SELECT parent_manifest_root, completed_turn, conversation_seq,
-                        compaction_generation, canonical_segment_bytes,
-                        total_canonical_bytes, total_message_count, manifest_json, reachable
-                 FROM conversation_manifest_nodes
-                 WHERE isolation_domain = ? AND owner_user_id = ?
-                   AND session_id = ? AND branch_id = ? AND manifest_root = ?
-                 FOR UPDATE",
-            )
-            .bind(&key.isolation_domain)
-            .bind(&key.owner_user_id)
-            .bind(&key.session_id)
-            .bind(&key.branch_id)
-            .bind(&node.manifest_root)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(|source| database_error("verify_existing_manifest", source))?;
-            validate_stored_manifest(
-                &stored,
-                node,
-                canonical_segment_bytes,
-                total_canonical_bytes,
-                total_message_count,
-            )?;
-            Some(database_u64(&stored, "reachable")?)
-        } else {
-            None
-        };
-
-        let mut insert_references = QueryBuilder::<MySql>::new(
-            "INSERT IGNORE INTO conversation_manifest_segments
-             (isolation_domain, owner_user_id, session_id, branch_id,
-              manifest_root, segment_position, segment_hash) ",
-        );
-        insert_references.push_values(
-            node.appended_segments.iter().enumerate(),
-            |mut values, (position, segment)| {
-                values
-                    .push_bind(&key.isolation_domain)
-                    .push_bind(&key.owner_user_id)
-                    .push_bind(&key.session_id)
-                    .push_bind(&key.branch_id)
-                    .push_bind(&node.manifest_root)
-                    .push_bind(i64::try_from(position).unwrap_or(i64::MAX))
-                    .push_bind(&segment.segment_hash);
-            },
-        );
-        let inserted_references = insert_references
-            .build()
-            .execute(&mut **tx)
-            .await
-            .map_err(|source| database_error("persist_manifest_segment_references", source))?;
-        if manifest_already_exists
-            || inserted_references.rows_affected()
-                != u64::try_from(node.appended_segments.len()).unwrap_or(u64::MAX)
-        {
-            let stored_references = sqlx::query(
-                "SELECT segment_position, segment_hash
-                 FROM conversation_manifest_segments
-                 WHERE isolation_domain = ? AND owner_user_id = ?
-                   AND session_id = ? AND branch_id = ? AND manifest_root = ?
-                 ORDER BY segment_position ASC FOR UPDATE",
-            )
-            .bind(&key.isolation_domain)
-            .bind(&key.owner_user_id)
-            .bind(&key.session_id)
-            .bind(&key.branch_id)
-            .bind(&node.manifest_root)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|source| database_error("verify_manifest_segment_references", source))?;
-            validate_stored_manifest_references(&stored_references, node)?;
-        }
-        if let Some(reachable) = existing_manifest_reachable {
-            match reachable {
-                0 => {
-                    let activated = sqlx::query(
-                        "UPDATE conversation_manifest_nodes SET reachable = 1
-                         WHERE isolation_domain = ? AND owner_user_id = ?
-                           AND session_id = ? AND branch_id = ? AND manifest_root = ?
-                           AND reachable = 0 AND compaction_generation = ?
-                           AND canonical_segment_bytes = ? AND total_canonical_bytes = ?
-                           AND total_message_count = ?",
-                    )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(source) if astra_core::is_duplicate_key_error(&source) => {
+                let sql = format!(
+                    "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes
+                     WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+                       AND branch_id = ? AND compaction_generation = ? AND conversation_seq = ? FOR UPDATE"
+                );
+                let row = sqlx::query(sqlx::AssertSqlSafe(sql))
                     .bind(&key.isolation_domain)
                     .bind(&key.owner_user_id)
                     .bind(&key.session_id)
                     .bind(&key.branch_id)
-                    .bind(&node.manifest_root)
                     .bind(i64_from_u64(
                         "manifest compaction generation",
                         node.compaction_generation,
                     )?)
                     .bind(i64_from_u64(
-                        "manifest segment bytes",
-                        canonical_segment_bytes,
+                        "manifest conversation sequence",
+                        node.conversation_seq,
                     )?)
-                    .bind(i64_from_u64(
-                        "manifest total canonical bytes",
-                        total_canonical_bytes,
-                    )?)
-                    .bind(i64_from_u64(
-                        "manifest total message count",
-                        total_message_count,
-                    )?)
-                    .execute(&mut **tx)
+                    .fetch_optional(&mut **tx)
                     .await
-                    .map_err(|source| database_error("activate_existing_manifest", source))?;
-                    if activated.rows_affected() != 1 {
-                        return Err(SessionContextCoordinatorError::NeedsRepair(
-                            "verified staged manifest could not be activated".into(),
-                        ));
-                    }
-                }
-                1 => {}
-                _ => {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "existing immutable manifest has an invalid reachability state".into(),
-                    ));
-                }
+                    .map_err(|source| database_error("verify_existing_manifest", source))?
+                    .ok_or_else(|| {
+                        SessionContextCoordinatorError::NeedsRepair(
+                            "immutable manifest identity conflicts with another coordinate".into(),
+                        )
+                    })?;
+                validate_stored_manifest(
+                    &row,
+                    node,
+                    canonical_segment_bytes,
+                    total_canonical_bytes,
+                    total_message_count,
+                )?;
+                decode_stored_manifest_content(&row, key)?;
+                Ok(())
             }
+            Err(source) => Err(database_error("persist_manifest", source)),
         }
-        Ok(())
-    }
-
-    async fn persist_database_segments_in_tx(
-        &self,
-        tx: &mut Transaction<'_, MySql>,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError> {
-        for segment in segments {
-            let json = database_to_json("segment", segment)?;
-            let result = sqlx::query(
-                "INSERT IGNORE INTO conversation_segments
-                 (isolation_domain, owner_user_id, segment_hash, canonical_root_hash,
-                  canonical_bytes, message_count, segment_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&key.isolation_domain)
-            .bind(&key.owner_user_id)
-            .bind(&segment.segment_hash)
-            .bind(&segment.canonical_root_hash)
-            .bind(i64_from_u64("segment bytes", segment.canonical_bytes)?)
-            .bind(i64::from(segment.message_count))
-            .bind(json)
-            .execute(&mut **tx)
-            .await
-            .map_err(|source| database_error("persist_segment", source))?;
-            if result.rows_affected() == 0 {
-                let stored = sqlx::query(
-                    "SELECT segment_json FROM conversation_segments
-                     WHERE isolation_domain = ? AND owner_user_id = ? AND segment_hash = ?
-                     FOR UPDATE",
-                )
-                .bind(&key.isolation_domain)
-                .bind(&key.owner_user_id)
-                .bind(&segment.segment_hash)
-                .fetch_one(&mut **tx)
-                .await
-                .map_err(|source| database_error("verify_existing_segment", source))?
-                .try_get::<String, _>("segment_json")
-                .map_err(|source| database_error("decode_existing_segment", source))?;
-                let stored: ConversationSegmentV1 = database_json("existing_segment", &stored)?;
-                if stored != *segment {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "existing immutable segment does not match its content-addressed key"
-                            .into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn persist_database_segments(
-        &self,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError> {
-        for segment in segments {
-            let json = database_to_json("segment", segment)?;
-            let result = sqlx::query(
-                "INSERT IGNORE INTO conversation_segments
-                 (isolation_domain, owner_user_id, segment_hash, canonical_root_hash,
-                  canonical_bytes, message_count, segment_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&key.isolation_domain)
-            .bind(&key.owner_user_id)
-            .bind(&segment.segment_hash)
-            .bind(&segment.canonical_root_hash)
-            .bind(i64_from_u64("segment bytes", segment.canonical_bytes)?)
-            .bind(i64::from(segment.message_count))
-            .bind(json)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| database_error("persist_segment", source))?;
-            if result.rows_affected() == 0 {
-                let stored = sqlx::query(
-                    "SELECT segment_json FROM conversation_segments
-                     WHERE isolation_domain = ? AND owner_user_id = ? AND segment_hash = ?",
-                )
-                .bind(&key.isolation_domain)
-                .bind(&key.owner_user_id)
-                .bind(&segment.segment_hash)
-                .fetch_one(self.pool.get())
-                .await
-                .map_err(|source| database_error("verify_existing_segment", source))?
-                .try_get::<String, _>("segment_json")
-                .map_err(|source| database_error("decode_existing_segment", source))?;
-                let stored: ConversationSegmentV1 = database_json("existing_segment", &stored)?;
-                if stored != *segment {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "existing immutable segment does not match its content-addressed key"
-                            .into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 }
 
 fn order_manifest_chain(
     head: &SessionContextHeadV1,
-    mut nodes: std::collections::HashMap<String, ContextManifestNodeV1>,
-) -> Result<Vec<ContextManifestNodeV1>, SessionContextCoordinatorError> {
+    mut nodes: std::collections::HashMap<String, StoredManifestContent>,
+) -> Result<Vec<StoredManifestContent>, SessionContextCoordinatorError> {
     let mut root = Some(head.latest_manifest_root.clone());
     let mut seen = HashSet::new();
     let mut reverse = Vec::new();
@@ -4283,17 +4071,17 @@ fn order_manifest_chain(
         let node = nodes.remove(&current).ok_or_else(|| {
             SessionContextCoordinatorError::NeedsRepair(format!("missing manifest {current}"))
         })?;
-        root = if node.replaces_history {
+        root = if node.node.replaces_history {
             None
         } else {
-            node.parent_manifest_root.clone()
+            node.node.parent_manifest_root.clone()
         };
         reverse.push(node);
     }
     reverse.reverse();
     if reverse
         .last()
-        .is_none_or(|node| !cursor_projection_matches_head(&node.cursor(), &head.cursor))
+        .is_none_or(|node| !cursor_projection_matches_head(&node.node.cursor(), &head.cursor))
     {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "head cursor does not match database manifest".into(),
@@ -4405,79 +4193,37 @@ fn manifest_delta(
 
 fn materialize_nodes(
     head: &SessionContextHeadV1,
-    nodes: Vec<ContextManifestNodeV1>,
-    segments: &mut std::collections::HashMap<String, ConversationSegmentV1>,
+    nodes: Vec<StoredManifestContent>,
 ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
-    let mut use_counts = std::collections::HashMap::<String, usize>::new();
-    for node in &nodes {
-        for segment in &node.appended_segments {
-            *use_counts.entry(segment.segment_hash.clone()).or_default() += 1;
-        }
-    }
     let mut messages = Vec::new();
     let mut logical_segment_count = 0_u64;
     let mut canonical_segment_bytes = 0_u64;
     let mut prior_cursor = None;
-    for node in nodes {
-        validate_manifest_advance(prior_cursor.as_ref(), &node)?;
-        let cursor = node.cursor();
-        for segment_ref in node.appended_segments {
-            let remaining = use_counts
-                .get_mut(&segment_ref.segment_hash)
+    for content in nodes {
+        validate_manifest_advance(prior_cursor.as_ref(), &content.node)?;
+        for segment in content.segments {
+            canonical_segment_bytes = canonical_segment_bytes
+                .checked_add(segment.canonical_bytes)
                 .ok_or_else(|| {
                     SessionContextCoordinatorError::NeedsRepair(
-                        "manifest segment use count is missing".into(),
+                        "materialized byte count overflow".into(),
                     )
                 })?;
-            *remaining -= 1;
-            if *remaining == 0 {
-                let segment = segments.remove(&segment_ref.segment_hash).ok_or_else(|| {
-                    SessionContextCoordinatorError::NeedsRepair(format!(
-                        "missing segment {}",
-                        segment_ref.segment_hash
-                    ))
-                })?;
-                if segment.reference() != segment_ref {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "segment metadata does not match manifest reference".into(),
-                    ));
-                }
-                canonical_segment_bytes = canonical_segment_bytes
-                    .checked_add(segment.canonical_bytes)
-                    .ok_or_else(|| {
-                        SessionContextCoordinatorError::NeedsRepair(
-                            "materialized byte count overflow".into(),
-                        )
-                    })?;
-                messages.extend(segment.messages);
-            } else {
-                let segment = segments.get(&segment_ref.segment_hash).ok_or_else(|| {
-                    SessionContextCoordinatorError::NeedsRepair(format!(
-                        "missing segment {}",
-                        segment_ref.segment_hash
-                    ))
-                })?;
-                if segment.reference() != segment_ref {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "segment metadata does not match manifest reference".into(),
-                    ));
-                }
-                canonical_segment_bytes = canonical_segment_bytes
-                    .checked_add(segment.canonical_bytes)
-                    .ok_or_else(|| {
-                        SessionContextCoordinatorError::NeedsRepair(
-                            "materialized byte count overflow".into(),
-                        )
-                    })?;
-                messages.extend(segment.messages.iter().cloned());
-            }
             logical_segment_count = logical_segment_count.checked_add(1).ok_or_else(|| {
                 SessionContextCoordinatorError::NeedsRepair(
                     "materialized segment count overflow".into(),
                 )
             })?;
+            messages.extend(segment.messages);
         }
-        prior_cursor = Some(cursor);
+        if content.total_canonical_bytes != canonical_segment_bytes
+            || content.total_message_count != u64::try_from(messages.len()).unwrap_or(u64::MAX)
+        {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "manifest totals do not match its content".into(),
+            ));
+        }
+        prior_cursor = Some(content.node.cursor());
     }
     if canonical_segment_bytes != head.total_canonical_bytes
         || u64::try_from(messages.len()).ok() != Some(head.total_message_count)
@@ -6600,29 +6346,137 @@ fn validate_stored_manifest(
     Ok(())
 }
 
-fn validate_stored_manifest_references(
-    stored_references: &[sqlx::mysql::MySqlRow],
-    node: &ContextManifestNodeV1,
-) -> Result<(), SessionContextCoordinatorError> {
-    if stored_references.len() != node.appended_segments.len() {
-        return Err(SessionContextCoordinatorError::NeedsRepair(
-            "immutable manifest segment reference count is inconsistent".into(),
+const MANIFEST_CONTENT_COLUMNS: &str = "manifest_root, parent_manifest_root, completed_turn,
+    conversation_seq, compaction_generation, canonical_segment_bytes,
+    total_canonical_bytes, total_message_count, manifest_json, content_json, reachable";
+
+struct StoredManifestContent {
+    node: ContextManifestNodeV1,
+    segments: Vec<ConversationSegmentV1>,
+    total_canonical_bytes: u64,
+    total_message_count: u64,
+}
+
+fn encode_manifest_content(
+    content: &[Vec<Value>],
+) -> Result<String, SessionContextCoordinatorError> {
+    if content.len() > MAX_SEGMENT_BATCH {
+        return Err(SessionContextCoordinatorError::ResourceLimit(
+            "too many Context segments",
         ));
     }
-    for (position, row) in stored_references.iter().enumerate() {
-        let stored_position = database_u64(row, "segment_position")?;
-        let stored_hash = row
-            .try_get::<String, _>("segment_hash")
-            .map_err(|source| database_error("decode_manifest_segment_reference", source))?;
-        if stored_position != u64::try_from(position).unwrap_or(u64::MAX)
-            || stored_hash != node.appended_segments[position].segment_hash
+    // Bound the whole frame before any canonical traversal, sorting or hashing.
+    // In particular, a batch of individually valid segments must stop counting
+    // at 32 MiB instead of canonicalizing up to 256 * 8 MiB first.
+    if !astra_turn_types::json_serialized_fits(content, MAX_CONTEXT_CONTENT_BYTES)
+        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?
+    {
+        return Err(SessionContextCoordinatorError::ResourceLimit(
+            "encoded Context content exceeds byte budget",
+        ));
+    }
+    for messages in content {
+        if !astra_turn_types::json_serialized_fits(messages, MAX_CONTEXT_SEGMENT_BYTES)
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?
+            || canonical_conversation_serialized_len(messages) > MAX_CONTEXT_SEGMENT_BYTES
         {
-            return Err(SessionContextCoordinatorError::NeedsRepair(
-                "immutable manifest segment reference does not match the manifest".into(),
+            return Err(SessionContextCoordinatorError::ResourceLimit(
+                "Context segment exceeds byte budget",
             ));
         }
     }
-    Ok(())
+    // Counting stops at the bound before allocating. This buffer is encoded
+    // once and reused by the existing transaction, including commit retries.
+    database_to_json("manifest content", &content)
+}
+
+fn decode_manifest_content(
+    node: &ContextManifestNodeV1,
+    json: &str,
+) -> Result<Vec<ConversationSegmentV1>, SessionContextCoordinatorError> {
+    let invalid = |detail: &str| SessionContextCoordinatorError::NeedsRepair(detail.into());
+    node.validate()
+        .map_err(|error| invalid(&error.to_string()))?;
+    if json.len() > MAX_CONTEXT_CONTENT_BYTES as usize
+        || node.appended_segments.len() > MAX_SEGMENT_BATCH
+    {
+        return Err(invalid("stored Context exceeds byte budget"));
+    }
+    let content: Vec<Vec<Value>> = database_json("manifest content", json)?;
+    if content.len() != node.appended_segments.len() {
+        return Err(invalid("manifest content segment count mismatch"));
+    }
+    content
+        .into_iter()
+        .zip(&node.appended_segments)
+        .map(|(messages, expected)| {
+            if !astra_turn_types::json_serialized_fits(&messages, MAX_CONTEXT_SEGMENT_BYTES)
+                .map_err(|error| invalid(&error.to_string()))?
+            {
+                return Err(invalid(
+                    "stored Context segment exceeds encoded byte budget",
+                ));
+            }
+            let segment = ConversationSegmentV1::new(&node.key, messages)
+                .map_err(|error| invalid(&error.to_string()))?;
+            if segment.canonical_bytes > MAX_CONTEXT_SEGMENT_BYTES
+                || segment.reference() != *expected
+            {
+                return Err(invalid(
+                    "manifest content does not match its ordered reference",
+                ));
+            }
+            Ok(segment)
+        })
+        .collect()
+}
+
+fn decode_stored_manifest_content(
+    row: &sqlx::mysql::MySqlRow,
+    key: &SessionKeyV1,
+) -> Result<StoredManifestContent, SessionContextCoordinatorError> {
+    let json: String = row
+        .try_get("manifest_json")
+        .map_err(|source| database_error("decode_manifest", source))?;
+    let node: ContextManifestNodeV1 = database_json("manifest", &json)?;
+    let stored_root: String = row
+        .try_get("manifest_root")
+        .map_err(|source| database_error("decode_manifest_root", source))?;
+    if node.key != *key || node.manifest_root != stored_root || database_u64(row, "reachable")? != 1
+    {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "manifest scope or reachability mismatch".into(),
+        ));
+    }
+    let content_json: String = row
+        .try_get("content_json")
+        .map_err(|source| database_error("decode_manifest_content", source))?;
+    let segments = decode_manifest_content(&node, &content_json)?;
+    let total_canonical_bytes = database_u64(row, "total_canonical_bytes")?;
+    let total_message_count = database_u64(row, "total_message_count")?;
+    let canonical_bytes = segments
+        .iter()
+        .try_fold(0_u64, |sum, segment| {
+            sum.checked_add(segment.canonical_bytes)
+        })
+        .ok_or_else(|| {
+            SessionContextCoordinatorError::NeedsRepair(
+                "manifest content byte count overflow".into(),
+            )
+        })?;
+    validate_stored_manifest(
+        row,
+        &node,
+        canonical_bytes,
+        total_canonical_bytes,
+        total_message_count,
+    )?;
+    Ok(StoredManifestContent {
+        node,
+        segments,
+        total_canonical_bytes,
+        total_message_count,
+    })
 }
 
 fn validate_optional_manifest_root(
@@ -6637,64 +6491,6 @@ fn validate_optional_manifest_root(
         return Err(SessionContextCoordinatorError::Invalid(
             "manifest root must be a lowercase SHA-256 digest".into(),
         ));
-    }
-    Ok(())
-}
-
-fn validate_segment_batch(
-    key: &SessionKeyV1,
-    segment_hashes: &[String],
-) -> Result<(), SessionContextCoordinatorError> {
-    key.validate()
-        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-    if segment_hashes.is_empty() || segment_hashes.len() > MAX_SEGMENT_BATCH {
-        return Err(SessionContextCoordinatorError::Invalid(format!(
-            "segment batch must contain between 1 and {MAX_SEGMENT_BATCH} identities"
-        )));
-    }
-    let mut unique = HashSet::with_capacity(segment_hashes.len());
-    for hash in segment_hashes {
-        validate_optional_manifest_root(Some(hash))?;
-        if !unique.insert(hash) {
-            return Err(SessionContextCoordinatorError::Invalid(
-                "segment batch contains duplicate identities".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_segment_upload(
-    key: &SessionKeyV1,
-    segments: &[ConversationSegmentV1],
-) -> Result<(), SessionContextCoordinatorError> {
-    let hashes = segments
-        .iter()
-        .map(|segment| segment.segment_hash.clone())
-        .collect::<Vec<_>>();
-    validate_segment_batch(key, &hashes)?;
-    let mut total_bytes = 0_u64;
-    for segment in segments {
-        segment
-            .validate_for(key)
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        if segment.canonical_bytes > MAX_STAGED_SEGMENT_BYTES {
-            return Err(SessionContextCoordinatorError::Invalid(format!(
-                "conversation segment exceeds {MAX_STAGED_SEGMENT_BYTES} canonical bytes"
-            )));
-        }
-        total_bytes = total_bytes
-            .checked_add(segment.canonical_bytes)
-            .ok_or_else(|| {
-                SessionContextCoordinatorError::Invalid(
-                    "conversation segment batch byte count overflow".into(),
-                )
-            })?;
-    }
-    if total_bytes > MAX_STAGED_BATCH_BYTES {
-        return Err(SessionContextCoordinatorError::Invalid(format!(
-            "conversation segment batch exceeds {MAX_STAGED_BATCH_BYTES} canonical bytes"
-        )));
     }
     Ok(())
 }
@@ -7270,6 +7066,116 @@ fn hash_field(digest: &mut Sha256, value: &str) {
 #[cfg(test)]
 mod adoption_tests {
     use super::*;
+
+    #[test]
+    fn node_content_preserves_duplicate_references_and_rejects_changed_order() {
+        let key = SessionKeyV1::owner_session("server", "owner", "session", "main");
+        let first = vec![serde_json::json!({"role":"user","content":"中文🙂\n\t\"\\"})];
+        let second = vec![serde_json::json!({"role":"assistant","content":"answer"})];
+        for content in [
+            vec![first.clone(), first.clone()],
+            vec![first.clone(), second.clone()],
+        ] {
+            let segments: Vec<_> = content
+                .iter()
+                .map(|messages| ConversationSegmentV1::new(&key, messages.clone()).unwrap())
+                .collect();
+            let node = ContextManifestNodeV1::new(
+                key.clone(),
+                None,
+                1,
+                1,
+                1,
+                0,
+                None,
+                segments
+                    .iter()
+                    .map(ConversationSegmentV1::reference)
+                    .collect(),
+            )
+            .unwrap();
+            let encoded = encode_manifest_content(&content).unwrap();
+            assert_eq!(decode_manifest_content(&node, &encoded).unwrap(), segments);
+            for malformed in ["null", "[]", "[[]]"] {
+                assert!(decode_manifest_content(&node, malformed).is_err());
+            }
+            let mut changed = content.clone();
+            changed[0][0]["content"] = "changed".into();
+            assert!(
+                decode_manifest_content(&node, &serde_json::to_string(&changed).unwrap()).is_err()
+            );
+        }
+        let segments = [
+            ConversationSegmentV1::new(&key, first.clone()).unwrap(),
+            ConversationSegmentV1::new(&key, second.clone()).unwrap(),
+        ];
+        let node = ContextManifestNodeV1::new(
+            key,
+            None,
+            1,
+            1,
+            1,
+            0,
+            None,
+            segments
+                .iter()
+                .map(ConversationSegmentV1::reference)
+                .collect(),
+        )
+        .unwrap();
+        let reversed = encode_manifest_content(&[second, first]).unwrap();
+        assert!(decode_manifest_content(&node, &reversed).is_err());
+    }
+
+    #[test]
+    fn ordinary_context_preparation_enforces_segment_and_encoded_frame_limits() {
+        let authority = RunContextAuthority {
+            key: SessionKeyV1::owner_session("server", "owner", "session", "main"),
+            run_id: "run".into(),
+            generation: 0,
+            row_exists: false,
+            base_head: None,
+            turn: 1,
+            writer_epoch: 0,
+            authority_epochs: AuthorityEpochsV1::default(),
+            binding: RunContextBinding::Absent,
+        };
+        let delta = |logical_segments| CanonicalTurnDeltaV1 {
+            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            compaction_generation: 0,
+            config_version_id: None,
+            mode: CanonicalDeltaModeV1::Append,
+            logical_segments,
+        };
+        let input = vec![serde_json::json!({"role":"user","content":""})];
+        let overhead = serde_json::to_vec(&input).unwrap().len();
+        let at_limit = vec![
+            serde_json::json!({"role":"user","content":"x".repeat(MAX_CONTEXT_SEGMENT_BYTES as usize - overhead)}),
+        ];
+        assert!(
+            PreparedSessionContextCommit::for_run(
+                &authority,
+                &"a".repeat(64),
+                delta(vec![at_limit.clone()])
+            )
+            .is_ok()
+        );
+        for content in [
+            vec![input; MAX_SEGMENT_BATCH + 1],
+            vec![vec![
+                serde_json::json!({"role":"user","content":"x".repeat(MAX_CONTEXT_SEGMENT_BYTES as usize)}),
+            ]],
+            vec![at_limit; 4], // Four individually legal segments exceed the whole-frame budget including brackets/commas.
+        ] {
+            assert!(matches!(
+                PreparedSessionContextCommit::for_run(&authority, &"a".repeat(64), delta(content)),
+                Err(SessionContextCoordinatorError::ResourceLimit(_))
+            ));
+        }
+    }
 
     #[test]
     fn run_context_preparation_accepts_initial_run_generation_and_fences_binding_generation() {

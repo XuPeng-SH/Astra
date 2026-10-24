@@ -103,6 +103,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlCapture {
     }
 }
 
+const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";
+
 fn answer(message: Value, reason: &str) -> ProviderResponse {
     ProviderResponse::OpenAi(json!({
         "choices": [{"index": 0, "message": message, "finish_reason": reason}],
@@ -283,14 +285,16 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         .expect("this integration binary owns its SQL subscriber");
 
     let mut budgets = Vec::new();
-    for (scenario, readonly_rounds, warm_context) in [
-        ("ordinary", 0, false),
-        ("discovery", 1, false),
-        ("discovery", 3, false),
-        ("agent_list", 1, false),
-        ("agent_list", 3, false),
-        ("ordinary", 0, true),
-        ("agent_list", 3, true),
+    for (scenario, readonly_rounds, warm_context, held_for_control) in [
+        ("ordinary", 0, false, false),
+        ("discovery", 1, false, false),
+        ("discovery", 3, false, false),
+        ("agent_list", 1, false, false),
+        ("agent_list", 3, false, false),
+        ("ordinary", 0, true, false),
+        ("agent_list", 3, true, false),
+        ("ordinary", 0, false, true),
+        ("agent_list", 3, false, true),
     ] {
         let executes_agent = scenario == "agent_list";
         let tool_call_count = readonly_rounds + usize::from(executes_agent);
@@ -334,6 +338,36 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                     json!({"role":"assistant", "content":"Warm context ready."}),
                     "stop",
                 ),
+            );
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        if held_for_control {
+            let ProviderResponse::OpenAi(first) = responses.remove(0) else {
+                panic!("controlled scenario starts with the ordinary provider response");
+            };
+            let mut delta = first["choices"][0]["message"].clone();
+            if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for (index, call) in calls.iter_mut().enumerate() {
+                    call["index"] = json!(index);
+                }
+            }
+            let chunk = format!(
+                "data: {}\n\n",
+                json!({
+                    "id":"control-observation", "object":"chat.completion.chunk", "model":model,
+                    "choices":[{"index":0,"delta":delta,
+                        "finish_reason":first["choices"][0]["finish_reason"]}],
+                    "usage":first["usage"]
+                })
+            )
+            .into_bytes();
+            responses.insert(
+                0,
+                ProviderResponse::Stream {
+                    content_type: "text/event-stream",
+                    chunks: vec![chunk, b"data: [DONE]\n\n".to_vec()],
+                    release_before_chunk: Some((0, release.clone())),
+                },
             );
         }
         b.ctx
@@ -388,6 +422,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         } else {
             "Discover the agent tool without invoking it."
         };
+        let execution_started = std::time::Instant::now();
         *capture.0.lock().unwrap() = Some(Vec::new());
         let request = axum::http::Request::builder()
             .method("POST")
@@ -403,7 +438,30 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .to_string(),
             ))
             .unwrap();
-        let (status, body) = collect_full_sse_stream(&b.ctx.app, request, 30).await;
+        let observe_control = async {
+            if held_for_control {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let observed = capture.0.lock().unwrap().as_ref().is_some_and(|samples| {
+                            samples
+                                .iter()
+                                .any(|sample| sample.sql == CONTROL_OBSERVATION_SQL)
+                        });
+                        if observed {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("held provider must observe the real durable control poll");
+                release.notify_one();
+            }
+        };
+        let ((status, body), ()) = tokio::join!(
+            collect_full_sse_stream(&b.ctx.app, request, 30),
+            observe_control,
+        );
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         let response_finished_at = std::time::Instant::now();
         let events = parse_sse_events(&body);
@@ -450,6 +508,15 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .await
         );
         let samples = capture.0.lock().unwrap().take().unwrap();
+        let execution_ms = execution_started.elapsed().as_secs_f64() * 1000.0;
+        let control_observation_sql = samples
+            .iter()
+            .filter(|sample| sample.sql == CONTROL_OBSERVATION_SQL)
+            .count();
+        if held_for_control {
+            assert!(control_observation_sql > 0);
+        }
+
         let transactions = transaction_windows(&samples);
         let after_response_sql = samples
             .iter()
@@ -459,6 +526,16 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             .iter()
             .map(|sample| sample.sql.clone())
             .collect::<Vec<_>>();
+        for sql in &statements {
+            assert!(
+                !sql.starts_with("SELECT requested.payload_json AS requested_payload")
+                    && !sql.starts_with("SELECT last_event_idx FROM agent_runs")
+                    && !(sql.starts_with("SELECT")
+                        && sql.contains("FROM agent_run_events")
+                        && sql.contains("UNION ALL")),
+                "an unchanged opening control tail must not load permission or input history: {sql}"
+            );
+        }
         assert!(
             !statements
                 .iter()
@@ -545,9 +622,62 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                     .any(|message| message["role"] == "tool")
             );
         }
+        if scenario == "ordinary" && !warm_context && !held_for_control {
+            use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
+            let restore = HybridRestoreService::new(b.ctx.pool.clone());
+            let extra_ids = (0..19)
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .collect::<Vec<_>>();
+            for expected in [1, 20] {
+                if expected == 20 {
+                    let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                        "INSERT INTO agent_sessions (user_id, session_id, status) ",
+                    );
+                    insert.push_values(&extra_ids, |mut row, id| {
+                        row.push_bind(&b.ctx.user_id)
+                            .push_bind(id)
+                            .push_bind("active");
+                    });
+                    insert.build().execute(&b.ctx.pool).await.unwrap();
+                }
+                *capture.0.lock().unwrap() = Some(Vec::new());
+                let directory = restore
+                    .list_resumable_sessions(&b.ctx.user_id)
+                    .await
+                    .unwrap();
+                let observed = capture.0.lock().unwrap().take().unwrap();
+                assert_eq!(directory.len(), expected);
+                assert_eq!(
+                    observed.len(),
+                    1,
+                    "directory hydration must not grow with its row count"
+                );
+                for forbidden in [
+                    "agent_events",
+                    "session_artifacts",
+                    "session_checkpoints",
+                    "conversation_manifest_nodes",
+                ] {
+                    assert!(!observed[0].sql.contains(forbidden), "{}", observed[0].sql);
+                }
+                eprintln!("resumable_directory rows={expected} sql={}", observed.len());
+            }
+            let mut cleanup = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "DELETE FROM agent_sessions WHERE user_id = ",
+            );
+            cleanup
+                .push_bind(&b.ctx.user_id)
+                .push(" AND session_id IN (");
+            let mut ids = cleanup.separated(", ");
+            for id in &extra_ids {
+                ids.push_bind(id);
+            }
+            ids.push_unseparated(")");
+            cleanup.build().execute(&b.ctx.pool).await.unwrap();
+        }
         b.ctx.close().await;
         eprintln!(
-            "chat_sql_budget scenario={scenario} warm_context={warm_context} readonly_rounds={readonly_rounds} tool_calls={tool_call_count} total_sql={}",
+            "chat_sql_budget scenario={scenario} warm_context={warm_context} readonly_rounds={readonly_rounds} tool_calls={tool_call_count} held_for_control={held_for_control} control_polls={control_observation_sql} total_sql={}",
             statements.len()
         );
         if let Some(path) = std::env::var_os("ASTRA_TEST_SQL_BUDGET_REPORT") {
@@ -560,7 +690,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                     })
                 })
                 .collect::<Vec<_>>();
-            let record = json!({"scenario":scenario, "warm_context":warm_context, "readonly_rounds": readonly_rounds, "tool_calls":tool_call_count, "total_sql": statements.len(), "statements": statements, "statement_timings":statement_timings, "transactions":transactions, "after_response_sql":after_response_sql});
+            let record = json!({"scenario":scenario, "warm_context":warm_context, "readonly_rounds": readonly_rounds, "tool_calls":tool_call_count, "total_sql": statements.len(), "control_observation_sql":control_observation_sql, "held_for_control":held_for_control, "execution_ms":execution_ms, "statements": statements, "statement_timings":statement_timings, "transactions":transactions, "after_response_sql":after_response_sql});
             use std::io::Write as _;
             let mut report = std::fs::OpenOptions::new()
                 .create(true)
@@ -569,25 +699,36 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .unwrap();
             writeln!(report, "{record}").unwrap();
         }
-        budgets.push((scenario, readonly_rounds, warm_context, statements));
+        budgets.push((
+            scenario,
+            readonly_rounds,
+            warm_context,
+            control_observation_sql,
+            statements,
+        ));
     }
-    for (scenario, rounds, warm_context, statements) in &budgets {
+    for (scenario, rounds, warm_context, polls, statements) in &budgets {
+        // Keep every query in the total budget, including periodic controls.
+        assert!(
+            statements.len() <= 20,
+            "{scenario} (warm={warm_context}, polls={polls}) used {} SQL statements including transactions and drained work:\n{}",
+            statements.len(),
+            statements.join("\n")
+        );
+        if *scenario == "ordinary" {
+            continue;
+        }
         let baseline = budgets
             .iter()
-            .find(|(name, _, warm, _)| *name == "ordinary" && warm == warm_context)
-            .unwrap()
-            .3
-            .len();
+            .find(|(name, _, warm, _, _)| *name == "ordinary" && warm == warm_context)
+            .unwrap();
+        // Explain only the exact observed periodic reads; the independent
+        // raw total budget above never deducts a query.
+        let expected = baseline.4.len() as i64 + *polls as i64 - baseline.3 as i64;
         assert_eq!(
-            statements.len(),
-            baseline,
-            "{scenario} {rounds} readonly rounds (warm={warm_context}) must add no framework SQL; base={baseline} total={}",
-            statements.len()
-        );
-        assert!(
-            baseline <= 20,
-            "ordinary chat (warm={warm_context}) used {baseline} SQL statements including transactions and drained background work:\n{}",
-            statements.join("\n")
+            statements.len() as i64,
+            expected,
+            "{scenario} {rounds} readonly rounds (warm={warm_context}, polls={polls}) must add no SQL beyond the exact observed periodic controls"
         );
     }
 }
@@ -650,5 +791,135 @@ async fn explicit_explain_keeps_diagnostic_ingestion_after_complete_drain() {
     .unwrap();
     assert!(recorded.0 > 0, "explicit diagnostics must remain available");
     assert_eq!(b.ctx.native_provider_requests().await.len(), 1);
+    b.ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn post_provider_context_limit_preserves_answer_usage_and_tool_facts() {
+    use astra_services::runs::{
+        CanonicalTerminalContext, CanonicalTerminalOutcome, CommittedRunTerminalReceipt,
+    };
+    use sqlx::Row;
+
+    let b = bootstrap().await;
+    let model = format!("mock-{}", b.ctx.suffix);
+    // This fits the provider's existing 16 MiB stream budget but exceeds the
+    // canonical segment's 8 MiB once message framing is included.
+    let large_answer = "x".repeat(8 * 1024 * 1024);
+    let expected_hash = Sha256::digest(large_answer.as_bytes());
+    b.ctx.install_native_provider(&b.auth_header, vec![ProviderScript::new(
+        "real readonly tool followed by a large answer and one later turn",
+        move |request| request.body["model"] == model && request.body["stream"] == true,
+        vec![
+            answer(json!({"role":"assistant", "content":"", "tool_calls":[{
+                "id":"select-agent", "type":"function",
+                "function":{"name":"tool_search", "arguments":"{\"query\":\"select:agent\"}"}
+            }]}), "tool_calls"),
+            answer(json!({"role":"assistant", "content":"", "tool_calls":[{
+                "id":"list-agent", "type":"function",
+                "function":{"name":"invoke_tool", "arguments":json!({"name":"agent","arguments":{"action":"list"}}).to_string()}
+            }]}), "tool_calls"),
+            answer(json!({"role":"assistant", "content":large_answer}), "stop"),
+            answer(json!({"role":"assistant", "content":"Next turn succeeds."}), "stop"),
+        ],
+    )]).await;
+    let request = |message: &str| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/chat/stream")
+            .header("authorization", &b.auth_header)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "message":message, "session_id":b.ctx.session_id,
+                    "model_selection":seeded_model_selection(&b.ctx),
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let (status, body) =
+        collect_full_sse_stream(&b.ctx.app, request("List agent status, then answer."), 60).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let streamed: String = events
+        .iter()
+        .filter(|e| e["type"] == "text_delta")
+        .map(|e| e["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(streamed.len(), large_answer.len());
+    assert_eq!(Sha256::digest(streamed.as_bytes()), expected_hash);
+    let finished = events
+        .iter()
+        .find(|e| e["type"] == "run_finished")
+        .expect("durable terminal before EOF");
+    assert_eq!(finished["status"], "failed");
+    assert!(!events.iter().any(|e| e["type"] == "turn_complete"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "run_error" && e["error_code"] == "resource_limit")
+    );
+    let run_id = finished["run_id"].as_str().unwrap();
+    let row = sqlx::query(
+        "SELECT status, terminal_receipt_json, last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&b.ctx.user_id)
+    .bind(run_id)
+    .fetch_one(&b.ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("status"), "failed");
+    let receipt = CommittedRunTerminalReceipt::decode(
+        &row.get::<String, _>("terminal_receipt_json"),
+        row.get("last_event_idx"),
+    )
+    .unwrap()
+    .receipt;
+    assert_eq!(receipt.outcome, CanonicalTerminalOutcome::Failed);
+    assert_eq!(receipt.context, CanonicalTerminalContext::Unchanged);
+    assert_eq!(receipt.error_code.as_deref(), Some("resource_limit"));
+    let usage = receipt
+        .usage
+        .expect("provider accounting survives optional Context failure");
+    assert_eq!(usage.input_tokens(), Some(126));
+    assert_eq!(usage.output_tokens(), Some(21));
+    let ledger = receipt
+        .tool_ledger
+        .expect("real tool ledger survives optional Context failure");
+    assert_eq!(ledger.attempted, 2);
+    assert_eq!(ledger.terminal, 2);
+    assert_eq!(ledger.unresolved, 0);
+    assert_eq!(ledger.result_classes.succeeded, 2);
+    let stored_answer: String = sqlx::query_scalar(
+        "SELECT content FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND run_id = ? AND role = 'assistant'",
+    ).bind(&b.ctx.user_id).bind(&b.ctx.session_id).bind(run_id).fetch_one(&b.ctx.pool).await.unwrap();
+    assert_eq!(stored_answer.len(), large_answer.len());
+    assert_eq!(Sha256::digest(stored_answer.as_bytes()), expected_hash);
+    let context_nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ? AND session_id = ?")
+        .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
+    assert_eq!(context_nodes, 0);
+    assert_eq!(
+        b.ctx.native_provider_requests().await.len(),
+        3,
+        "Context failure must not retry provider or tools"
+    );
+    let (_, next) = collect_full_sse_stream(&b.ctx.app, request("hi"), 30).await;
+    let next_events = parse_sse_events(&next);
+    assert!(
+        next_events
+            .iter()
+            .any(|e| e["type"] == "run_finished" && e["status"] == "completed"),
+        "{next}"
+    );
+    assert!(next.contains("Next turn succeeds."));
+    assert_eq!(b.ctx.native_provider_requests().await.len(), 4);
+    assert!(
+        b.ctx
+            .app_state
+            .drain_background_runs(std::time::Duration::from_secs(5))
+            .await
+    );
     b.ctx.close().await;
 }

@@ -12005,6 +12005,135 @@ async fn db_run_start_generation_controls_survive_a_fresh_reader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: guidance before binding and through an independent controller"]
+async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
+    let pool = setup_lifecycle_run_db_it().await;
+    for before_binding in [true, false] {
+        let suffix = Uuid::new_v4();
+        let user = format!("opening-wake-owner-{suffix}");
+        let session = format!("opening-wake-session-{suffix}");
+        crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+        let llm = spawn_gated_terminal_test_llm().await;
+        let owner = db_backed_test_service(&pool, &format!("opening-owner-{suffix}"))
+            .with_run_concurrency_limit(1);
+        let controller = db_backed_test_service(&pool, &format!("opening-controller-{suffix}"));
+        let permit = if before_binding {
+            Some(owner.test_run_semaphore().acquire_owned().await.unwrap())
+        } else {
+            None
+        };
+        let mut request = prepared_test_request("Complete this conversation.");
+        request.session_id = Some(session.clone());
+        request.provider_runtime_authorized = true;
+        request.admitted_model_execution = None;
+        request.runtime_auth = Some(RuntimeAuthRequest {
+            authorization: "Bearer opening-wake-test".into(),
+        });
+        request.capability_descriptors =
+            Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+                model_gateway: Some(test_runtime_descriptor(
+                    "opening-wake-gateway",
+                    "model_gateway",
+                    &format!("{}/chat/completions", llm.base_url),
+                )),
+                ..Default::default()
+            });
+        request.execution_policy.skill_auto_route =
+            astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+        let stream = ok(owner.stream_chat(user.clone(), request).await);
+        let run_id = stream.run_id.clone();
+        if !before_binding {
+            tokio::time::timeout(Duration::from_secs(5), llm.blocked_entered.notified())
+                .await
+                .expect("provider proves the opening readers are already bound");
+            assert!(
+                controller.runs.read().await.is_empty(),
+                "controller has no local executor or wake channel"
+            );
+        }
+        let submitter = if before_binding { &owner } else { &controller };
+        let accepted = ok(submitter
+            .submit_run_user_intent(
+                run_id.clone(),
+                user.clone(),
+                RunUserIntentData {
+                    intent_id: format!("opening-guidance-{suffix}"),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    input: json!({"content":"Use the focused verification before answering."}),
+                },
+            )
+            .await);
+        assert!(!accepted.duplicate);
+        if !before_binding {
+            let mut ready = owner
+                .runs
+                .read()
+                .await
+                .get(&run_id)
+                .unwrap()
+                .input_wake
+                .subscribe();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if *ready.borrow_and_update() >= accepted.event_index {
+                        break;
+                    }
+                    ready
+                        .changed()
+                        .await
+                        .expect("owner control watcher stays alive");
+                }
+            })
+            .await
+            .expect("the owning Server observes remotely committed guidance");
+        }
+        drop(permit);
+        llm.release_blocked.notify_one();
+        let events = tokio::time::timeout(Duration::from_secs(15), collect_chat_stream(stream))
+            .await
+            .expect("guided execution reaches its real terminal");
+        assert!(
+            events
+                .iter()
+                .any(|event| replay_event_type(event) == Some("run_finished")
+                    && chat_stream_event_status(event) == Some(STATUS_COMPLETED)),
+            "{events:?}"
+        );
+        let durable = owner
+            .run_engine
+            .load_run(&user, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_COMPLETED);
+        assert_eq!(
+            durable
+                .events
+                .iter()
+                .filter(|event| replay_event_type(event) == Some("user_intent_applied"))
+                .count(),
+            1,
+            "the exact accepted guidance must receive its durable application ACK"
+        );
+        if before_binding {
+            assert_eq!(
+                llm.requests.load(Ordering::SeqCst),
+                1,
+                "guidance accepted before binding belongs in the first provider request"
+            );
+        } else {
+            assert!(
+                llm.requests.load(Ordering::SeqCst) >= 2,
+                "remote guidance during a held answer must reach another provider boundary"
+            );
+        }
+        assert!(owner.drain_background_tasks(Duration::from_secs(5)).await);
+        cleanup_lifecycle_run_fixture(&pool, &user, &run_id).await;
+        crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
     let pool = setup_lifecycle_run_db_it().await;

@@ -4677,9 +4677,9 @@ mod tests {
             &state,
             CanonicalTerminalSettlement {
                 expected_owner_pod_id: store.owner_pod_id(),
-                // The outer generation fence accepts the running owner. This
-                // deliberately conflicts only after canonical rows have been
-                // staged, proving the shared transaction rolls every class back.
+                // The terminal claim must reject this status before publishing
+                // any evidence or usage. The collision case below independently
+                // exercises rollback after canonical rows have been staged.
                 expected_statuses: &[astra_core::STATUS_WAITING],
                 expected_owner_generation: authority.owner_generation,
                 status: astra_core::STATUS_COMPLETED,
@@ -4698,8 +4698,11 @@ mod tests {
         .await
         .expect_err("terminal precondition conflict must roll back canonical writes");
         assert!(
-            error.contains("authoritative atomic terminal resolution conflict")
-                && error.contains("terminal state or usage mismatch"),
+            error
+                == format!(
+                    "canonical terminal lost durable execution authority at generation {}",
+                    authority.owner_generation
+                ),
             "unexpected canonical terminal error: {error}"
         );
 
@@ -4846,7 +4849,10 @@ mod tests {
                     &user,
                     &session,
                     Some(&session),
-                    Default::default(),
+                    crate::server::run::engine::RunStartContext {
+                        original_input: Some(request.message.clone()),
+                        ..Default::default()
+                    },
                     true,
                     &mut participant
                 )
@@ -5157,48 +5163,57 @@ mod tests {
                     "a genuine later turn cannot invalidate the earlier exact commit"
                 );
 
-                let manifest: String = sqlx::query_scalar("SELECT manifest_json FROM conversation_manifest_nodes WHERE owner_user_id=? AND session_id=? AND manifest_root=?")
+                let row = sqlx::query("SELECT manifest_json,content_json,total_message_count,compaction_generation,conversation_seq FROM conversation_manifest_nodes WHERE owner_user_id=? AND session_id=? AND manifest_root=?")
                     .bind(&user).bind(&session).bind(&old_manifest).fetch_one(pool.get()).await.unwrap();
-                let segment = sqlx::query("SELECT s.segment_hash,s.segment_json FROM conversation_segments s JOIN conversation_manifest_segments r ON r.isolation_domain=s.isolation_domain AND r.owner_user_id=s.owner_user_id AND r.segment_hash=s.segment_hash WHERE r.owner_user_id=? AND r.session_id=? AND r.manifest_root=? ORDER BY r.segment_position LIMIT 1")
-                    .bind(&user).bind(&session).bind(&old_manifest).fetch_one(pool.get()).await.unwrap();
-                let segment_hash: String = segment.try_get("segment_hash").unwrap();
-                let segment_json: String = segment.try_get("segment_json").unwrap();
-                // Each failure leaves C0 and all original raw rows intact.
-                // Resolution must inspect the actual immutable Context objects.
-                for fault in ["manifest", "references", "segment", "totals"] {
-                    let (break_sql, restore_sql, saved) = match fault {
-                        "manifest" => (
-                            "UPDATE conversation_manifest_nodes SET manifest_json=? WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
-                            "UPDATE conversation_manifest_nodes SET manifest_json=? WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
-                            manifest.as_str(),
-                        ),
-                        "segment" => (
-                            "UPDATE conversation_segments SET segment_json=? WHERE owner_user_id=? AND segment_hash=?",
-                            "UPDATE conversation_segments SET segment_json=? WHERE owner_user_id=? AND segment_hash=?",
-                            segment_json.as_str(),
-                        ),
-                        "references" => (
-                            "UPDATE conversation_manifest_segments SET segment_position=segment_position+100 WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
-                            "UPDATE conversation_manifest_segments SET segment_position=segment_position-100 WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
-                            "",
-                        ),
-                        _ => (
-                            "UPDATE conversation_manifest_nodes SET total_message_count=total_message_count+1 WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
-                            "UPDATE conversation_manifest_nodes SET total_message_count=total_message_count-1 WHERE owner_user_id=? AND session_id=? AND manifest_root=?",
-                            "",
-                        ),
-                    };
-                    let mut broken = sqlx::query(break_sql);
-                    if !saved.is_empty() {
-                        broken = broken.bind("{}");
-                    }
-                    broken = broken.bind(&user);
-                    if fault == "segment" {
-                        broken = broken.bind(&segment_hash);
-                    } else {
-                        broken = broken.bind(&session).bind(&old_manifest);
-                    }
-                    assert!(broken.execute(pool.get()).await.unwrap().rows_affected() > 0);
+                let manifest: String = row.try_get("manifest_json").unwrap();
+                let content: String = row.try_get("content_json").unwrap();
+                let count: i64 = row.try_get("total_message_count").unwrap();
+                let generation: i64 = row.try_get("compaction_generation").unwrap();
+                let sequence: i64 = row.try_get("conversation_seq").unwrap();
+                let mut reordered: Vec<Vec<Value>> = serde_json::from_str(&content).unwrap();
+                assert!(reordered[0].len() >= 2);
+                reordered[0].reverse();
+                // Exact resolution must verify both the immutable body and
+                // its ordering, as well as the original indexed coordinates.
+                for (column, bad, saved) in [
+                    (
+                        "compaction_generation",
+                        (generation + 1).to_string(),
+                        generation.to_string(),
+                    ),
+                    (
+                        "conversation_seq",
+                        (sequence + 1000).to_string(),
+                        sequence.to_string(),
+                    ),
+                    ("manifest_json", "{}".into(), manifest),
+                    ("content_json", "[]".into(), content.clone()),
+                    (
+                        "content_json",
+                        serde_json::to_string(&reordered).unwrap(),
+                        content,
+                    ),
+                    (
+                        "total_message_count",
+                        (count + 1).to_string(),
+                        count.to_string(),
+                    ),
+                ] {
+                    let sql = format!(
+                        "UPDATE conversation_manifest_nodes SET {column}=? WHERE owner_user_id=? AND session_id=? AND manifest_root=?"
+                    );
+                    assert_eq!(
+                        sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                            .bind(bad)
+                            .bind(&user)
+                            .bind(&session)
+                            .bind(&old_manifest)
+                            .execute(pool.get())
+                            .await
+                            .unwrap()
+                            .rows_affected(),
+                        1
+                    );
                     assert!(
                         persist_server_loop_canonical_terminal_settlement(
                             &pool,
@@ -5209,19 +5224,16 @@ mod tests {
                         )
                         .await
                         .is_err(),
-                        "{fault} corruption cannot resolve as an exact commit"
+                        "{column} corruption cannot resolve as an exact commit"
                     );
-                    let mut restore = sqlx::query(restore_sql);
-                    if !saved.is_empty() {
-                        restore = restore.bind(saved);
-                    }
-                    restore = restore.bind(&user);
-                    if fault == "segment" {
-                        restore = restore.bind(&segment_hash);
-                    } else {
-                        restore = restore.bind(&session).bind(&old_manifest);
-                    }
-                    restore.execute(pool.get()).await.unwrap();
+                    sqlx::query(sqlx::AssertSqlSafe(sql))
+                        .bind(saved)
+                        .bind(&user)
+                        .bind(&session)
+                        .bind(&old_manifest)
+                        .execute(pool.get())
+                        .await
+                        .unwrap();
                 }
                 assert!(
                     persist_server_loop_canonical_terminal_settlement(
@@ -5251,7 +5263,6 @@ mod tests {
             );
         }
         for table in [
-            "conversation_manifest_segments",
             "conversation_manifest_nodes",
             "session_context_heads",
             "session_context_operation_receipts",
@@ -5276,11 +5287,6 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM conversation_segments WHERE owner_user_id = ?")
-            .bind(&user)
-            .execute(pool.get())
-            .await
-            .unwrap();
         cleanup_core_persist_fixture_for_owner(pool.get(), &session, &user).await;
     }
 

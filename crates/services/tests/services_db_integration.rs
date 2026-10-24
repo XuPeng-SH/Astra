@@ -5018,15 +5018,24 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         .iter()
         .find(|session| session.session_id == session_a)
         .expect("session A listed");
-    assert_eq!(listed_a.turn_count, 2);
+    assert_eq!(
+        listed_a.turn_count, 0,
+        "directory requires a canonical head"
+    );
     assert_eq!(listed_a.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(listed_a.git_branch.as_deref(), Some("feature/cloud-sync"));
     let listed_b = resumable
         .iter()
         .find(|session| session.session_id == session_b)
         .expect("session B listed");
-    assert_eq!(listed_b.turn_count, 1);
-    assert_eq!(listed_b.model.as_deref(), Some("claude-sonnet-4.5"));
+    assert_eq!(
+        listed_b.turn_count, 0,
+        "diagnostic events do not supply directory turns"
+    );
+    assert!(
+        listed_b.model.is_none(),
+        "directory does not infer a model from events"
+    );
     assert_eq!(listed_b.git_branch.as_deref(), Some("legacy-fallback"));
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_a, session_b]).await;
@@ -5137,8 +5146,8 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         .find(|session| session.session_id == session_id)
         .expect("sparse-turn session listed");
     assert_eq!(
-        listed_session.turn_count, 4,
-        "list_resumable_sessions must use the same turn high watermark as restore_session"
+        listed_session.turn_count, 0,
+        "directory omits diagnostic turn counts; selected detail recovery retains its high watermark"
     );
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;

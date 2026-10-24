@@ -101,13 +101,12 @@ pub enum WorkBranchDeletionError {
     #[error("branch session cleanup failed: {0}")]
     SessionCleanup(String),
     #[error(
-        "branch lineage cleanup is not terminal (manifests={orphaned_manifests}, pins={orphaned_pins}, forks={orphaned_forks}, references={orphaned_references})"
+        "branch lineage cleanup is not terminal (manifests={orphaned_manifests}, pins={orphaned_pins}, forks={orphaned_forks})"
     )]
     LineagePending {
         orphaned_manifests: i64,
         orphaned_pins: i64,
         orphaned_forks: i64,
-        orphaned_references: i64,
     },
     #[error("branch deletion operation was not found")]
     OperationNotFound,
@@ -952,9 +951,8 @@ impl DatabaseWorkBranchDeletionService {
 
     /// Proves that every retained lineage object is still owned by a valid
     /// descendant fork before branch-local records may disappear. Shared
-    /// immutable payloads are intentionally not deleted here: owner-level
-    /// segment GC remains bounded in the production reaper and may be shared
-    /// by unrelated branches.
+    /// node payloads remain under the existing fork/pin retention owner and
+    /// are collected with their node once the last descendant releases them.
     pub async fn reconcile_lineage(
         &self,
         owner_id: &WorkOwnerId,
@@ -1030,40 +1028,26 @@ impl DatabaseWorkBranchDeletionService {
         .map_err(|source| database_error("verify retained branch pins", source))?;
         let orphaned_forks: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM session_forks fork
-             WHERE fork.owner_user_id = ? AND fork.child_session_id = ?",
-        )
-        .bind(owner_id.as_str())
-        .bind(admission.session_id.as_str())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|source| database_error("verify deleted child forks", source))?;
-        let orphaned_references: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_manifest_segments segment
-             WHERE segment.owner_user_id = ? AND segment.session_id = ?
+             WHERE fork.owner_user_id = ? AND fork.child_session_id = ?
                AND NOT EXISTS (
-                   SELECT 1 FROM conversation_manifest_nodes node
-                   WHERE node.isolation_domain = segment.isolation_domain
-                     AND node.owner_user_id = segment.owner_user_id
-                     AND node.session_id = segment.session_id
-                     AND node.branch_id = segment.branch_id
-                     AND node.manifest_root = segment.manifest_root
+                   SELECT 1 FROM session_forks descendants
+                   WHERE descendants.isolation_domain = fork.isolation_domain
+                     AND descendants.owner_user_id = fork.owner_user_id
+                     AND descendants.parent_session_id = fork.child_session_id
+                     AND descendants.parent_branch_id = fork.child_branch_id
+                     AND descendants.state IN ('prepared', 'active')
                )",
         )
         .bind(owner_id.as_str())
         .bind(admission.session_id.as_str())
         .fetch_one(&mut *tx)
         .await
-        .map_err(|source| database_error("verify branch manifest references", source))?;
-        if orphaned_manifests != 0
-            || orphaned_pins != 0
-            || orphaned_forks != 0
-            || orphaned_references != 0
-        {
+        .map_err(|source| database_error("verify deleted child forks", source))?;
+        if orphaned_manifests != 0 || orphaned_pins != 0 || orphaned_forks != 0 {
             return Err(WorkBranchDeletionError::LineagePending {
                 orphaned_manifests,
                 orphaned_pins,
                 orphaned_forks,
-                orphaned_references,
             });
         }
         let updated = sqlx::query(

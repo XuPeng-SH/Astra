@@ -2004,23 +2004,12 @@ fn default_fork_list_limit() -> u32 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionSegmentBatchRequest {
-    pub segment_hashes: Vec<String>,
+    pub manifest_root: String,
 }
 
 #[derive(Serialize)]
 pub(crate) struct SessionSegmentBatchResponse {
     pub segments: Vec<astra_turn_types::ConversationSegmentV1>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionSegmentUploadRequest {
-    pub segments: Vec<astra_turn_types::ConversationSegmentV1>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct SessionSegmentUploadResponse {
-    pub stored_segment_hashes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -2689,53 +2678,13 @@ pub(crate) async fn get_session_segments_handler(
         .as_ref()
         .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
     let segments = coordinator
-        .load_segments(
+        .load_manifest_content(
             &server_session_key(&user.user_id, &session.session_id),
-            &request.segment_hashes,
+            &request.manifest_root,
         )
         .await
         .map_err(session_context_http_error)?;
     Ok(Json(SessionSegmentBatchResponse { segments }))
-}
-
-pub(crate) async fn upload_session_segments_handler(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<SessionSegmentUploadRequest>,
-) -> Result<Json<SessionSegmentUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let session = state
-        .session_service
-        .get_session(session_id, user.user_id.clone())
-        .await?;
-    let pool = state
-        .shared_pool
-        .as_ref()
-        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
-    let _device = verify_device_proof_from_headers(
-        pool,
-        &user.user_id,
-        &session.session_id,
-        &headers,
-        DeviceProofPurpose::Publish,
-    )
-    .await?;
-    let key = server_session_key(&user.user_id, &session.session_id);
-    state
-        .session_context_coordinator
-        .as_ref()
-        .ok_or_else(|| internal_error("session context coordinator is not configured"))?
-        .store_segments(&key, &request.segments)
-        .await
-        .map_err(session_context_http_error)?;
-    Ok(Json(SessionSegmentUploadResponse {
-        stored_segment_hashes: request
-            .segments
-            .into_iter()
-            .map(|segment| segment.segment_hash)
-            .collect(),
-    }))
 }
 
 pub(crate) async fn issue_session_execution_grant_handler(
@@ -2886,6 +2835,9 @@ fn session_context_http_error(
         ),
         astra_services::SessionContextCoordinatorError::Invalid(message) => {
             error_response(StatusCode::BAD_REQUEST, message)
+        }
+        astra_services::SessionContextCoordinatorError::ResourceLimit(message) => {
+            error_response(StatusCode::PAYLOAD_TOO_LARGE, message)
         }
         astra_services::SessionContextCoordinatorError::SegmentNotFound => {
             error_response(StatusCode::NOT_FOUND, error.to_string())

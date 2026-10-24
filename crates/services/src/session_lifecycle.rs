@@ -89,7 +89,15 @@ const SESSION_LOCK_AGENT_RUNS_SQL: &str = "SELECT run_id FROM agent_runs
 const SESSION_DELETE_CHILD_FORKS_SELECT_SQL: &str =
     "SELECT isolation_domain, fork_id, parent_session_id
        FROM session_forks
-      WHERE child_session_id = ? AND owner_user_id = ?";
+      WHERE child_session_id = ? AND owner_user_id = ?
+        AND NOT EXISTS (
+            SELECT 1 FROM session_forks descendants
+            WHERE descendants.isolation_domain = session_forks.isolation_domain
+              AND descendants.owner_user_id = session_forks.owner_user_id
+              AND descendants.parent_session_id = session_forks.child_session_id
+              AND descendants.parent_branch_id = session_forks.child_branch_id
+              AND descendants.state IN ('prepared', 'active')
+        )";
 
 const SESSION_DELETE_CHILD_FORK_EVENTS_SQL: &str = "DELETE FROM session_fork_events
          WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?";
@@ -124,23 +132,6 @@ const SESSION_DELETE_ORPHAN_MANIFESTS_SQL: &str = "DELETE FROM conversation_mani
                      )
                  )
            )";
-
-const SESSION_DELETE_ORPHAN_MANIFEST_REFERENCES_SQL: &str =
-    "DELETE FROM conversation_manifest_segments
-      WHERE owner_user_id = ? AND session_id = ?
-        AND NOT EXISTS (
-                SELECT 1 FROM conversation_manifest_nodes
-                 WHERE conversation_manifest_nodes.isolation_domain =
-                           conversation_manifest_segments.isolation_domain
-                   AND conversation_manifest_nodes.owner_user_id =
-                           conversation_manifest_segments.owner_user_id
-                   AND conversation_manifest_nodes.session_id =
-                           conversation_manifest_segments.session_id
-                   AND conversation_manifest_nodes.branch_id =
-                           conversation_manifest_segments.branch_id
-                   AND conversation_manifest_nodes.manifest_root =
-                           conversation_manifest_segments.manifest_root
-            )";
 
 const SESSION_DELETE_WORKSPACE_CLEANUP_DEBT_MESSAGE: &str =
     "session hard delete requested cloud workspace cleanup";
@@ -779,24 +770,6 @@ async fn delete_unpinned_orphan_manifests(
     Ok(())
 }
 
-async fn delete_orphan_manifest_references_for_session(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-    outcome: &mut SessionDatabaseDeleteOutcome,
-) -> Result<(), String> {
-    let rows = query(SESSION_DELETE_ORPHAN_MANIFEST_REFERENCES_SQL)
-        .bind(user_id)
-        .bind(session_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|source| {
-            format!("delete_session.orphan_conversation_manifest_segments: {source}")
-        })?
-        .rows_affected();
-    record_table_delete(outcome, "orphan_conversation_manifest_segments", rows)
-}
-
 pub(crate) async fn hard_delete_session_rows(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
@@ -890,9 +863,9 @@ pub(crate) async fn hard_delete_session_rows(
     outcome.workspace_cleanup_debts_enqueued =
         enqueue_workspace_cleanup_debts_for_session_delete(tx, session_id, user_id).await?;
 
-    // A child fork owns the pin that keeps its parent's exact prefix alive.
-    // Remove that dependency before deleting the child; parent deletion keeps
-    // the same records intact while any child still exists.
+    // A child fork pins its parent's exact prefix. Live descendants still need
+    // that ancestry after this Session is deleted; retain the existing group
+    // until the bottom-up fork collector can release it.
     let fork_parent_scopes = delete_child_fork_state(tx, session_id, user_id, &mut outcome).await?;
 
     for statement in SESSION_DELETE_DIRECT_BATCH_TABLES {
@@ -964,11 +937,6 @@ pub(crate) async fn hard_delete_session_rows(
     // If the parent session was deleted earlier, removing its last child pin
     // makes the retained manifests collectible in this same transaction.
     delete_unpinned_orphan_manifests(tx, user_id, &fork_parent_scopes, &mut outcome).await?;
-    delete_orphan_manifest_references_for_session(tx, session_id, user_id, &mut outcome).await?;
-    for (_, parent_session_id) in &fork_parent_scopes {
-        delete_orphan_manifest_references_for_session(tx, parent_session_id, user_id, &mut outcome)
-            .await?;
-    }
 
     // A provider terminal that already owned the invocation lock can publish a
     // debt while hard-delete waits. The second owner-scoped pass runs after the

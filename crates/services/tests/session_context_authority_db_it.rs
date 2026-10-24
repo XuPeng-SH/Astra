@@ -220,9 +220,7 @@ async fn canonical_commit_releases_only_its_own_completed_writer() {
         3
     );
     for table in [
-        "conversation_manifest_segments",
         "conversation_manifest_nodes",
-        "conversation_segments",
         "session_context_operation_receipts",
         "session_context_authority_events",
         "session_context_heads",
@@ -1632,14 +1630,14 @@ async fn independent_sessions_share_one_physical_checkout() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
+async fn canonical_commit_verifies_existing_node_and_preserves_idempotency() {
     let pool = common::setup_pool().await;
-    let owner_id = format!("staged-manifest-owner-{}", Uuid::new_v4());
-    let session_id = format!("staged-manifest-session-{}", Uuid::new_v4());
+    let owner_id = format!("existing-manifest-owner-{}", Uuid::new_v4());
+    let session_id = format!("existing-manifest-session-{}", Uuid::new_v4());
     let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
     let actor = ActorContextV1::owner_user(
         &owner_id,
-        "staged-manifest-db-it",
+        "existing-manifest-db-it",
         ActorKindV1::Cli,
         SessionSurfaceV1::Cli,
         None,
@@ -1664,7 +1662,7 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
     };
     let messages = vec![serde_json::json!({
         "role": "assistant",
-        "content": "legacy staged manifest"
+        "content": "existing immutable manifest"
     })];
     let segment = ConversationSegmentV1::new(&key, messages.clone()).expect("segment");
     let node = ContextManifestNodeV1::new(
@@ -1678,30 +1676,13 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
         vec![segment.reference()],
     )
     .expect("manifest");
-    let segment_json = serde_json::to_string(&segment).expect("serialize segment");
-    sqlx::query(
-        "INSERT INTO conversation_segments
-         (isolation_domain, owner_user_id, segment_hash, canonical_root_hash,
-          canonical_bytes, message_count, segment_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&segment.segment_hash)
-    .bind(&segment.canonical_root_hash)
-    .bind(i64::try_from(segment.canonical_bytes).expect("segment bytes fit BIGINT"))
-    .bind(i64::from(segment.message_count))
-    .bind(segment_json)
-    .execute(pool.get())
-    .await
-    .expect("stage legacy segment");
     sqlx::query(
         "INSERT INTO conversation_manifest_nodes
          (isolation_domain, owner_user_id, session_id, branch_id, manifest_root,
           parent_manifest_root, completed_turn, conversation_seq,
           compaction_generation, canonical_segment_bytes, total_canonical_bytes,
-          total_message_count, manifest_json, reachable)
-         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 0)",
+          total_message_count, manifest_json, content_json, reachable)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(&key.isolation_domain)
     .bind(&key.owner_user_id)
@@ -1715,25 +1696,10 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
     .bind(i64::try_from(segment.canonical_bytes).expect("total bytes fit BIGINT"))
     .bind(i64::from(segment.message_count))
     .bind(serde_json::to_string(&node).expect("serialize manifest"))
+    .bind(serde_json::to_string(&vec![messages.clone()]).unwrap())
     .execute(pool.get())
     .await
-    .expect("stage legacy unreachable manifest");
-    sqlx::query(
-        "INSERT INTO conversation_manifest_segments
-         (isolation_domain, owner_user_id, session_id, branch_id,
-          manifest_root, segment_position, segment_hash)
-         VALUES (?, ?, ?, ?, ?, 0, ?)",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
-    .bind(&node.manifest_root)
-    .bind(&segment.segment_hash)
-    .execute(pool.get())
-    .await
-    .expect("stage legacy manifest reference");
-
+    .expect("insert complete immutable manifest");
     let delta = CanonicalTurnDeltaV1 {
         schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
         completed_turn: 1,
@@ -1744,10 +1710,53 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
         mode: CanonicalDeltaModeV1::Append,
         logical_segments: vec![messages.clone()],
     };
+    // A duplicate coordinate must prove the full existing immutable row.
+    // Reject corruption without advancing the head or leaving a replay receipt.
+    let encoded = serde_json::to_string(&vec![messages.clone()]).unwrap();
+    let conflicting_root = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    for (column, bad, saved) in [
+        (
+            "manifest_root",
+            conflicting_root,
+            node.manifest_root.clone(),
+        ),
+        ("content_json", "[]".into(), encoded),
+    ] {
+        let sql = format!(
+            "UPDATE conversation_manifest_nodes SET {column} = ?
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+               AND branch_id = ? AND compaction_generation = 0 AND conversation_seq = 1"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+            .bind(bad)
+            .bind(&key.isolation_domain)
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&key.branch_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(matches!(
+            coordinator
+                .commit_turn(&reservation, delta.clone(), "commit-existing-manifest")
+                .await,
+            Err(SessionContextCoordinatorError::NeedsRepair(_))
+        ));
+        assert!(coordinator.load_head(&key).await.unwrap().is_none());
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(saved)
+            .bind(&key.isolation_domain)
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&key.branch_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
     let outcome = coordinator
-        .commit_turn(&reservation, delta.clone(), "commit-staged-manifest")
+        .commit_turn(&reservation, delta.clone(), "commit-existing-manifest")
         .await
-        .expect("commit over staged manifest");
+        .expect("commit over existing immutable manifest");
     let cursor = match outcome {
         CoordinatorMutationV1::Applied { cursor } => cursor,
         other => panic!("unexpected commit outcome: {other:?}"),
@@ -1775,14 +1784,14 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
     let materialized = coordinator
         .materialize(&head)
         .await
-        .expect("materialize reactivated manifest");
+        .expect("materialize committed immutable manifest");
     assert_eq!(materialized.messages, messages);
 
     let snapshot = coordinator.load_admission_snapshot(&key).await.unwrap();
     assert_eq!(snapshot.head.unwrap().cursor, cursor);
     assert!(matches!(
         coordinator
-            .commit_turn(&reservation, delta.clone(), "commit-staged-manifest")
+            .commit_turn(&reservation, delta.clone(), "commit-existing-manifest")
             .await
             .unwrap(),
         CoordinatorMutationV1::AlreadyApplied { .. }
@@ -1791,7 +1800,7 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
     changed.config_version_id = Some("changed-config".into());
     assert!(matches!(
         coordinator
-            .commit_turn(&reservation, changed, "commit-staged-manifest")
+            .commit_turn(&reservation, changed, "commit-existing-manifest")
             .await,
         Err(SessionContextCoordinatorError::IdempotencyMismatch)
     ));
@@ -1830,22 +1839,20 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
     changed.config_version_id = Some("other-config".into());
     assert!(matches!(
         coordinator
-            .commit_turn(&reservation, changed, "commit-staged-manifest")
+            .commit_turn(&reservation, changed, "commit-existing-manifest")
             .await,
         Err(SessionContextCoordinatorError::IdempotencyMismatch)
     ));
     assert!(matches!(
         coordinator
-            .commit_turn(&reservation, delta, "commit-staged-manifest")
+            .commit_turn(&reservation, delta, "commit-existing-manifest")
             .await
             .unwrap(),
         CoordinatorMutationV1::AlreadyApplied { .. }
     ));
 
     for table in [
-        "conversation_manifest_segments",
         "conversation_manifest_nodes",
-        "conversation_segments",
         "session_context_operation_receipts",
         "session_context_authority_events",
         "session_context_heads",
@@ -1857,13 +1864,13 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
         .bind(&key.owner_user_id)
         .execute(pool.get())
         .await
-        .expect("clean staged manifest fixture");
+        .expect("clean existing manifest fixture");
     }
 }
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_lists_derive_activity_from_committed_context_with_stable_seek_pages() {
+async fn session_lists_derive_activity_from_established_heads_with_stable_seek_pages() {
     use astra_services::auth::session::SessionCreateRequestData;
     use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
     use astra_services::{DatabaseSessionService, SessionListFilter};
@@ -1969,8 +1976,27 @@ async fn session_lists_derive_activity_from_committed_context_with_stable_seek_p
         astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
     );
     let (reservation, delta) = commit(&coordinator, &key).await;
-    sqlx::query("UPDATE conversation_manifest_nodes SET created_at='2026-05-01 12:00:00.000002' WHERE owner_user_id=? AND session_id=?")
+    assert_eq!(
+        &restore.list_resumable_sessions(&owner).await.unwrap()[0].session_id,
+        target,
+        "a real Context commit promotes an aged Session without a metadata write"
+    );
+    let committed_activity = service
+        .get_session(target.clone(), owner.clone())
+        .await
+        .unwrap()
+        .updated_at;
+    sqlx::query("UPDATE conversation_manifest_nodes SET created_at='2060-05-01 12:00:00.000002' WHERE owner_user_id=? AND session_id=?")
         .bind(&owner).bind(target).execute(pool.get()).await.unwrap();
+    assert_eq!(
+        service
+            .get_session(target.clone(), owner.clone())
+            .await
+            .unwrap()
+            .updated_at,
+        committed_activity,
+        "immutable node timestamps must not affect Session activity"
+    );
     for (id, ts) in [
         (tie, "2026-05-01 12:00:00.000002"),
         (earlier, "2026-05-01 12:00:00.000001"),
@@ -1992,7 +2018,7 @@ async fn session_lists_derive_activity_from_committed_context_with_stable_seek_p
     ] {
         commit(&coordinator, &other_key).await;
     }
-    // Existing and empty controller operations change mutable head timestamps only.
+    // Controller writes promote an established Context; empty heads remain metadata-only.
     let cursor = coordinator.load_head(&key).await.unwrap().unwrap().cursor;
     let actor = ActorContextV1::owner_user(
         &owner,
@@ -2004,6 +2030,18 @@ async fn session_lists_derive_activity_from_committed_context_with_stable_seek_p
     );
     let lease = coordinator.load_active_writer(&key).await.unwrap().unwrap();
     coordinator.release_writer(&lease).await.unwrap();
+    sqlx::query("UPDATE session_context_heads SET updated_at='2000-01-01' WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
+        .bind(&owner).bind(target).execute(pool.get()).await.unwrap();
+    assert_eq!(
+        service
+            .get_session(target.clone(), owner.clone())
+            .await
+            .unwrap()
+            .updated_at
+            .as_deref(),
+        Some("2021-01-01T00:00:00"),
+        "metadata is the fallback when head activity is older"
+    );
     let (lease, next) = match coordinator
         .acquire_writer_and_reserve_turn(
             &key,
@@ -2040,6 +2078,11 @@ async fn session_lists_derive_activity_from_committed_context_with_stable_seek_p
         .release_writer(&renewed.writer_lease)
         .await
         .unwrap();
+    assert_eq!(
+        &restore.list_resumable_sessions(&owner).await.unwrap()[0].session_id,
+        target,
+        "real Controller updates promote an established Context without another commit"
+    );
     let empty_key = SessionKeyV1::owner_session("server", &owner, noise, "main");
     let lease = match coordinator
         .acquire_writer(&empty_key, None, &actor, Duration::from_secs(120), "empty")
@@ -2050,6 +2093,10 @@ async fn session_lists_derive_activity_from_committed_context_with_stable_seek_p
         other => panic!("unexpected empty controller: {other:?}"),
     };
     coordinator.release_writer(&lease).await.unwrap();
+
+    // Freeze activity after all writes to test seek pagination on a static directory.
+    sqlx::query("UPDATE session_context_heads SET updated_at='2026-05-01 12:00:00.000002' WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
+        .bind(&owner).bind(target).execute(pool.get()).await.unwrap();
 
     // Recreate readers to exclude process-local state. Seek with exact ties and microseconds.
     let service = DatabaseSessionService::new(settings).with_pool(pool.clone());
@@ -2099,7 +2146,7 @@ async fn session_lists_derive_activity_from_committed_context_with_stable_seek_p
         .unwrap();
     assert_eq!(
         &restored[0].session_id, target,
-        "canonical activity crosses the 20-row cutoff"
+        "established head activity crosses the 20-row cutoff"
     );
     let stored: String=sqlx::query_scalar("SELECT DATE_FORMAT(updated_at,'%Y-%m-%dT%H:%i:%s') FROM agent_sessions WHERE user_id=? AND session_id=?")
         .bind(&owner).bind(target).fetch_one(pool.get()).await.unwrap();
@@ -2107,10 +2154,65 @@ async fn session_lists_derive_activity_from_committed_context_with_stable_seek_p
         stored, "2021-01-01T00:00:00",
         "recency reads must not repair metadata or create diagnostics"
     );
+    // Directory reads must not hydrate optional diagnostics or corrupt workspace details.
+    sqlx::query(
+        "UPDATE agent_sessions SET metadata=CAST(? AS JSON) WHERE user_id=? AND session_id=?",
+    )
+    .bind(
+        r#"{"model":"directory-model","git_branch":"directory-branch","permission_mode":"prompt"}"#,
+    )
+    .bind(&owner)
+    .bind(target)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO agent_events (user_id, session_id, event_id, event_type, turn_seq, llm_model_used, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'user_query', 999, 'diagnostic-model', 'synthetic', 'directory-isolation')")
+        .bind(&owner).bind(target).bind(Uuid::new_v4().to_string()).execute(pool.get()).await.unwrap();
+    let workspace_id = astra_services::session_workspace::WORKSPACE_METADATA_PROJECTION_ID;
+    sqlx::query("INSERT INTO session_artifacts (user_id, session_id, artifact_id, artifact_kind, content_json) VALUES (?, ?, ?, 'workspace_metadata', '[]')")
+        .bind(&owner).bind(target).bind(workspace_id).execute(pool.get()).await.unwrap();
+    let listed = restore.list_resumable_sessions(&owner).await.unwrap();
+    let entry = listed.iter().find(|s| &s.session_id == target).unwrap();
+    assert_eq!(
+        entry.turn_count, 1,
+        "directory count comes from the real canonical head"
+    );
+    assert_eq!(entry.model.as_deref(), Some("directory-model"));
+    assert_eq!(entry.git_branch.as_deref(), Some("directory-branch"));
+    assert_eq!(entry.permission_mode.as_deref(), Some("prompt"));
+    assert_eq!(
+        (
+            entry.total_tokens_in,
+            entry.total_tokens_out,
+            entry.checkpoint_count
+        ),
+        (0, 0, 0)
+    );
+    assert!(
+        entry.recent_tools.is_empty()
+            && entry.conversation_messages.is_empty()
+            && entry.resume_bundle.is_none()
+    );
+    let error = restore.restore_session(&owner, target).await.unwrap_err();
+    assert!(
+        error.contains("restore_cloud_workspace"),
+        "selected detail recovery still rejects corrupt workspace evidence: {error}"
+    );
+    sqlx::query("DELETE FROM session_artifacts WHERE user_id=? AND session_id=? AND artifact_id=?")
+        .bind(&owner)
+        .bind(target)
+        .bind(workspace_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM agent_events WHERE user_id=? AND session_id=?")
+        .bind(&owner)
+        .bind(target)
+        .execute(pool.get())
+        .await
+        .unwrap();
     for table in [
-        "conversation_manifest_segments",
         "conversation_manifest_nodes",
-        "conversation_segments",
         "session_context_operation_receipts",
         "session_context_authority_events",
         "session_context_heads",

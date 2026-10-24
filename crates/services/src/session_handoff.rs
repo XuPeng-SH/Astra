@@ -2680,15 +2680,6 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
         }
-        sqlx::query(
-            "DELETE FROM conversation_segments
-             WHERE isolation_domain = ? AND owner_user_id = ?",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .execute(pool.get())
-        .await
-        .expect("cleanup segments");
     }
 
     async fn create_session_root(pool: &SharedPool, key: &SessionKeyV1) {

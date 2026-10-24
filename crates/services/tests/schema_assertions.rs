@@ -262,8 +262,8 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     // no readiness marker, and an expired lease. It must be safe to retry.
     for sql in [
         "DELETE FROM astra_schema_contracts WHERE component = 'astra-core'",
-        "DELETE FROM astra_schema_table_contracts WHERE table_name = 'conversation_manifest_segments'",
-        "DROP TABLE conversation_manifest_segments",
+        "DELETE FROM astra_schema_table_contracts WHERE table_name = 'conversation_manifest_nodes'",
+        "DROP TABLE conversation_manifest_nodes",
         "INSERT INTO astra_schema_bootstrap_leases (component, holder_id, lease_expires_at) VALUES ('astra-core', 'crashed-owner', DATE_SUB(NOW(6), INTERVAL 1 SECOND))",
     ] {
         sqlx::query(sql).execute(pool.get()).await.unwrap();
@@ -281,6 +281,32 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         current,
         astra_services::storage::CORE_SCHEMA_CONTRACT_VERSION
     );
+
+    // The named hash lookup must remain unique, even when the readiness
+    // marker is already present. Bootstrap validates shape; it never repairs.
+    for sql in [
+        "ALTER TABLE conversation_manifest_nodes DROP INDEX uq_context_manifest_root",
+        "CREATE INDEX uq_context_manifest_root ON conversation_manifest_nodes (manifest_root)",
+    ] {
+        sqlx::query(sql).execute(pool.get()).await.unwrap();
+    }
+    let error = ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect_err("non-unique immutable identity must fail schema validation")
+        .to_string();
+    assert!(
+        error.contains("uq_context_manifest_root must be unique"),
+        "{error}"
+    );
+    for sql in [
+        "ALTER TABLE conversation_manifest_nodes DROP INDEX uq_context_manifest_root",
+        "CREATE UNIQUE INDEX uq_context_manifest_root ON conversation_manifest_nodes (manifest_root)",
+    ] {
+        sqlx::query(sql).execute(pool.get()).await.unwrap();
+    }
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .unwrap();
 
     sqlx::query("UPDATE astra_schema_contracts SET contract_version = 'unsupported-old-schema' WHERE component = 'astra-core'")
         .execute(pool.get()).await.unwrap();
@@ -1593,11 +1619,7 @@ async fn phase1_run_durability_schema_contract() {
         ],
         "canonical head serialization must be scoped by the complete SessionKey"
     );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "conversation_segments").await,
-        ["isolation_domain", "owner_user_id", "segment_hash"],
-        "immutable segment deduplication must stop at the owner boundary"
-    );
+
     assert_eq!(
         primary_key_columns(&pool, &schema, "conversation_manifest_nodes").await,
         [
@@ -1605,24 +1627,33 @@ async fn phase1_run_durability_schema_contract() {
             "owner_user_id",
             "session_id",
             "branch_id",
-            "manifest_root"
+            "compaction_generation",
+            "conversation_seq"
         ],
-        "manifest lookup must carry complete owner/session/branch identity"
+        "manifest coordinate lookup must carry complete owner/session/branch identity"
     );
+
     assert_eq!(
-        primary_key_columns(&pool, &schema, "conversation_manifest_segments").await,
-        [
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "manifest_root",
-            "segment_position"
-        ],
-        "segment reachability must be indexed by the immutable manifest identity"
+        unique_key_columns(
+            &pool,
+            &schema,
+            "conversation_manifest_nodes",
+            "uq_context_manifest_root"
+        )
+        .await,
+        ["manifest_root"],
+        "immutable manifest identity must support a unique hash point lookup",
     );
+
+    for removed in ["conversation_segments", "conversation_manifest_segments"] {
+        assert!(
+            !table_exists(&pool, &schema, removed).await,
+            "retired Context table {removed} must not be created"
+        );
+    }
     let manifest_nodes = column_names(&pool, &schema, "conversation_manifest_nodes").await;
     for expected in [
+        "content_json",
         "total_canonical_bytes",
         "total_message_count",
         "reachable",

@@ -20,13 +20,14 @@ const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (activity_at < ";
 const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (activity_at = ";
 const SESSION_LIST_ORDER_SQL: &str = " ORDER BY activity_at DESC, session_id DESC LIMIT ";
 
-/// Conversation recency belongs to the selected immutable commit, not to
-/// optional diagnostic counters or mutable controller lease timestamps.
+/// Session recency includes metadata and established Context head activity,
+/// including Controller writes. It does not read immutable conversation history.
 /// Keep one row per owner/session and preserve metadata-only sessions.
 pub(crate) fn push_session_activity_source(query: &mut QueryBuilder<MySql>, user_id: &str) {
     query.push(
-        "(SELECT s.*, GREATEST(COALESCE(s.updated_at, s.created_at),
-                              COALESCE(n.created_at, s.created_at)) AS activity_at
+        "(SELECT s.*, COALESCE(h.completed_turn, 0) AS context_completed_turn,
+                    GREATEST(COALESCE(s.updated_at, s.created_at),
+                              COALESCE(h.updated_at, s.created_at)) AS activity_at
           FROM agent_sessions s
           LEFT JOIN session_context_heads h
             ON h.isolation_domain = 'server' AND h.owner_user_id = s.user_id
@@ -35,10 +36,6 @@ pub(crate) fn push_session_activity_source(query: &mut QueryBuilder<MySql>, user
     query.push_bind(astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID);
     query.push(
         " AND h.head_json IS NOT NULL AND h.completed_turn > 0
-          LEFT JOIN conversation_manifest_nodes n
-            ON n.isolation_domain = h.isolation_domain AND n.owner_user_id = h.owner_user_id
-           AND n.session_id = h.session_id AND n.branch_id = h.branch_id
-           AND n.manifest_root = h.latest_manifest_root AND n.reachable = 1
           WHERE s.user_id = ",
     );
     query.push_bind(user_id).push(") AS s");
