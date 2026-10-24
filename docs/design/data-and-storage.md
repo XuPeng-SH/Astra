@@ -512,3 +512,24 @@ used inbox, release transfers ownership immediately into the messaging owner's
 existing cancellation-safe exact-token task. Its completion is tracked by the
 application drain; final conversation persistence does not await its SQL. Pending
 messages and ambiguous delivery custody are retained by that owner.
+
+The public SQL-budget fixture measures the entire request, including BEGIN,
+COMMIT and the application's post-stream drain. With an existing authenticated
+Session and a scripted provider, a short ordinary turn uses 15 statements with
+an empty Context and 17 with retained Context, in two transactions. One or three
+readonly discovery/agent-list rounds add no framework statements. Holding the
+provider until the real control watcher polls adds one observation statement;
+it does not trigger redundant permission or input reads. These are measured
+fixture counts, not a zero-SQL guarantee for new Session creation, approval,
+remote tools, effects, recovery or opt-in Explain diagnostics.
+
+Remaining historical reads are explicit limitations. Admission checks actual
+Run status, live owners and unresolved tool custody under the existing fences;
+the raw transcript writer still allocates its Session sequence with MAX. On
+MatrixOne 4.2.5, a tenant-prefix predicate can bypass a selective secondary
+index, including a forced index (matrixorigin/matrixone#31046). A generated-key
+workaround was rejected because interleaved-history testing still scanned base
+rows when its index returned nothing. No generated occupancy fields, new owner
+state or transcript counters are added to mask that behavior. The current
+schema therefore retains the existing admission and raw-history owners; this
+PR does not claim all remaining queries have history-independent cost.
