@@ -89,7 +89,6 @@ pub(crate) async fn settle_failed_turn(
     }
     reconcile_and_report_turn_failure(
         state,
-        dispatch.ctx.api,
         dispatch.ctx.profile,
         dispatch.line,
         failure,

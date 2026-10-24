@@ -56,7 +56,12 @@ their admission debt. Shared stream consumers retain observed partial text and
 usage only after accepting the exact root's classified Failed terminal. That
 failure closes client admission without fabricating a successful completion,
 tool receipt or another provider request; malformed or missing terminal evidence
-still fails closed.
+still fails closed. CLI errors remain failed through the final text/JSON boundary;
+recovery hints cannot promote them into resumable completions. Failure reports
+retain observed qualified usage and model identity without polling Run accounting.
+Totals lost with the stream remain unknown locally; C0 remains the final accounting
+owner, and explicit Run queries remain available. Guidance disposition and exact
+cancellation/effect settlement keep their existing owners.
 
 ## Source API retirement
 

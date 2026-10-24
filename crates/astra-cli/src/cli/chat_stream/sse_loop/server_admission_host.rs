@@ -348,6 +348,7 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// Latest immutable physical SSE owner, retained through final-output
     /// delivery and durable cancellation.
     pub last_physical_run_id: Option<String>,
+    pub failed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
     pub turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     /// Structured admission failure metadata retained after the accumulator is
     /// moved into the shared loop.  These facts drive user-facing recovery and
