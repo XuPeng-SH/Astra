@@ -2175,7 +2175,7 @@ async fn revalidate_admitted_model_executions_with_access(
         "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 NULL AS configuration_updated_at, NULL AS quirks_json, NULL AS pricing_json,
-                NULL AS tags_json, NULL AS max_completion_tokens, 1 AS personal
+                NULL AS tags_json, CAST(NULL AS INT) AS max_completion_tokens, 1 AS personal
          FROM user_llm_models WHERE user_id = ",
     );
     query.push_bind(user_id).push(" AND model_id IN (");

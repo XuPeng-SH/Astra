@@ -91,12 +91,38 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
             .iter()
             .any(|key| data.contains_key(*key));
 
-            if has_token_usage {
+            let normalized = if let Some(qualified) = data.get("qualified_usage") {
+                // C0 already owns qualification. Unknown buckets are not bad
+                // numbers, and its aggregate must not be rebuilt from mirrors.
+                if qualified.is_null() {
+                    Some(serde_json::Map::from_iter([(
+                        "qualified_usage".into(),
+                        serde_json::Value::Null,
+                    )]))
+                } else {
+                    match astra_turn_types::CanonicalTokenUsage::from_json(qualified) {
+                        Ok(usage) => {
+                            let canonical = usage.to_json();
+                            let mut fields = canonical
+                                .as_object()
+                                .expect("canonical usage is an object")
+                                .clone();
+                            fields.insert("qualified_usage".into(), canonical);
+                            Some(fields)
+                        }
+                        Err(_) => {
+                            tracing::warn!(run_id, index = ?index,
+                                "run terminal contained malformed qualified token usage; suppressing its external usage projection");
+                            None
+                        }
+                    }
+                }
+            } else if has_token_usage {
                 let read = |key: &str| match data.get(key) {
                     None => Some(0),
                     Some(value) => value.as_u64(),
                 };
-                let normalized = match (
+                match (
                     read("prompt_tokens"),
                     read("cache_read_tokens"),
                     read("cache_creation_tokens"),
@@ -118,40 +144,37 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                         );
                         None
                     }
-                };
-                if let Some(normalized) = normalized {
-                    let mut usage = normalized.to_json_map();
-                    usage.insert(
-                        "type".to_string(),
-                        serde_json::Value::String("usage".to_string()),
-                    );
-                    usage.insert(
-                        "usage_scope".to_string(),
-                        serde_json::Value::String("run_total".to_string()),
-                    );
-                    for key in [
-                        "qualified_usage",
-                        "last_request_usage",
-                        "last_request_input_tokens",
-                    ] {
-                        if let Some(value) = data.get(key) {
-                            usage.insert(key.to_string(), value.clone());
-                        }
+                }.map(|usage| usage.to_json_map())
+            } else {
+                None
+            };
+            if let Some(mut usage) = normalized {
+                usage.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("usage".to_string()),
+                );
+                usage.insert(
+                    "usage_scope".to_string(),
+                    serde_json::Value::String("run_total".to_string()),
+                );
+                for key in ["last_request_usage", "last_request_input_tokens"] {
+                    if let Some(value) = data.get(key) {
+                        usage.insert(key.to_string(), value.clone());
                     }
-                    if let Some(tool_call_count) = data
-                        .get("tool_call_count")
-                        .and_then(serde_json::Value::as_u64)
-                    {
-                        usage.insert(
-                            "tool_call_count".to_string(),
-                            serde_json::Value::from(tool_call_count),
-                        );
-                    }
-                    if let Some(index) = index.clone() {
-                        usage.insert("index".to_string(), index);
-                    }
-                    transformed_events.push(serde_json::Value::Object(usage));
                 }
+                if let Some(tool_call_count) = data
+                    .get("tool_call_count")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    usage.insert(
+                        "tool_call_count".to_string(),
+                        serde_json::Value::from(tool_call_count),
+                    );
+                }
+                if let Some(index) = index.clone() {
+                    usage.insert("index".to_string(), index);
+                }
+                transformed_events.push(serde_json::Value::Object(usage));
             }
 
             // `run_finished` records an accounting total.  A separate,
@@ -1347,6 +1370,108 @@ mod tests {
     }
 
     #[test]
+    fn canonical_terminal_usage_reaches_the_actual_sse_consumer_without_guessing() {
+        use astra_services::runs::{
+            CanonicalRunTerminalReceipt, CanonicalTerminalContext, CanonicalTerminalOutcome,
+            CanonicalTerminalTranscript,
+        };
+        use astra_turn_types::CanonicalTokenUsage;
+        let known = CanonicalTokenUsage::new(Some(7), Some(11), Some(2), Some(3)).unwrap();
+        let samples = [
+            Some(CanonicalTokenUsage::new(Some(13), None, None, Some(5)).unwrap()),
+            Some(known),
+            Some(CanonicalTokenUsage::new(Some(0), Some(0), Some(0), Some(0)).unwrap()),
+            Some(CanonicalTokenUsage::new(None, None, None, None).unwrap()),
+            None,
+        ];
+        for failed in [false, true] {
+            for sample in samples {
+                let error = failed.then_some("stream stopped");
+                let receipt = CanonicalRunTerminalReceipt {
+                    schema_version: 1,
+                    user_id: "owner".into(),
+                    session_id: "session".into(),
+                    run_id: "run-usage-boundary".into(),
+                    generation: 1,
+                    opening_hash: "a".repeat(64),
+                    context_admission_hash: None,
+                    outcome: if failed {
+                        CanonicalTerminalOutcome::Failed
+                    } else {
+                        CanonicalTerminalOutcome::Completed
+                    },
+                    error_hash: CanonicalRunTerminalReceipt::error_hash(error),
+                    error_code: failed.then(|| "stream_transport".into()),
+                    error_metadata: None,
+                    context: CanonicalTerminalContext::Unowned,
+                    transcript: CanonicalTerminalTranscript {
+                        item_count: 0,
+                        digest: "b".repeat(64),
+                        assistant_source_event_id: None,
+                    },
+                    usage: sample,
+                    tool_ledger: None,
+                };
+                let completion = receipt
+                    .completion_events(None, None, error, Some(1), -1, 2)
+                    .unwrap();
+                let projected =
+                    transform_stream_run_events_for_client("run-usage-boundary", completion);
+                let usage = projected
+                    .iter()
+                    .find(|event| event["type"] == "usage")
+                    .expect("C0 accounting event");
+                let expected = sample
+                    .map(CanonicalTokenUsage::to_json)
+                    .unwrap_or(serde_json::Value::Null);
+                assert_eq!(usage["qualified_usage"], expected);
+                for key in [
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_creation_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                ] {
+                    assert_eq!(usage.get(key), expected.get(key));
+                }
+                let mut accum =
+                    astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+                accum.qualified_usage = Some(known);
+                accum.has_usage = true;
+                accum.prompt_tokens = 7;
+                accum.current_request_usage =
+                    Some(astra_turn_types::RequestTokenUsage::try_new(7, 11, 2, 3).unwrap());
+                for event in projected {
+                    astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                        &format!("data: {}\n\n", serde_json::to_string(&event).unwrap()),
+                        &mut accum,
+                        &mut Vec::new(),
+                    );
+                }
+                assert_eq!(accum.qualified_usage, sample);
+                assert!(accum.usage_is_run_total);
+                assert!(accum.current_request_usage.is_none());
+                assert_eq!(
+                    accum.prompt_tokens,
+                    sample
+                        .and_then(CanonicalTokenUsage::input_tokens)
+                        .unwrap_or(0)
+                );
+                assert_eq!(
+                    accum.completion_tokens,
+                    sample
+                        .and_then(CanonicalTokenUsage::output_tokens)
+                        .unwrap_or(0)
+                );
+                assert_eq!(
+                    accum.has_usage,
+                    sample.is_some_and(|usage| !usage.to_json().as_object().unwrap().is_empty())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn projected_terminal_usage_is_accepted_by_the_chat_sse_consumer() {
         let projected = transform_stream_run_events_for_client(
             "run-usage-boundary",
@@ -1467,21 +1592,22 @@ mod tests {
 
     #[test]
     fn malformed_terminal_usage_is_not_relabelled_as_zero() {
-        let projected = transform_stream_run_events_for_client(
-            "run-malformed-usage",
-            vec![json!({
-                "event_type": "run_finished",
-                "data": {"prompt_tokens": "seven", "completion_tokens": 3},
-                "index": 4
-            })],
-        );
-
-        assert!(projected.iter().all(|event| event["type"] != "usage"));
-        assert!(
-            projected
-                .iter()
-                .any(|event| event["type"] == "run_finished")
-        );
+        for data in [
+            json!({"prompt_tokens":"seven", "completion_tokens":3}),
+            json!({"qualified_usage":{"input_tokens":"seven"}, "prompt_tokens":7,
+                "cache_read_tokens":0,"cache_creation_tokens":0,"completion_tokens":3}),
+        ] {
+            let projected = transform_stream_run_events_for_client(
+                "run-malformed-usage",
+                vec![json!({"event_type":"run_finished", "data":data, "index":4})],
+            );
+            assert!(projected.iter().all(|event| event["type"] != "usage"));
+            assert!(
+                projected
+                    .iter()
+                    .any(|event| event["type"] == "run_finished")
+            );
+        }
     }
 
     #[test]
@@ -2053,7 +2179,6 @@ mod tests {
         assert_eq!(
             persisted_event_types,
             vec![
-                "run_started",
                 "tool_call",
                 "tool_call_end",
                 "approval_required",
@@ -2061,7 +2186,7 @@ mod tests {
                 "text_done",
                 "run_finished",
             ],
-            "cache-miss replay must be backed by semantic durable facts only"
+            "opening is virtual; later semantic facts remain physical"
         );
 
         let lifecycle = AgenticRunLifecycleService::new(

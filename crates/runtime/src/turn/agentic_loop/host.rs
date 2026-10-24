@@ -8292,7 +8292,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_textless_response_stops_bounded_with_human_copy() {
+    async fn repeated_textless_response_stops_bounded_without_fabricated_answer() {
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("bash", "file list")], 20, 10, Some(50)),
             text_result("", 15, 0, Some(30)),
@@ -8310,13 +8310,8 @@ pub(crate) mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(astra_turn_core::interruption::InterruptionKind::EmptyCompletion)
         );
-        assert!(
-            state.final_text.contains("final answer"),
-            "{}",
-            state.final_text
-        );
-        assert!(!state.final_text.contains("empty_completion"));
-        assert!(!state.final_text.contains("[turn_interrupted]"));
+        assert!(state.final_text.is_empty());
+        assert!(host.rendered_final_text.is_empty());
     }
 
     #[tokio::test]
@@ -8759,8 +8754,8 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 0); // No turns executed
-        assert!(state.final_text.contains("before producing a final answer"));
-        assert!(!state.final_text.contains("empty_completion"));
+        assert!(state.final_text.is_empty());
+        assert!(host.rendered_final_text.is_empty());
         assert_eq!(state.remaining_turns, 10); // Unchanged
         // EmptyCompletion interruption recorded
         let interruption = state
@@ -13059,7 +13054,7 @@ pub(crate) mod tests {
     async fn rate_limit_after_tool_calls_preserves_work() {
         // Turn 1: successful tool execution
         // Turn 2: 429 rate limit error
-        // Expected: graceful completion (Ok), not hard error (Err)
+        // Preserve actual tool work while returning the typed failure.
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_edge_tool("bash", "file list output")],
@@ -13075,18 +13070,17 @@ pub(crate) mod tests {
             .push(json!({"role": "user", "content": "review code"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert_eq!(outcome.unwrap_err().kind, astra_core::ErrorKind::RateLimit);
         assert!(
-            outcome.is_ok(),
-            "429 after tool calls should complete gracefully, got: {outcome:?}"
+            state.final_text.is_empty(),
+            "runtime notices cannot become an assistant answer"
         );
+        assert_eq!(state.total_tool_calls, 1);
         assert!(
-            state.final_text.contains("Rate limit reached"),
-            "final_text should mention rate limit: {}",
-            state.final_text,
-        );
-        assert!(
-            state.final_text.contains("1 tool call"),
-            "final_text should mention tool call count",
+            state
+                .messages
+                .iter()
+                .any(|message| message["role"] == "tool")
         );
     }
 
@@ -13218,7 +13212,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn rate_limit_cooldown_reject_preserves_prior_tool_work() {
         // When the first turn does tool work but the second turn 429s,
-        // the existing rate-limit graceful degradation preserves results.
+        // the typed failure must preserve results without fabricating success.
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("bash", "hello")], 100, 20, Some(50)),
             error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
@@ -13229,11 +13223,17 @@ pub(crate) mod tests {
             .push(json!({"role": "user", "content": "test"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "should gracefully complete: {outcome:?}");
+        assert_eq!(outcome.unwrap_err().kind, astra_core::ErrorKind::RateLimit);
         assert!(
-            state.final_text.contains("Rate limit"),
-            "should mention rate limit in final text: {}",
-            state.final_text,
+            state.final_text.is_empty(),
+            "runtime notices cannot become an assistant answer"
+        );
+        assert_eq!(state.total_tool_calls, 1);
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message["role"] == "tool")
         );
         // Verify cooldown recorded the error for future turns.
         assert!(

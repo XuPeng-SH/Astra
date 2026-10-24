@@ -29,7 +29,6 @@ mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
 mod journey_extended;
 mod journey_full;
-mod journey_full_capture_matrix;
 mod journey_meta_matrix;
 mod journey_models_matrix;
 mod journey_phase0_production_baseline;
@@ -126,11 +125,7 @@ matrix_test! {
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_extended::run_chat_stream_session_info_smoke
 }
-matrix_test! {
-    e2e_matrix_stream_session_metadata_enables_full_llm_exchange_journaling, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_full_capture_matrix::run_stream_session_metadata_enables_full_llm_exchange_journaling
-}
+
 matrix_test! {
     e2e_matrix_stream_bootstrap_cleanup_preserves_live_fixture, 4,
     "live MatrixOne + mock LLM; overlapping fixture cleanup isolation gate",

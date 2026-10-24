@@ -183,6 +183,13 @@ async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
         "same terminal fact must not create a second semantic event"
     );
 
+    assert!(
+        store
+            .release_owner_lease(&owner_id, &session_id, &first_run_id, 0)
+            .await
+            .unwrap()
+    );
+
     store
         .insert_run(work_run(
             &owner_id,

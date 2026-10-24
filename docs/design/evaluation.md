@@ -102,13 +102,14 @@ those thresholds with the original execution facts; later configuration edits
 do not reinterpret an in-flight run or replenish its recovery permissions.
 Tool batches perform no configuration file I/O.
 
-The Server terminal owner evaluates the complete settled tool and child evidence
-once, before committing `run_finished`. Its `turn_evaluation` carries the
-original journal event, session/run identity, execution generation, frozen
-thresholds and final status. Live delivery and replay project the same fact.
-CLI journals and feedback consume it without re-evaluating partial stream
-records or loading local thresholds. Missing evaluation remains unknown;
-conflicting or incorrectly scoped evaluation is a protocol error.
+The Server may evaluate the complete settled tool and child evidence once.
+`turn_evaluation` is optional diagnostic evidence; canonical Run completion and
+cold replay do not depend on persisting it. A live evaluation can therefore be
+absent from cold replay. When supplied, it carries the original journal event,
+session/run identity, execution generation, frozen thresholds and final status.
+Missing evaluation remains unknown; conflicting or incorrectly scoped evidence
+is a protocol error. CLI journals and feedback do not manufacture an evaluation
+from partial stream records or reload local thresholds to fill that gap.
 
 The CLI sidecar journal adds only its existing projection ID/index for retry
 reconciliation. The Server timestamp, canonical turn, producer scope and

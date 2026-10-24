@@ -313,6 +313,14 @@ async fn db_cancel_session_retains_unknown_tool_external_writer_and_preadmission
         }
         for _ in 0..2 {
             let pending = fixture.cancel().await;
+            if case == "preadmission" {
+                assert!(
+                    pending.execution_settled,
+                    "no Run or Controller grant owns execution: {pending:?}"
+                );
+                assert_eq!(pending.execution_blocker, None);
+                continue;
+            }
             assert!(!pending.execution_settled, "{case}: {pending:?}");
             use astra_services::session_context_coordinator::SessionExecutionBlocker;
             assert_eq!(
@@ -325,13 +333,14 @@ async fn db_cancel_session_retains_unknown_tool_external_writer_and_preadmission
                 "{case}: {pending:?}"
             );
         }
-        assert!(
+        assert_eq!(
             fixture
                 .coordinator
                 .execution_reuse_blocker(&fixture.key)
                 .await
                 .unwrap()
                 .is_some(),
+            case != "preadmission",
             "{case}"
         );
         if let Some(identity) = identity {

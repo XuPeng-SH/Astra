@@ -3572,6 +3572,12 @@ mod tests {
                     recovered.run.checkpoint_json.as_deref(),
                     Some(next_payload.as_str())
                 );
+                assert!(
+                    store
+                        .release_owner_lease(&key.owner_user_id, &key.session_id, &competing_run, 4)
+                        .await
+                        .unwrap()
+                );
                 receipt.checkpoint_id
             } else {
                 sqlx::query(
@@ -3885,20 +3891,6 @@ mod tests {
             })
             .await
             .expect("validate forced handoff");
-        let fenced = service
-            .fence_writer(
-                &key,
-                &handoff.handoff_id,
-                None,
-                None,
-                Duration::from_secs(60),
-                "forced-fence",
-            )
-            .await
-            .expect("fence forced writer")
-            .handoff;
-        assert!(!fenced.risk.effects_are_sealed());
-
         let run_id = format!("run-{suffix}");
         sqlx::query(
             "INSERT INTO agent_runs
@@ -3949,6 +3941,20 @@ mod tests {
             .await
             .expect("insert invocation evidence");
         }
+
+        let fenced = service
+            .fence_writer(
+                &key,
+                &handoff.handoff_id,
+                None,
+                None,
+                Duration::from_secs(60),
+                "forced-fence",
+            )
+            .await
+            .expect("fence forced writer")
+            .handoff;
+        assert!(!fenced.risk.effects_are_sealed());
 
         let hydrate_request = TransitionSessionHandoffV1 {
             idempotency_key: "forced-hydrate".into(),

@@ -733,7 +733,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     // envelope to text that may already have streamed. Apart from leaking
     // internal details, re-rendering that envelope on an append-only stream
     // duplicates the provider response.
-    if let Some(interruption) = state.interruption.as_ref() {
+    if state.interruption.is_some() {
         // Prefer the latest provider response, then the bounded settlement
         // candidate. A current runtime-owned Work settlement sentence is not
         // provider output and must not be promoted to partial assistant text.
@@ -749,15 +749,14 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                     && !state.final_text.trim().is_empty())
                 .then(|| {
                     (
-                        state.final_text.trim().to_string(),
+                        state.final_text.clone(),
                         state.final_text_model_item_id.clone(),
                     )
                 })
             });
         if let Some((candidate, model_item_id)) = candidate {
-            let candidate = candidate.trim();
-            let already_current = state.final_text.trim() == candidate;
-            state.final_text = candidate.to_string();
+            let already_current = state.final_text == candidate;
+            state.final_text = candidate;
             state.final_text_model_item_id = model_item_id;
             // Preserve the live-stream fact only when this is the exact text
             // that already crossed the render boundary. A replacement
@@ -766,10 +765,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                 state.final_text_streamed = false;
             }
         } else {
-            // With no partial assistant content, render only the safe public
-            // message. `error_detail` remains available on `run_interrupted`
-            // for diagnostics but never becomes transcript text.
-            state.final_text = interruption_terminal_message(interruption);
+            // Lifecycle notices belong to the interruption/error channel,
+            // never to assistant history or canonical Context.
+            state.final_text.clear();
             state.final_text_model_item_id = None;
             state.final_text_streamed = false;
         }
@@ -809,32 +807,6 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     // durability and render human copy. Internal reason codes and scheduler
     // counters remain observability data; they are not user-facing prose.
     if state.total_tool_calls > 0 {
-        let recent_tools: Vec<String> = state
-            .stall
-            .tool_call_records
-            .iter()
-            .filter_map(|r| {
-                if r.result_preview.as_deref() == Some("") {
-                    return None;
-                }
-                if r.error.is_some() {
-                    Some(format!("{}(failed)", r.name))
-                } else {
-                    Some(r.name.clone())
-                }
-            })
-            .collect();
-        let tool_summary = if recent_tools.is_empty() {
-            String::new()
-        } else {
-            let mut seen = std::collections::HashSet::new();
-            let unique: Vec<&str> = recent_tools
-                .iter()
-                .filter(|n| seen.insert(n.as_str()))
-                .map(|s| s.as_str())
-                .collect();
-            format!(" Completed tools included: {}.", unique.join(", "))
-        };
         let rounds_completed = state.max_turns.saturating_sub(state.remaining_turns);
         let detail = format!(
             "turn ended while working: {} tool call(s) completed, last_finish_reason={}, rounds_completed={}, remaining_turns={}, max_turns={}",
@@ -851,12 +823,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                 settlement_interruption_summary(state, Some(detail)),
             ));
         }
-        if let Some(interruption) = state.interruption.as_ref() {
-            state.final_text = interruption_terminal_message(interruption);
-            state.final_text_model_item_id = None;
-            state.final_text.push_str(&tool_summary);
-            state.final_text_streamed = false;
-        }
+        state.final_text.clear();
+        state.final_text_model_item_id = None;
+        state.final_text_streamed = false;
         return;
     }
     if state.interruption.is_none() {
@@ -869,17 +838,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             ),
         ));
     }
-    if let Some(interruption) = state.interruption.as_ref() {
-        state.final_text = interruption_terminal_message(interruption);
-        state.final_text_model_item_id = None;
-        state.final_text_streamed = false;
-    }
-}
-
-fn interruption_terminal_message(
-    interruption: &astra_turn_core::interruption::InterruptionRecord,
-) -> String {
-    interruption.user_message.clone()
+    state.final_text.clear();
+    state.final_text_model_item_id = None;
+    state.final_text_streamed = false;
 }
 
 fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
@@ -1108,7 +1069,7 @@ mod tests {
         let mut state = make_state();
         state.final_text = "stale completion-shaped summary".to_string();
         state.hooks.completion_settlement.deferred_candidate_text =
-            Some("The build passed its final check.".to_string());
+            Some("  The build passed its final check.\n".to_string());
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
@@ -1125,7 +1086,7 @@ mod tests {
 
         ensure_terminal_text(&mut state);
 
-        assert_eq!(state.final_text, "The build passed its final check.");
+        assert_eq!(state.final_text, "  The build passed its final check.\n");
         assert!(!state.final_text.contains("prompt budget"));
         assert_eq!(
             state
@@ -1317,16 +1278,16 @@ mod tests {
             },
         ));
 
+        let before = state.messages.clone();
+        state.begin_run_transcript_capture(std::iter::empty());
         finalize_and_render(&mut host, &mut state).await;
 
-        assert_eq!(
-            state.final_text,
-            state.interruption.as_ref().unwrap().user_message,
-            "interrupted tool-only turns must not persist an empty or success-shaped final answer"
-        );
-        assert!(!state.final_text.is_empty());
-        assert!(!state.final_text.contains("budget_exhausted"));
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(state.final_text.is_empty());
+        assert!(state.final_text_model_item_id.is_none());
+        assert!(state.interruption.is_some());
+        assert!(host.rendered_final_text.is_empty());
+        assert_eq!(state.messages, before);
+        assert!(state.take_run_transcript_capture().is_empty());
     }
 
     #[tokio::test]
@@ -1387,6 +1348,8 @@ mod tests {
         state.total_tool_calls = 3;
         state.remaining_turns = 2;
 
+        let before = state.messages.clone();
+        state.begin_run_transcript_capture(std::iter::empty());
         finalize_and_render(&mut host, &mut state).await;
 
         let interruption = state
@@ -1402,11 +1365,12 @@ mod tests {
             Vec::<String>::new(),
             "empty completion should preserve the user's full tool surface; settlement is guidance/state, not a tool denylist"
         );
-        assert!(state.final_text.contains("final answer"));
-        assert!(state.final_text.contains("Continue this session to resume"));
-        assert!(!state.final_text.contains("empty_completion"));
-        assert!(!state.final_text.contains("[turn_interrupted]"));
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(state.final_text.is_empty());
+        assert!(state.final_text_model_item_id.is_none());
+        assert!(state.interruption.is_some());
+        assert!(host.rendered_final_text.is_empty());
+        assert_eq!(state.messages, before);
+        assert!(state.take_run_transcript_capture().is_empty());
     }
 
     #[tokio::test]
@@ -1829,44 +1793,73 @@ mod tests {
                 resume_restricted_tools: vec![],
             },
         ));
-        let expected = interruption_terminal_message(
-            state.interruption.as_ref().expect("budget interruption"),
-        );
-
+        let before = state.messages.clone();
+        state.begin_run_transcript_capture(std::iter::empty());
         finalize_and_render(&mut host, &mut state).await;
 
-        assert_eq!(state.final_text, expected);
-        assert!(!state.final_text.contains("Infrastructure round limit"));
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(state.final_text.is_empty());
+        assert!(state.final_text_model_item_id.is_none());
+        assert!(state.interruption.is_some());
+        assert!(host.rendered_final_text.is_empty());
+        assert_eq!(state.messages, before);
+        assert!(state.take_run_transcript_capture().is_empty());
     }
 
     #[tokio::test]
     async fn finalize_and_render_does_not_repeat_streamed_partial_text() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.final_text = "Useful partial answer.".to_string();
-        state.final_text_streamed = true;
-        state.hooks.completion_settlement.latest_provider_text = Some(state.final_text.clone());
-        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
-            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            astra_turn_core::interruption::InterruptionStateSummary {
-                has_checkpoint: true,
-                tool_calls_completed: 2,
-                turns_completed: 3,
-                remaining_turns: 4,
-                error_detail: Some("typed completion action was not satisfied".into()),
-                stall_signal: None,
-                resume_restricted_tools: vec![],
-            },
-        ));
+        for deferred in [false, true] {
+            let mut host = MockHost::new(Vec::new());
+            let mut state = make_state();
+            let text = "  Useful partial answer.\n";
+            let mut response = text_result(text, 10, 5, None);
+            response.accum.model_item_id = Some("observed-partial".into());
+            state.messages = vec![serde_json::json!({"role":"user","content":"original request"})];
+            state.begin_run_transcript_capture(std::iter::empty());
+            state.final_text = text.to_owned();
+            state.final_text_model_item_id = response.accum.model_item_id.clone();
+            state.final_text_streamed = true;
+            if deferred {
+                state.hooks.completion_settlement.text_only = true;
+                super::super::execution_phase::capture_deferred_candidate_text(
+                    &mut state, &response,
+                );
+            } else {
+                super::super::execution_phase::capture_latest_provider_text(&mut state, &response);
+            }
+            state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+                astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                astra_turn_core::interruption::InterruptionStateSummary {
+                    has_checkpoint: true,
+                    tool_calls_completed: 2,
+                    turns_completed: 3,
+                    remaining_turns: 4,
+                    error_detail: Some("typed completion action was not satisfied".into()),
+                    stall_signal: None,
+                    resume_restricted_tools: vec![],
+                },
+            ));
 
-        finalize_and_render(&mut host, &mut state).await;
+            finalize_and_render(&mut host, &mut state).await;
 
-        assert_eq!(state.final_text, "Useful partial answer.");
-        assert!(state.final_text_streamed);
-        assert!(host.rendered_final_text.is_empty());
-        assert!(!state.final_text.contains("typed completion action"));
+            assert_eq!(state.final_text, text);
+            assert_eq!(
+                state.final_text_model_item_id.as_deref(),
+                Some("observed-partial")
+            );
+            materialize_terminal_text_message(&mut state);
+            let assistants: Vec<_> = state
+                .messages
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .collect();
+            assert_eq!(assistants.len(), 1);
+            assert_eq!(assistants[0]["content"], text);
+            assert_eq!(state.take_run_transcript_capture().len(), 1);
+            assert!(state.final_text_streamed);
+            assert!(host.rendered_final_text.is_empty());
+            assert!(!state.final_text.contains("typed completion action"));
+        }
     }
 
     #[tokio::test]

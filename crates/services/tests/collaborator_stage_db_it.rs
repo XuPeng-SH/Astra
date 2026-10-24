@@ -719,6 +719,7 @@ impl Fixture {
         sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, created_at, updated_at, last_active_at)
                      VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))")
             .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
+        collaborator_fixture::seed_execution_binding(&pool, &user_id, &session_id).await;
         let parent = record(&user_id, &session_id, None);
         let parent_id = parent.run_id.clone();
         store.insert_run(parent).await.unwrap();

@@ -445,7 +445,9 @@ async fn l2_event_idx_and_idempotency_use_agent_runs() {
         .into_iter()
         .map(|row| row.try_get::<i64, _>("event_idx").unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(idx, [0, 1, 2]);
+    assert_eq!(idx, [1, 2]);
+    let logical = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(logical.events.iter().map(|event| event["index"].as_i64().unwrap()).collect::<Vec<_>>(), [0,1,2]);
 
     let counter = sqlx::query("SELECT last_event_idx FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
@@ -745,6 +747,7 @@ async fn reconnect_replays_recovery_and_guidance_uses_a_new_run() {
             .all(|event| event["data"]["intent_id"] != "rejected-old-run")
     );
 
+    assert!(store_a.release_owner_lease(&user_id, &session_id, &run_id, loaded.run_generation).await.unwrap());
     let continuation_id = format!("{run_id}-continuation");
     engine
         .start_run(&continuation_id, &user_id, &session_id)

@@ -3513,8 +3513,13 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
                 None,
             )
             .await,
-        Err(astra_services::SessionContextCoordinatorError::Fenced)
+        Err(astra_services::SessionContextCoordinatorError::ExecutionOccupied(
+            astra_services::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool
+        ))
     ));
+    assert!(
+        recovered["control_basis"]["writer_epoch"].as_u64().unwrap() > source_lease.writer_epoch
+    );
 
     let (abandoned_status, abandoned) = post_work_control(
         app.clone(),
@@ -5918,15 +5923,10 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     assert_eq!(second_status, StatusCode::CONFLICT);
     assert_eq!(second["code"], "work_session_already_bound");
 
-    sqlx::query(
-        "INSERT INTO agent_runs (user_id, session_id, run_id, status)
-         VALUES (?, ?, 'later-run', 'running')",
-    )
-    .bind(&owner_id)
-    .bind(&session_id)
-    .execute(pool.get())
-    .await
-    .expect("later active run fixture");
+    astra_runtime::RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())))
+        .start_run("later-run", &owner_id, &session_id)
+        .await
+        .expect("later active Run fixture");
     let (busy_replay_status, busy_replay) =
         post_work_session_binding(app.clone(), &owner_id, &session_id, request.clone()).await;
     assert_eq!(busy_replay_status, StatusCode::CREATED);

@@ -44,6 +44,16 @@ interruptions cannot mask later failures or cancellation. Final error exits clos
 current inner step through the shared finalization owner, including admission
 and guidance failures; they do not create a step if none began.
 
+Server Runs that exhaust automatic provider recovery settle as `failed`, retaining
+actual partial assistant text in the canonical transcript and Context. Diagnostic
+interruption hints do not grant durable resume authority. Failed settlement uses
+the existing C0 transaction, including cancellation arbitration, accepted-input
+disposition and exact owner retirement; it adds no separate pause protocol or
+query. An explicit new user message starts a new Run. Real input/approval waits,
+debugger pauses, confirmed handoff custody and ownership fencing retain their
+existing owners. A failed Run does not confirm unknown external effects or clear
+their admission debt.
+
 ## Source API retirement
 
 The unused `LoopDispatcher` source API is retired; production hosts invoke the

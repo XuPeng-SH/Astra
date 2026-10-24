@@ -25931,10 +25931,16 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 .cloned()
                 .unwrap_or(serde_json::Value::String(String::new())),
         }),
-        "text_done" => serde_json::json!({
-            "type": "text_done",
-            "full_text": data.get("full_text").cloned().unwrap_or(serde_json::Value::String(String::new())),
-        }),
+        "text_done" => {
+            let mut out = serde_json::json!({
+                "type": "text_done",
+                "full_text": data.get("full_text").cloned().unwrap_or(serde_json::Value::String(String::new())),
+            });
+            if let Some(partial) = data.get("partial").and_then(serde_json::Value::as_bool) {
+                out["partial"] = partial.into();
+            }
+            out
+        }
         "reasoning_message_content" => serde_json::json!({
             "type": "reasoning_message_content",
             "content": data.get("content").cloned().unwrap_or(serde_json::Value::String(String::new())),
@@ -33711,6 +33717,12 @@ mod tests {
         parent.session_id = session_id.clone();
         parent.status = STATUS_COMPLETED.into();
         store.insert_run(parent).await.unwrap();
+        assert!(
+            store
+                .release_owner_lease(&user_id, &session_id, &parent_id, 0)
+                .await
+                .unwrap()
+        );
         let mut noise = durable_run_record(&noise_id);
         noise.user_id = user_id.clone();
         noise.session_id = session_id.clone();
@@ -40482,6 +40494,30 @@ mod tests {
             assert!(live.get("idempotency_key").is_none());
             assert!(live.get("runtime").is_none());
         }
+    }
+
+    #[test]
+    fn text_done_preserves_only_typed_partial_status() {
+        for partial in [
+            json!(true),
+            json!(false),
+            serde_json::Value::Null,
+            json!("true"),
+        ] {
+            let event = transform_run_event_for_client(json!({
+                "event_type":"text_done", "data":{"full_text":"  observed bytes\n", "partial":partial}
+            }));
+            assert_eq!(event["full_text"], "  observed bytes\n");
+            if partial.is_boolean() {
+                assert_eq!(event.get("partial"), Some(&partial));
+            } else {
+                assert!(event.get("partial").is_none());
+            }
+        }
+        let event = transform_run_event_for_client(
+            json!({"event_type":"text_done", "data":{"full_text":"all"}}),
+        );
+        assert!(event.get("partial").is_none());
     }
 
     #[test]

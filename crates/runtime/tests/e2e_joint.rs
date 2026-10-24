@@ -1029,11 +1029,11 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         .unwrap_or(Some(-1))
         .unwrap_or(-1);
     assert!(
-        min_idx == 0 && event_count == distinct_count && max_idx + 1 == event_count,
+        min_idx == 1 && event_count == distinct_count && max_idx == event_count,
         "S04 server event_idx must be monotonic/no-gap/no-duplicate; min={min_idx} max={max_idx} count={event_count} distinct={distinct_count}"
     );
     assert!(
-        seen.len() as i64 == event_count,
+        seen.len() as i64 == event_count + 1,
         "S04 client simulated IndexedDB watermark must include every server event; client={} server={event_count}",
         seen.len()
     );

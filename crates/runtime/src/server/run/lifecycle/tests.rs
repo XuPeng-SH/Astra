@@ -370,7 +370,7 @@ fn complete_tool_ledger_receipt(
 }
 
 #[test]
-fn completed_run_is_paused_before_commit_when_tool_ledger_is_open() {
+fn completed_run_is_failed_before_commit_when_tool_ledger_is_open() {
     let svc = test_service();
     let request = test_request("exercise one tool");
     let mut state =
@@ -411,8 +411,8 @@ fn completed_run_is_paused_before_commit_when_tool_ledger_is_open() {
     );
     let (_, status, error) =
         AgenticRunLifecycleService::finalize_run_events(outcome, Vec::new(), &state);
-    assert_eq!(status, RunStatus::Paused);
-    assert_eq!(error, None);
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.is_some());
 }
 
 #[test]
@@ -1185,7 +1185,7 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         .expect("accept continuation plan");
 
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
-    engine
+    let old_authority = engine
         .start_run(&old_run, &owner, &session)
         .await
         .expect("start old run");
@@ -1249,6 +1249,13 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
             .await
             .expect("pause old run");
     }
+    assert!(
+        engine
+            .store()
+            .release_owner_lease(&owner, &session, &old_run, old_authority.owner_generation)
+            .await
+            .expect("stop the old execution before continuation")
+    );
     if through_new_turn {
         exercise_primary_continuation_entry(
             &pool,
@@ -8682,7 +8689,7 @@ fn activation_token_only_runtime_cancel_never_projects_user_origin() {
 }
 
 #[test]
-fn server_subrun_requires_intervention_from_typed_interruption() {
+fn server_subrun_automatic_intervention_hint_has_no_pause_authority() {
     let svc = test_service();
     let request = test_request("subrun requires intervention");
     let mut state = svc.build_initial_state(
@@ -8711,17 +8718,20 @@ fn server_subrun_requires_intervention_from_typed_interruption() {
         },
     ));
 
-    assert_eq!(server_subrun_completed_agent_status(&state), STATUS_PAUSED);
+    assert_eq!(server_subrun_completed_agent_status(&state), STATUS_FAILED);
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_durable_status(&outcome, &state),
-        STATUS_PAUSED
+        STATUS_FAILED
     );
-    assert_eq!(server_subrun_live_termination(&outcome, &state), None);
+    assert_eq!(
+        server_subrun_live_termination(&outcome, &state),
+        Some(AgentLiveTermination::Failed)
+    );
     let reason = server_subrun_interruption_reason(&state);
     assert_eq!(
-        server_subrun_waiting_for(&outcome, STATUS_PAUSED, reason.as_deref()),
-        Some("empty_completion: paused task needs direction")
+        server_subrun_waiting_for(&outcome, STATUS_FAILED, reason.as_deref()),
+        None
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
@@ -8755,7 +8765,7 @@ fn server_subrun_tool_only_empty_completion_is_terminal_partial() {
             resume_restricted_tools: vec![],
         },
     );
-    state.final_text = interruption.user_message.clone();
+    state.final_text.clear();
     state.interruption = Some(interruption);
 
     assert_eq!(
@@ -13056,18 +13066,12 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
     let mut discovered_request = request.clone();
     discovered_request.work_binding = None;
     discovered_request.run_start_idempotency = None;
-    let discovered = service
-        .validate_work_runtime_binding(&owner_id, &session_id, &discovered_request)
-        .await
-        .expect("session-bound Work discovery")
-        .expect("canonical session binding is discovered");
-    assert_eq!(discovered.work_id.as_str(), work_id);
-    assert_eq!(discovered.branch_id.as_str(), branch_id);
-    assert_eq!(discovered.graph_revision.get(), 1);
-    assert!(discovered.item.is_none());
     assert!(
-        discovered.owns_work_plan(),
-        "a resumed session branch must retain root graph-authoring authority even without an active item attempt"
+        service
+            .validate_work_runtime_binding(&owner_id, &session_id, &discovered_request)
+            .await
+            .expect("ordinary requests do not implicitly select Work")
+            .is_none()
     );
     assert!(
         service
@@ -20889,41 +20893,19 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
         &state,
     );
 
-    assert_eq!(status, RunStatus::Paused);
-    assert!(
-        error.is_none(),
-        "resumable interruption should be structured paused state, not a run error: {error:?}"
-    );
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.as_deref().unwrap().contains("Round budget"));
     assert_eq!(events[0]["event_type"], "text_done");
+    assert_eq!(events[0]["data"]["full_text"], state.final_text);
     assert_eq!(events[0]["data"]["partial"], true);
-    assert_eq!(
-        events[0]["data"]["full_text"],
-        "[Round budget hard-limit reached]"
-    );
-    assert!(
-        !events[0]["data"]["full_text"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Why stopped:")
-    );
-    assert_eq!(
-        events[0]["data"]["interruption"]["kind"],
-        "budget_exhausted"
-    );
-    assert!(
-        events[0]["data"]["interruption"]["user_message"]
-            .as_str()
-            .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget")),
-        "interruption detail should carry the budget stop reason: {events:?}"
-    );
-    assert_eq!(events[1]["event_type"], "run_interrupted");
+    assert_eq!(events[1]["event_type"], "run_error");
+    assert_eq!(events[1]["data"]["error_code"], "budget_exhausted");
     assert_eq!(events[2]["event_type"], "run_finished");
-    assert_eq!(events[2]["data"]["interrupted"], true);
-    assert_eq!(events[2]["data"]["interruption_kind"], "budget_exhausted");
+    assert!(events.iter().all(|e| e["event_type"] != "run_interrupted"));
 }
 
 #[test]
-fn finalize_run_events_matching_classified_error_preserves_typed_interruption() {
+fn finalize_run_events_provider_error_retains_typed_failure() {
     let svc = test_service();
     let request = test_request("budget");
     let mut state = svc.build_initial_state(
@@ -20959,20 +20941,14 @@ fn finalize_run_events_matching_classified_error_preserves_typed_interruption() 
         &state,
     );
 
-    assert_eq!(status, RunStatus::Paused);
-    assert!(error.is_none());
-    assert!(
-        events
-            .iter()
-            .all(|event| event["event_type"] != "run_error")
-    );
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.as_deref().unwrap().contains("LLM time budget"));
     assert_eq!(events[0]["event_type"], "text_done");
     assert_eq!(events[0]["data"]["partial"], true);
-    assert_eq!(events[1]["event_type"], "run_interrupted");
-    assert_eq!(events[1]["data"]["kind"], "budget_exhausted");
+    assert_eq!(events[1]["event_type"], "run_error");
+    assert_eq!(events[1]["data"]["error_kind"], "budget_exhausted");
     assert_eq!(events[2]["event_type"], "run_finished");
-    assert_eq!(events[2]["data"]["interrupted"], true);
-    assert_eq!(events[2]["data"]["interruption_kind"], "budget_exhausted");
+    assert!(events.iter().all(|e| e["event_type"] != "run_interrupted"));
 }
 
 #[test]
@@ -21091,7 +21067,7 @@ fn finalize_run_events_completes_answered_run_without_legacy_task_summary() {
 }
 
 #[test]
-fn finalize_run_events_pauses_real_empty_completion_without_legacy_task_summary() {
+fn finalize_run_events_fails_empty_completion_without_resume_authority() {
     let svc = test_service();
     let request = test_request("empty settlement");
     let mut state = svc.build_initial_state(
@@ -21124,19 +21100,16 @@ fn finalize_run_events_pauses_real_empty_completion_without_legacy_task_summary(
         &state,
     );
 
-    assert_eq!(status, RunStatus::Paused);
-    assert!(error.is_none());
-    assert_eq!(events[0]["event_type"], "run_interrupted");
-    assert_eq!(events[0]["data"]["kind"], "empty_completion");
-    assert!(events[0]["data"].get("task_board").is_none());
-    assert!(events[0]["data"].get("waiting_for").is_none());
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.is_some());
+    assert_eq!(events[0]["event_type"], "run_error");
+    assert_eq!(events[0]["data"]["error_code"], "empty_completion");
     assert_eq!(events[1]["event_type"], "run_finished");
-    assert_eq!(events[1]["data"]["interrupted"], true);
-    assert!(events[1]["data"].get("waiting_for").is_none());
+    assert!(events.iter().all(|e| e["event_type"] != "run_interrupted"));
 }
 
 #[test]
-fn finalize_run_events_waiting_reason_comes_from_interruption_authority() {
+fn finalize_run_events_debugger_pause_retains_its_wait_reason() {
     let svc = test_service();
     let request = test_request("paused task");
     let mut state = svc.build_initial_state(
@@ -21150,7 +21123,7 @@ fn finalize_run_events_waiting_reason_comes_from_interruption_authority() {
     );
     state.final_text = "Paused pending user direction.".to_string();
     state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-        astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+        astra_turn_core::interruption::InterruptionKind::HarnessPaused,
         astra_turn_core::interruption::ResumeAction::RequiresIntervention {
             description: "external approval is required".to_string(),
         },
@@ -31140,6 +31113,13 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
             .await
             .expect("complete prior Explain run before starting the next root")
     );
+    assert!(
+        svc.run_engine
+            .store()
+            .release_owner_lease(user, &session, &run, generation)
+            .await
+            .unwrap()
+    );
     let current_execution =
         crate::server::model_execution_admission::inheritance_test_support::genesis_execution();
     start_model_bound_test_parent_with_explain(
@@ -32136,6 +32116,7 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         "tool": "bash",
         "result": "ok"
     }));
+    raw_stream_events.push(json!({"type":"agent_completed", "agent_id":"child", "run_id":"child-run", "summary":"delivered"}));
     raw_stream_events.extend(
         (0..(budget.row_budget + 25))
             .map(|idx| json!({"type": "agent_live_event", "event_kind": "progress", "seq": idx})),
@@ -32184,8 +32165,8 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
     assert!(
         budgeted
             .iter()
-            .any(|event| durable_event_type(event) == Some("tool_call_end")),
-        "tool end boundary must beat progress noise under budget pressure"
+            .any(|event| durable_event_type(event) == Some("agent_completed")),
+        "durable child completion must beat progress noise under budget pressure"
     );
     assert_eq!(
         durable_event_type(&budgeted[budgeted.len() - 2]),
@@ -32226,8 +32207,8 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
     .expect("load persisted event rows");
     assert_eq!(
         rows.len(),
-        budget.row_budget + 1,
-        "DB rows should be bounded to budgeted batch plus run_started"
+        budget.row_budget,
+        "opening metadata must not add a physical event row"
     );
     let persisted_types = rows
         .iter()
@@ -32240,7 +32221,7 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
     );
     for expected in [
         "durable_events_compacted",
-        "tool_call_end",
+        "agent_completed",
         "text_done",
         "run_finished",
     ] {
@@ -32259,8 +32240,8 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
             && event.get("event_type").and_then(Value::as_str) != Some("text_delta")
     }));
     assert!(replay_events.iter().any(|event| {
-        event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-            || event.get("event_type").and_then(Value::as_str) == Some("tool_call_end")
+        event.get("type").and_then(Value::as_str) == Some("agent_completed")
+            || event.get("event_type").and_then(Value::as_str) == Some("agent_completed")
     }));
     assert!(replay_events.iter().any(|event| {
         event.get("event_type").and_then(Value::as_str) == Some("text_done")
@@ -34521,6 +34502,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
         let owner = Uuid::new_v4().to_string();
         crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
         let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(&owner);
+        collaborator_db_fixture::seed_execution_binding(&pool, &user, &session).await;
         let parent = collaborator_db_fixture::record(&user, &session, None);
         let parent_id = parent.run_id.clone();
         store.insert_run(parent).await.unwrap();
@@ -36760,24 +36742,17 @@ pub(crate) fn assert_empty_recovery_run_finalization(
 ) {
     let (events, status, error) =
         AgenticRunLifecycleService::finalize_run_events(outcome, vec![], state);
-    assert_eq!(status, RunStatus::Paused, "{events:?}");
-    assert_eq!(error.as_deref(), Some("user_intervention"));
-    let interrupted = events
+    assert_eq!(status, RunStatus::Failed, "{events:?}");
+    assert!(error.is_some());
+    let failure = events
         .iter()
-        .find(|event| event["event_type"] == "run_interrupted")
+        .find(|event| event["event_type"] == "run_error")
         .unwrap();
-    assert_eq!(interrupted["data"]["kind"], "empty_completion");
-    assert_eq!(interrupted["data"]["waiting_for"], "user_intervention");
-    assert!(
-        serde_json::to_string(interrupted)
-            .unwrap()
-            .contains("authorized model")
-    );
-    assert!(
-        events
-            .iter()
-            .all(|event| event["event_type"] != "run_error")
-    );
+    assert_eq!(failure["data"]["error_code"], "empty_completion");
+    assert!(events.iter().all(|event| !matches!(
+        event["event_type"].as_str(),
+        Some("text_done" | "run_interrupted")
+    )));
     // A later real failure or cancellation must still override this interruption.
     for (kind, expected) in [
         (astra_core::ErrorKind::DatabaseError, RunStatus::Failed),

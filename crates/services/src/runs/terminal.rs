@@ -157,6 +157,9 @@ impl CanonicalRunTerminalReceipt {
                 let answer =
                     answer.ok_or("terminal answer is missing from canonical raw history")?;
                 let mut data = serde_json::json!({"full_text":answer});
+                if matches!(self.outcome, CanonicalTerminalOutcome::Failed) {
+                    data["partial"] = true.into();
+                }
                 if let Some(id) = model_item_id {
                     data["model_item_id"] = id.into();
                 }

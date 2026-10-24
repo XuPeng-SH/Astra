@@ -439,6 +439,15 @@ async fn public_run_engine_persists_canonical_delegation_facts_on_matrixone() {
         format!("{root}/{child}/{grandchild}")
     );
     assert_eq!(nested_row.get::<i64, _>("depth"), 2);
+    let logical = engine.load_run(&user, &child).await.unwrap().unwrap();
+    assert_eq!(
+        logical
+            .events
+            .iter()
+            .map(|event| event["event_type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["run_started", "child_waiting", "run_error", "run_finished"]
+    );
     let events = sqlx::query("SELECT event_type FROM agent_run_events WHERE user_id = ? AND run_id = ? ORDER BY event_idx")
         .bind(&user).bind(&child).fetch_all(pool.get()).await.unwrap();
     assert_eq!(
@@ -446,6 +455,6 @@ async fn public_run_engine_persists_canonical_delegation_facts_on_matrixone() {
             .iter()
             .map(|row| row.get::<String, _>("event_type"))
             .collect::<Vec<_>>(),
-        ["run_started", "child_waiting", "run_error", "run_finished"]
+        ["child_waiting", "run_error", "run_finished"]
     );
 }

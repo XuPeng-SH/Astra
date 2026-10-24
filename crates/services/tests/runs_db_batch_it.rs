@@ -10,9 +10,13 @@ mod isolated_database;
 use astra_core::SharedPool;
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::runs::{
-    DatabaseRunStateStore, DurableRunRecord, RunControlReadKey, RunStateStore,
+    CanonicalRunTerminalReceipt, CanonicalRunTerminalRequest, CanonicalTerminalContext,
+    CanonicalTerminalOutcome, CanonicalTerminalTranscript, DatabaseRunStateStore, DurableRunRecord,
+    RunControlReadKey, RunStateStore,
 };
+use astra_turn_types::CanonicalTokenUsage;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, mysql::MySqlConnection};
 use std::{sync::Arc, time::Duration};
 use tracing::instrument::WithSubscriber;
@@ -148,6 +152,74 @@ async fn insert_run_fixture(
         .expect("insert active session fixture");
     }
     store.insert_run(record).await.expect("insert run fixture");
+}
+
+/// Complete through C0, the accounting/lifecycle owner, rather than inventing
+/// a second accounting-finalized event in the presentation log.
+async fn complete_run_fixture(
+    pool: &SharedPool,
+    store: &DatabaseRunStateStore,
+    user: &str,
+    session: &str,
+    run: &str,
+    prompt: Option<u64>,
+) {
+    let opened = store.load_run_admission(user, run).await.unwrap().unwrap();
+    let opened = opened.run();
+    let mut digest = Sha256::new();
+    digest.update(b"astra.run-terminal-transcript.v1\0");
+    digest.update(0_u64.to_be_bytes());
+    let receipt = CanonicalRunTerminalReceipt {
+        schema_version: 1,
+        user_id: user.into(),
+        session_id: session.into(),
+        run_id: run.into(),
+        generation: opened.run_generation,
+        opening_hash: opened.opening_hash.clone().unwrap(),
+        context_admission_hash: opened.context_admission_hash.clone(),
+        outcome: CanonicalTerminalOutcome::Completed,
+        error_hash: None,
+        error_code: None,
+        error_metadata: None,
+        context: CanonicalTerminalContext::Unowned,
+        transcript: CanonicalTerminalTranscript {
+            item_count: 0,
+            digest: format!("{:x}", digest.finalize()),
+            assistant_source_event_id: None,
+        },
+        usage: prompt
+            .map(|n| CanonicalTokenUsage::new(Some(n), Some(0), Some(0), Some(0)).unwrap()),
+        tool_ledger: None,
+    };
+    let mut tx = pool.get().begin().await.unwrap();
+    astra_services::storage::admit_session_execution_write(&mut tx, session, user)
+        .await
+        .unwrap();
+    store
+        .claim_canonical_terminal_in_transaction(
+            &mut tx,
+            CanonicalRunTerminalRequest {
+                user_id: user,
+                run_id: run,
+                expected_session_id: session,
+                expected_statuses: &["running"],
+                expected_owner_generation: opened.run_generation,
+                status: "completed",
+                waiting_for: None,
+                error_message: None,
+                error_code: None,
+                error_metadata: None,
+                cancellation_origin: None,
+                prompt_tokens: prompt.unwrap_or(0),
+                completion_tokens: 0,
+                tool_calls: 0,
+            },
+            &receipt,
+        )
+        .await
+        .unwrap()
+        .expect("canonical terminal claim");
+    tx.commit().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -470,23 +542,24 @@ async fn batch_write_preserves_event_idx_ordering() {
     .await
     .unwrap();
 
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 4);
 
     let types: Vec<String> = rows.iter().map(|r| r.get("event_type")).collect();
     assert_eq!(
         types,
-        vec![
-            "run_started",
-            "tool_call",
-            "tool_result",
-            "text_delta",
-            "run_finished"
-        ]
+        vec!["tool_call", "tool_result", "text_delta", "run_finished"]
     );
 
     let indices: Vec<i64> = rows.iter().map(|r| r.get("event_idx")).collect();
     for (i, idx) in indices.iter().enumerate() {
-        assert_eq!(*idx, i as i64, "event_idx should be sequential");
+        assert_eq!(*idx, i as i64 + 1, "event_idx should be sequential");
+    }
+
+    let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(loaded.events.len(), 5);
+    assert_eq!(loaded.events[0]["event_type"], "run_started");
+    for (index, event) in loaded.events.iter().enumerate() {
+        assert_eq!(event["index"], index as i64);
     }
 
     // Cleanup
@@ -1733,7 +1806,7 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
     independent.close().await;
 }
 
-/// The status reader must stay independent of history size and checkpoint bytes.
+/// Status returns bounded facts without hydrating history or checkpoint bodies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
@@ -1746,10 +1819,6 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         json!({"event_type":"run_started", "data":{"explain_analyze_requested":true,"transport":"edge"}}),
         json!({"event_type":"executor_bound", "data":{"executor":{"id":"original"}}}),
         json!({"event_type":"workspace_bound", "data":{"workspace":{"id":"original"},"transport":"ignored"}}),
-        json!({"event_type":"executor_bound", "data":{"executor":{"id":"replacement"}}}),
-        json!({"event_type":"workspace_bound", "data":{"workspace":{"id":"replacement"}}}),
-        json!({"event_type":"run_finished", "data":{"prompt_tokens":10}}),
-        json!({"event_type":"run_finished", "data":{"prompt_tokens":20}}),
     ];
     events.extend((0..256).map(
         |i| json!({"event_type":"agent_progress", "data":{"index":i,"text":"x".repeat(2048)}}),
@@ -1760,6 +1829,26 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         durable_run_record_with_events(run.clone(), user.clone(), session.clone(), "agent", events),
     )
     .await;
+    // Opening facts are immutable; later presentation cannot replace them.
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &run,
+            &[
+                json!({"event_type":"executor_bound","data":{"executor":{"id":"replacement"}}}),
+                json!({"event_type":"workspace_bound","data":{"workspace":{"id":"replacement"}}}),
+            ],
+        )
+        .await
+        .unwrap();
+    complete_run_fixture(&pool, &store, &user, &session, &run, Some(20)).await;
+    let terminal_tail = store
+        .load_run_control(&user, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
     let checkpoint = "x".repeat(256 * 1024);
     sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
         .bind(&checkpoint)
@@ -1769,13 +1858,21 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         .await
         .unwrap();
     let (_, replica) = setup().await;
-    for (phase, expected_tokens) in [(0, 20), (1, 30)] {
+    for phase in 0..2 {
         if phase == 1 {
-            store.append_events_batch(&user, &session, &run, &[
-                json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":25}}),
-                json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":30}}),
-                json!({"event_type":"run_finished","data":{"prompt_tokens":99}}),
-            ]).await.unwrap();
+            store
+                .append_events_batch(
+                    &user,
+                    &session,
+                    &run,
+                    &[
+                        json!({"event_type":"agent_progress","data":{"index":257}}),
+                        json!({"event_type":"agent_progress","data":{"index":258}}),
+                        json!({"event_type":"agent_progress","data":{"index":259}}),
+                    ],
+                )
+                .await
+                .unwrap();
         }
         let queries = Queries::default();
         let subscriber =
@@ -1790,11 +1887,8 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         assert_eq!(snapshot.workspace.unwrap()["id"], "original");
         assert_eq!(snapshot.executor.unwrap()["id"], "original");
         assert_eq!(snapshot.transport.as_deref(), Some("edge"));
-        assert_eq!(
-            snapshot.accounting.unwrap()["prompt_tokens"],
-            expected_tokens
-        );
-        assert_eq!(snapshot.last_event_idx, 262 + phase * 3);
+        assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 20);
+        assert_eq!(snapshot.last_event_idx, terminal_tail + phase * 3);
         let queries = queries.0.lock().unwrap();
         let reads: Vec<_> = queries
             .iter()
@@ -1866,7 +1960,13 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
     insert_run_fixture(
         &pool,
         &store,
-        durable_run_record(run.clone(), user.clone(), session.clone()),
+        durable_run_record_with_events(
+            run.clone(),
+            user.clone(),
+            session.clone(),
+            "agent",
+            vec![json!({"event_type":"run_started","data":{}})],
+        ),
     )
     .await;
     let empty = store
@@ -1881,13 +1981,11 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
             &user,
             &session,
             &run,
-            &[
-                json!({"event_type":"agent_progress","data":{}}),
-                json!({"event_type":"run_finished","data":{"prompt_tokens":19}}),
-            ],
+            &[json!({"event_type":"agent_progress","data":{}})],
         )
         .await
         .unwrap();
+    complete_run_fixture(&pool, &store, &user, &session, &run, Some(19)).await;
     // A bad unrelated payload cannot poison the bounded status read.
     sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'agent_progress'")
         .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
@@ -1897,35 +1995,15 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
         .unwrap()
         .unwrap();
     assert_eq!(finished.accounting.unwrap()["prompt_tokens"], 19);
-    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'")
-        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET terminal_receipt_json = '{' WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .execute(pool.get())
+    .await
+    .unwrap();
     assert!(store.load_run_status_snapshot(&user, &run).await.is_err());
-
-    // Presence, not a successfully decoded 'data', selects finalized accounting.
-    store
-        .append_events_batch(
-            &user,
-            &session,
-            &run,
-            &[json!({"event_type":"run_accounting_finalized"})],
-        )
-        .await
-        .unwrap();
-    assert!(
-        store
-            .load_run_status_snapshot(&user, &run)
-            .await
-            .unwrap()
-            .unwrap()
-            .accounting
-            .is_none()
-    );
-    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'")
-        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
-    assert!(
-        store.load_run_status_snapshot(&user, &run).await.is_err(),
-        "selected corruption must not become missing accounting"
-    );
 }
 
 #[tokio::test]
@@ -1933,11 +2011,7 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
 async fn status_snapshot_keeps_zero_positions_and_ignores_unselected_same_type_corruption() {
     let (pool, store) = setup().await;
     let user = common::id("status-zero");
-    for event in [
-        json!({"event_type":"run_finished","data":{"prompt_tokens":0}}),
-        json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":0}}),
-        json!({"event_type":"workspace_bound","data":{"workspace":{"id":"only-workspace"}}}),
-    ] {
+    for prompt in [None, Some(0)] {
         let run = common::id("status-run");
         let session = common::id("status-session");
         insert_run_fixture(
@@ -1948,41 +2022,62 @@ async fn status_snapshot_keeps_zero_positions_and_ignores_unselected_same_type_c
                 user.clone(),
                 session.clone(),
                 "agent",
-                vec![event.clone()],
+                vec![json!({"event_type":"run_started","data":{}})],
             ),
         )
         .await;
+        complete_run_fixture(&pool, &store, &user, &session, &run, prompt).await;
         let snapshot = store
             .load_run_status_snapshot(&user, &run)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.last_event_idx, 0);
-        if event["event_type"] == "workspace_bound" {
-            assert_eq!(snapshot.workspace.as_ref().unwrap()["id"], "only-workspace");
-            assert!(snapshot.executor.is_none() && snapshot.accounting.is_none());
-            store
-                .append_events_batch(
-                    &user,
-                    &session,
-                    &run,
-                    &[json!({"event_type":"workspace_bound","data":{"workspace":{"id":"later"}}})],
-                )
-                .await
-                .unwrap();
-            sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 1")
-                .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
-            let after = store
-                .load_run_status_snapshot(&user, &run)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(after.workspace, snapshot.workspace);
-        } else {
-            assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 0);
-            assert!(snapshot.workspace.is_none() && snapshot.executor.is_none());
-        }
+        assert_eq!(snapshot.last_event_idx, 1);
+        let accounting = snapshot.accounting.unwrap();
+        assert_eq!(
+            accounting
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64),
+            prompt
+        );
+        assert_eq!(accounting["qualified_usage"].is_null(), prompt.is_none());
+        assert!(snapshot.workspace.is_none() && snapshot.executor.is_none());
     }
+    let run = common::id("status-run");
+    let session = common::id("status-session");
+    insert_run_fixture(
+        &pool,
+        &store,
+        durable_run_record_with_events(run.clone(), user.clone(), session.clone(), "agent", vec![json!({"event_type":"workspace_bound","data":{"workspace":{"id":"only-workspace"}}})]),
+    )
+    .await;
+    let first_index: i64 = sqlx::query_scalar("SELECT event_idx FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'workspace_bound'")
+        .bind(&user).bind(&run).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(first_index, 0, "generic store facts can occupy index zero");
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &run,
+            &[json!({"event_type":"workspace_bound","data":{"workspace":{"id":"later"}}})],
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    let snapshot = store
+        .load_run_status_snapshot(&user, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.workspace.unwrap()["id"], "only-workspace");
+    assert!(snapshot.executor.is_none() && snapshot.accounting.is_none());
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 0")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    assert!(
+        store.load_run_status_snapshot(&user, &run).await.is_err(),
+        "selected index-zero corruption must fail"
+    );
 }
 
 /// Count real SQL rather than simulating the batching implementation.
@@ -2553,11 +2648,11 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
             .fetch_one(_pool.get())
             .await
             .unwrap();
-    assert_eq!(count_before, 2);
+    assert_eq!(count_before, 1);
 
-    // Re-append the same events — SELECT finds all keys → no INSERT.
+    // Re-append the physical event; the opening is owned by immutable Run metadata.
     store
-        .append_events_batch(&user_id, &session_id, &run_id, &events)
+        .append_events_batch(&user_id, &session_id, &run_id, &events[1..])
         .await
         .expect("re-append same keys");
 
@@ -2567,7 +2662,7 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
             .fetch_one(_pool.get())
             .await
             .unwrap();
-    assert_eq!(count_after, 2, "no new events — all deduped");
+    assert_eq!(count_after, 1, "no new events — all deduped");
 
     // last_event_idx unchanged: actually_inserted=0 → early return.
     let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
@@ -2575,7 +2670,7 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
 
     // Mixed batch: one exact immutable replay plus one new event advances by one.
     let mixed: Vec<serde_json::Value> = vec![
-        events[0].clone(),
+        events[1].clone(),
         make_idempotent_event("tool_result", "tctou-k3", json!({"output": "done"})),
     ];
     store
@@ -2589,7 +2684,7 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
             .fetch_one(_pool.get())
             .await
             .unwrap();
-    assert_eq!(count_final, 3, "1 new + 2 original = 3");
+    assert_eq!(count_final, 2, "one new event plus one physical original");
 
     let loaded2 = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(

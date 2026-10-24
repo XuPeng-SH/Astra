@@ -750,6 +750,32 @@ pub async fn run_product_matrix_full_journey(
     )
     .await;
     assert_eq!(st_appr, StatusCode::OK, "approval/respond: {appr_j}");
+    // Resolving approval does not finish the synthetic execution that owns it.
+    let approval_store = astra_services::runs::DatabaseRunStateStore::new(ctx.shared_pool.clone())
+        .with_owner_pod_id("system-matrix-approval-fixture");
+    use astra_services::runs::RunStateStore;
+    assert!(
+        approval_store
+            .update_run_status_with_events_if_current(
+                &ctx.user_id,
+                &ctx.session_id,
+                &approval_run_id,
+                &["running"],
+                Some(0),
+                "completed",
+                None,
+                None,
+                &[],
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        approval_store
+            .release_owner_lease(&ctx.user_id, &ctx.session_id, &approval_run_id, 0)
+            .await
+            .unwrap()
+    );
 
     let (st_runs, runs) = get_json(app, "/runs", Some(auth_header), &[]).await;
     assert_eq!(st_runs, StatusCode::OK, "list runs: {runs}");

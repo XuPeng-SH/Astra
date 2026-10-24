@@ -3405,7 +3405,23 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_transfer_writer", source))?;
-        admit_controller_context_write(&mut tx, &request.key).await?;
+        if request.mode == SessionHandoffModeV1::Forced {
+            // Authorization was validated above. Revoking an old writer must
+            // precede effect sealing; it does not admit new execution or
+            // claim that the previous execution/unknown effects have stopped.
+            crate::storage::admit_context_execution_write_with_facts(
+                &mut tx,
+                &request.key.session_id,
+                &request.key.owner_user_id,
+            )
+            .await
+            .map_err(|source| match source {
+                sqlx::Error::RowNotFound => SessionContextCoordinatorError::SessionLifecycleFenced,
+                source => database_error("admit_forced_writer_fence", source),
+            })?;
+        } else {
+            admit_controller_context_write(&mut tx, &request.key).await?;
+        }
         let now = database_now_ms(&mut tx).await?;
         let expires_at = checked_expiry(now, ttl)?;
         let mut state = lock_database_state(&mut tx, &request.key).await?;

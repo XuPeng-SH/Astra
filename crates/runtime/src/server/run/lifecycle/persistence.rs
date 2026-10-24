@@ -4554,8 +4554,8 @@ mod tests {
         .await
         .expect_err("stale generation must fail before writing any settlement evidence");
         assert!(
-            error.contains("authoritative atomic terminal resolution conflict")
-                && error.contains("run generation mismatch"),
+            error.contains("canonical terminal lost durable execution authority")
+                && error.contains(&format!("generation {}", authority.owner_generation)),
             "unexpected canonical append error: {error}"
         );
         let event_count: i64 = sqlx::query_scalar(

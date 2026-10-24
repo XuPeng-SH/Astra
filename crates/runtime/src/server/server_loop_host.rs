@@ -24834,6 +24834,13 @@ mod tests {
                 .unwrap()
         );
 
+        assert!(
+            store
+                .release_owner_lease(&user, session, "slot-blocker", 0)
+                .await
+                .unwrap()
+        );
+
         let mut conflicting_checkpoint: Value =
             serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
         conflicting_checkpoint["heavy"]["original_facts"]["total_prompt"] = json!(124);
@@ -24903,7 +24910,7 @@ mod tests {
             assert_ne!(
                 first.is_ok(),
                 second.is_ok(),
-                "only one concurrent owner wins"
+                "only one concurrent owner wins: first={first:?}, second={second:?}"
             );
             let winner = if first.is_ok() {
                 "replay-test-owner-a"

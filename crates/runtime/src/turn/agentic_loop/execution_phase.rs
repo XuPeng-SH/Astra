@@ -3305,6 +3305,30 @@ fn exhausted_provider_recovery_action(state: &AgenticLoopState) -> ResumeAction 
     }
 }
 
+/// Keep only observed assistant bytes, never reasoning or unexecuted tool calls.
+/// The same history owner feeds Root Context and child transcript capture.
+fn preserve_failed_provider_text(
+    state: &mut AgenticLoopState,
+    text: &str,
+    model_item_id: Option<String>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    state.final_text = text.to_owned();
+    state.final_text_model_item_id = model_item_id;
+    state.final_text_streamed = false;
+    if let Some(message) =
+        astra_turn_core::agentic_turn_ingest::terminal_assistant_message_to_append(
+            &state.messages,
+            &state.final_text,
+            state.final_text_model_item_id.as_deref(),
+        )
+    {
+        state.push_prompt_history_message(message);
+    }
+}
+
 fn record_direct_llm_error_state(
     state: &mut AgenticLoopState,
     error: &astra_core::ClassifiedError,
@@ -3363,52 +3387,58 @@ fn fold_provider_completion_error_usage(
     };
     // Accounting qualification is independent of successful delivery. An
     // interrupted dispatched request may carry only an unknown sample.
-    if let Some(usage) = details
+    let qualified = details
         .get("qualified_usage")
         .filter(|usage| !usage.is_null())
-    {
-        state.last_request_usage = None;
-        state.last_measured_prompt_tokens = None;
-        state.add_qualified_usage(Some(
+        .map(|usage| {
             astra_turn_types::CanonicalTokenUsage::from_json(usage).unwrap_or_else(|_| {
                 astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
                     .expect("unknown usage is valid")
-            }),
-        ));
+            })
+        });
+    if let Some(usage) = qualified {
+        state.last_request_usage = None;
+        state.last_measured_prompt_tokens = None;
+        state.add_qualified_usage(Some(usage));
     }
-    if details
+    let transport_success = details
         .pointer("/provider_response/transport_success")
         .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
-        return;
+        == Some(true);
+    if transport_success {
+        state.last_measured_prompt_tokens = details
+            .get("last_request_input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                details
+                    .get("last_request_usage")
+                    .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
+                    .and_then(|usage| usage.input_column())
+                    .and_then(|tokens| u64::try_from(tokens).ok())
+            });
+        state.last_request_usage = details
+            .get("last_request_usage")
+            .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
+            .and_then(|usage| {
+                astra_turn_types::RequestTokenUsage::try_new(
+                    usage.input_tokens()?,
+                    usage.cached_input_tokens()?,
+                    usage.cache_creation_tokens()?,
+                    usage.output_tokens()?,
+                )
+                .ok()
+            });
     }
-    state.last_measured_prompt_tokens = details
-        .get("last_request_input_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
-            details
-                .get("last_request_usage")
-                .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
-                .and_then(|usage| usage.input_column())
-                .and_then(|tokens| u64::try_from(tokens).ok())
-        });
-    state.last_request_usage = details
-        .get("last_request_usage")
-        .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
-        .and_then(|usage| {
-            astra_turn_types::RequestTokenUsage::try_new(
-                usage.input_tokens()?,
-                usage.cached_input_tokens()?,
-                usage.cache_creation_tokens()?,
-                usage.output_tokens()?,
-            )
-            .ok()
-        });
-    let Some(usage) = details.get("usage") else {
-        return;
+    // One host-return boundary, one increment. Failed transports still carry
+    // actual measured buckets; an unknown bucket never becomes known zero.
+    let usage = if transport_success {
+        details
+            .get("usage")
+            .and_then(|usage| astra_turn_types::CanonicalTokenUsage::from_json(usage).ok())
+    } else {
+        qualified
     };
-    let Ok(usage) = astra_turn_types::CanonicalTokenUsage::from_json(usage) else {
+    let Some(usage) = usage else {
         return;
     };
     state.total_prompt = state
@@ -5277,6 +5307,16 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.step_recorder.end_turn(false);
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
+            if let Some(details) = error
+                .details_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                && let Some(text) = details
+                    .get("partial_full_text")
+                    .and_then(serde_json::Value::as_str)
+            {
+                preserve_failed_provider_text(state, text, state.current_model_item_id.clone());
+            }
             record_direct_llm_error_state(state, &error);
             return Err(error);
         }
@@ -5660,44 +5700,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.rate_limit_cooldown.record_529(None);
             }
 
-            if is_rate_limit && state.total_tool_calls > 0 {
-                if !prep.quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!(
-                            "⚠ Rate limit hit after {} tool calls — preserving work.",
-                            state.total_tool_calls,
-                        ),
-                    );
-                }
-                state.final_text_model_item_id = None;
-                state.final_text = format!(
-                    "[Rate limit reached after {} tool call(s). \
-                     All completed tool results are preserved above. \
-                     You can continue from where I left off in the next message.]\n\n\
-                     Error: {}",
-                    state.total_tool_calls, e.message,
-                );
-                state.final_text_streamed = false;
-                state.interruption = Some(InterruptionRecord::new(
-                    InterruptionKind::RateLimited,
-                    ResumeAction::WaitAndRetry { delay_seconds: 30 },
-                    interruption_state_summary(
-                        state,
-                        Some(format!("Rate limit during streaming: {}", e.message)),
-                    ),
-                ));
-                record_early_exit_llm_round(
-                    state,
-                    &turn_result,
-                    prep.turn_start_time,
-                    Some("rate_limited"),
-                );
-                observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
-                state.step_recorder.end_turn(false);
-                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
-            }
-
             if is_rate_limit {
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::RateLimited,
@@ -5866,11 +5868,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // Fatal responses are partial observations, never successful
             // completion. Preserve this response's bytes before returning the
             // error; normal finalization does not run on the fatal path.
-            if !turn_result.accum.full_text.trim().is_empty() {
-                state.final_text.clone_from(&turn_result.accum.full_text);
-                state.final_text_model_item_id = turn_result.accum.model_item_id.clone();
-                state.final_text_streamed = false;
-            }
+            preserve_failed_provider_text(
+                state,
+                &turn_result.accum.full_text,
+                turn_result.accum.model_item_id.clone(),
+            );
 
             // Catch-all: map ErrorKind to InterruptionRecord so the checkpoint
             // always carries resume guidance. Existing specific records (rate
@@ -6282,8 +6284,8 @@ pub(crate) fn capture_latest_provider_text(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
 ) {
-    let text = turn_result.accum.full_text.trim();
-    if !text.is_empty() {
+    let text = &turn_result.accum.full_text;
+    if !text.trim().is_empty() {
         state.hooks.completion_settlement.latest_provider_text = Some(text.to_string());
         state
             .hooks
@@ -6316,7 +6318,7 @@ pub(crate) fn capture_deferred_candidate_text(
         return;
     }
     // A text-only retry may replace an earlier mixed candidate.
-    *deferred = Some(turn_result.accum.full_text.trim().to_string());
+    *deferred = Some(turn_result.accum.full_text.clone());
     state
         .hooks
         .completion_settlement
@@ -20658,11 +20660,15 @@ mod tests {
         for qualified in [
             serde_json::json!({}),
             serde_json::json!({"output_tokens":7}),
+            serde_json::json!({"input_tokens":17,"cached_input_tokens":3,"cache_creation_tokens":2,"output_tokens":7}),
         ] {
             let mut state = make_state();
             state.last_measured_prompt_tokens = Some(1000);
             state.last_request_usage =
                 Some(astra_turn_types::RequestTokenUsage::try_new(100, 900, 0, 20).unwrap());
+            state.total_prompt = 100;
+            state.total_cache_read = 900;
+            state.total_completion = 20;
             state.add_qualified_usage(Some(
                 astra_turn_types::CanonicalTokenUsage::new(Some(100), Some(900), Some(0), Some(20))
                     .unwrap(),
@@ -20676,8 +20682,20 @@ mod tests {
             let usage = state.qualified_usage.unwrap();
             assert!(state.last_request_usage.is_none());
             assert!(state.last_measured_prompt_tokens.is_none());
-            assert_eq!(usage.input_tokens(), None);
-            assert_eq!(usage.cached_input_tokens(), None);
+            assert_eq!(
+                usage.input_tokens(),
+                qualified
+                    .get("input_tokens")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value + 100)
+            );
+            assert_eq!(
+                usage.cached_input_tokens(),
+                qualified
+                    .get("cached_input_tokens")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value + 900)
+            );
             assert_eq!(
                 usage.output_tokens(),
                 qualified
@@ -20686,8 +20704,32 @@ mod tests {
                     .map(|v| v + 20)
             );
             assert_eq!(
-                state.total_prompt, 0,
-                "qualification does not invent observed counters"
+                state.total_prompt,
+                100 + qualified
+                    .get("input_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+            );
+            assert_eq!(
+                state.total_cache_read,
+                900 + qualified
+                    .get("cached_input_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+            );
+            assert_eq!(
+                state.total_cache_creation,
+                qualified
+                    .get("cache_creation_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+            );
+            assert_eq!(
+                state.total_completion,
+                20 + qualified
+                    .get("output_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
             );
         }
     }

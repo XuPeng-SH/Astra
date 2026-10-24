@@ -675,9 +675,9 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
 }
 
 pub fn push_active_run_live_event(run: &mut RunState, event: Value) {
-    // Keep bounded tool outcomes for same-process reconnects. Cross-process
-    // observers obtain those outcomes with the terminal batch; transient tool
-    // progress goes directly to current observers without database writes.
+    // Keep bounded presentation for same-process reconnects. Cold observers
+    // use the canonical invocation outcome; tool presentation frames are not
+    // durable replay promises.
     fn retained(event: &Value) -> bool {
         live_delta_event_for_persistence(event)
             || durable_event_type(event) == Some("tool_call_end")

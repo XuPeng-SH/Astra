@@ -404,6 +404,7 @@ fn native_child_script(
 
 async fn assert_native_delegation_without_auxiliary_selector(
     ctx: &super::harness::MatrixE2eCtx,
+    requests_per_child: usize,
     user_text: &str,
     slots: &[(&str, &str)],
 ) {
@@ -472,8 +473,8 @@ async fn assert_native_delegation_without_auxiliary_selector(
                                     && message["content"] == *prompt))
                 )
                 .count(),
-            1,
-            "each declared slot must issue exactly one actual child request with its complete task"
+            requests_per_child,
+            "each declared slot must issue only its bounded provider attempts with its complete task"
         );
     }
 }
@@ -493,20 +494,21 @@ fn provider_tool_call(id: &str, name: &str, args: Value) -> Value {
 enum OnlineFanoutTerminal {
     Completed,
     Failed,
+    EmptyCompletion,
 }
 
 impl OnlineFanoutTerminal {
     fn child_event_type(self) -> &'static str {
         match self {
             Self::Completed => "agent_completed",
-            Self::Failed => "agent_failed",
+            Self::Failed | Self::EmptyCompletion => "agent_failed",
         }
     }
 
     fn child_run_status(self) -> &'static str {
         match self {
             Self::Completed => "completed",
-            Self::Failed => "failed",
+            Self::Failed | Self::EmptyCompletion => "failed",
         }
     }
 }
@@ -580,6 +582,7 @@ fn concurrent_fanout_scripts(
     ];
     let child_response = || match case.terminal {
         OnlineFanoutTerminal::Completed => native_text_response(&case.child_provenance),
+        OnlineFanoutTerminal::EmptyCompletion => native_text_response(""),
         OnlineFanoutTerminal::Failed => ProviderResponse::Json {
             status: StatusCode::BAD_REQUEST,
             body: json!({"error":{"message":case.child_provenance}}),
@@ -621,7 +624,13 @@ fn concurrent_fanout_scripts(
                             .any(|m| m["role"] == "user" && m["content"] == message)
                     })
             },
-            vec![child_response(), child_response()],
+            (0..if case.terminal == OnlineFanoutTerminal::EmptyCompletion {
+                4
+            } else {
+                2
+            })
+                .map(|_| child_response())
+                .collect(),
         ),
     ]
 }
@@ -634,48 +643,49 @@ fn concurrent_fanout_payload(
 }
 
 async fn captured_synthesis_children(
-    pool: &sqlx::MySqlPool,
-    user_id: &str,
-    session_id: &str,
+    ctx: &super::harness::MatrixE2eCtx,
     root_run_id: &str,
+    prompt: &str,
     final_reply: &str,
     events: &[Value],
 ) -> Vec<Value> {
-    let completed_rounds = events
+    let rounds = events
         .iter()
         .find(|event| event["type"] == "turn_complete")
         .and_then(|event| event["llm_rounds"].as_u64())
-        .and_then(|rounds| rounds.checked_sub(1))
-        .expect("accepted final provider round");
-    let captures = sqlx::query_scalar::<_, String>(
-        "SELECT content_json FROM session_artifacts \
-         WHERE user_id = ? AND session_id = ? AND turn = 1 \
-           AND artifact_kind = 'llm_capture' AND source = 'server_loop_host' \
-           AND round = ? LIMIT 2",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(completed_rounds)
-    .fetch_all(pool)
-    .await
-    .expect("actual provider exchanges");
-    assert_eq!(
-        captures.len(),
-        1,
-        "one capture for the accepted final round"
-    );
-    let exchange: Value = serde_json::from_str(&captures[0]).unwrap();
-    assert_eq!(exchange["response"]["full_text"], final_reply);
+        .expect("accepted provider rounds");
     assert!(
-        exchange["response"]["tool_calls"]
-            .as_array()
-            .is_none_or(Vec::is_empty)
+        events
+            .iter()
+            .any(|event| event["type"] == "text_delta" && event["content"] == final_reply)
     );
+    let requests = ctx.native_provider_requests().await;
+    let primary: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.path == "/v1/chat/completions"
+                && request.body["stream"] == true
+                && request.body["model"] == format!("mock-{}", ctx.suffix)
+                && request.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["role"] == "user" && message["content"] == prompt)
+                })
+        })
+        .collect();
+    assert_eq!(primary.len() as u64, rounds);
+    let final_request = primary.last().expect("actual final provider request");
     let mut children = Vec::new();
-    for message in exchange["request"]["messages"].as_array().unwrap() {
-        let Some(payload) = message["content"]
-            .as_str()
-            .and_then(|content| content.strip_prefix("<runtime-required-context>\n"))
+    for message in final_request.body["messages"].as_array().unwrap() {
+        let Some(content) = message["content"].as_str() else {
+            continue;
+        };
+        let content = content
+            .strip_prefix("<astra-runtime-context>\n")
+            .and_then(|content| content.strip_suffix("\n</astra-runtime-context>"))
+            .unwrap_or(content);
+        let Some(payload) = content
+            .strip_prefix("<runtime-required-context>\n")
             .and_then(|content| content.strip_suffix("\n</runtime-required-context>"))
             .and_then(|content| serde_json::from_str::<Value>(content).ok())
         else {
@@ -689,6 +699,11 @@ async fn captured_synthesis_children(
         assert_eq!(payload["parent_run_id"], root_run_id);
         children.extend(payload["children"].as_array().unwrap().iter().cloned());
     }
+    assert!(
+        !children.is_empty(),
+        "actual final request must carry direct-child completion: {}",
+        final_request.body["messages"]
+    );
     for child in &children {
         let result = child["result"]
             .as_str()
@@ -700,7 +715,7 @@ async fn captured_synthesis_children(
 }
 
 async fn assert_concurrent_fanout_stream(
-    pool: &sqlx::MySqlPool,
+    ctx: &super::harness::MatrixE2eCtx,
     case: &ConcurrentFanoutCase,
     shared_group_id: &str,
     all_child_provenances: &[String],
@@ -798,10 +813,9 @@ async fn assert_concurrent_fanout_stream(
         vec![0, 1]
     );
     let results = captured_synthesis_children(
-        pool,
-        &case.user_id,
-        &case.session_id,
+        ctx,
         &root_run_id,
+        &format!("Run the isolated fanout scenario {}.", case.name),
         &case.final_reply,
         &events,
     )
@@ -833,6 +847,8 @@ async fn assert_concurrent_fanout_stream(
             let payload = result["result"].as_str().unwrap();
             if case.terminal == OnlineFanoutTerminal::Completed {
                 payload == case.child_provenance
+            } else if case.terminal == OnlineFanoutTerminal::EmptyCompletion {
+                payload.contains("empty_completion")
             } else {
                 payload.contains("[invalid_request] LLM request rejected: 400")
             }
@@ -934,6 +950,29 @@ async fn assert_concurrent_fanout_durability(
             && row.get::<String, _>("root_run_id") == evidence.root_run_id
             && row.get::<String, _>("status") == case.terminal.child_run_status()
     }));
+    if case.terminal == OnlineFanoutTerminal::EmptyCompletion {
+        for child in &children {
+            let row = sqlx::query("SELECT terminal_receipt_json, error_code FROM agent_runs WHERE user_id = ? AND run_id = ?")
+                .bind(&case.user_id).bind(child.get::<String, _>("run_id"))
+                .fetch_one(pool).await.unwrap();
+            assert!(
+                row.get::<Option<String>, _>("terminal_receipt_json")
+                    .is_some()
+            );
+            assert_eq!(
+                row.get::<Option<String>, _>("error_code").as_deref(),
+                Some("empty_completion")
+            );
+            let roles: Vec<String> = sqlx::query_scalar("SELECT role FROM session_transcript_items WHERE user_id = ? AND run_id = ? ORDER BY item_seq")
+                .bind(&case.user_id).bind(child.get::<String, _>("run_id"))
+                .fetch_all(pool).await.unwrap();
+            assert_eq!(
+                roles,
+                vec!["user"],
+                "an empty provider cannot author assistant history"
+            );
+        }
+    }
     let mut durable_child_run_ids = children
         .iter()
         .map(|row| row.get::<String, _>("run_id"))
@@ -1678,6 +1717,7 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
     }
     assert_native_delegation_without_auxiliary_selector(
         ctx,
+        1,
         "Run three reviews as one structured work group.",
         &[
             (
@@ -1987,11 +2027,11 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
             child_provenance: "A2 private provider body marker.".to_string(),
         },
         ConcurrentFanoutCase {
-            name: "b-one-failure".to_string(),
+            name: "b-one-empty-completion".to_string(),
             auth: b_auth.clone(),
             user_id: b_user_id.clone(),
             session_id: b_session_ids[0].clone(),
-            terminal: OnlineFanoutTerminal::Failed,
+            terminal: OnlineFanoutTerminal::EmptyCompletion,
             final_reply: "B1 synthesized its two preserved failures once.".to_string(),
             child_provenance: "B1 private provider body marker.".to_string(),
         },
@@ -2029,6 +2069,11 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
     for case in &cases {
         assert_native_delegation_without_auxiliary_selector(
             ctx,
+            if case.terminal == OnlineFanoutTerminal::EmptyCompletion {
+                2
+            } else {
+                1
+            },
             &format!("Run the isolated fanout scenario {}.", case.name),
             &[
                 (
@@ -2053,7 +2098,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         assert_eq!(status, StatusCode::OK, "{}: {raw_sse}", case.name);
         evidence.push(
             assert_concurrent_fanout_stream(
-                pool,
+                ctx,
                 case,
                 shared_group_id,
                 &all_child_provenances,
@@ -2273,6 +2318,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
     }
     assert_native_delegation_without_auxiliary_selector(
         ctx,
+        1,
         "Start three slow reviews; the user will cancel the live root.",
         &[
             ("Slow child one", "Return finding one."),
@@ -3060,6 +3106,7 @@ native_child_script(child_model.clone(),"Run three reviews and preserve every fa
     let raw_sse = String::from_utf8(bytes).unwrap();
     assert_native_delegation_without_auxiliary_selector(
         ctx,
+        1,
         "Run three reviews and preserve every failure cause.",
         &[
             ("Failed storage review", "Inspect storage."),
@@ -3139,10 +3186,9 @@ native_child_script(child_model.clone(),"Run three reviews and preserve every fa
         vec![0, 1, 2]
     );
     let children = captured_synthesis_children(
-        pool,
-        user_id,
-        &session_id,
+        ctx,
         &root_run_id,
+        "Run three reviews and preserve every failure cause.",
         final_reply,
         &events,
     )

@@ -7945,19 +7945,6 @@ impl AgenticRunLifecycleService {
             && lease_lost.is_some_and(|lost| lost.load(Ordering::Acquire));
         let cancellation_requested = !ownership_fenced && raw_cancellation_requested;
 
-        // The agentic loop records a typed interruption before returning the
-        // classified error that caused it.  Preserve that resumable terminal
-        // only when both sources agree: a stale interruption must never mask a
-        // later journal, database, or contract failure that replaced the loop
-        // outcome during durable settlement.
-        let error_matches_interruption = match (&loop_outcome, &loop_state.interruption) {
-            (Err(error), Some(interruption)) => {
-                astra_turn_core::interruption::interruption_from_error_kind(error.kind)
-                    .is_some_and(|(kind, _)| kind == interruption.kind)
-            }
-            _ => false,
-        };
-
         let (final_status, error_msg) = if ownership_fenced {
             // Lease loss is a process-ownership event, not a user request.
             // The generation-fenced durable CAS below will normally reject
@@ -8005,8 +7992,12 @@ impl AgenticRunLifecycleService {
                 "data": data,
             }));
             (RunStatus::Cancelled, None)
-        } else if let Some(interruption) = loop_state.interruption.as_ref().filter(|_| {
-            matches!(&loop_outcome, Ok(AgenticLoopOutcome::Completed)) || error_matches_interruption
+        } else if let Some(interruption) = loop_state.interruption.as_ref().filter(|interruption| {
+            // A diagnostic resume hint is not a durable execution grant.
+            // Only an actual debugger pause retains this nonterminal lane.
+            matches!(&loop_outcome, Ok(AgenticLoopOutcome::Completed))
+                && interruption.kind
+                    == astra_turn_core::interruption::InterruptionKind::HarnessPaused
         }) {
             let waiting_for = if matches!(
                 interruption.resume_action,
@@ -8084,6 +8075,33 @@ impl AgenticRunLifecycleService {
                     }));
                     (RunStatus::Failed, Some(rejection.message))
                 }
+                Ok(AgenticLoopOutcome::Completed) if loop_state.interruption.is_some() => {
+                    let interruption = loop_state
+                        .interruption
+                        .as_ref()
+                        .expect("checked interruption");
+                    let code = interruption.kind.label();
+                    let message = interruption
+                        .error_detail
+                        .clone()
+                        .unwrap_or_else(|| format!("execution stopped: {code}"));
+                    if !loop_state.final_text.is_empty() {
+                        events.push(json!({"event_type":"text_done", "data": {
+                            "full_text":loop_state.final_text,
+                            "model_item_id":loop_state.final_text_model_item_id,
+                            "partial":true,
+                        }}));
+                    }
+                    events.push(json!({"event_type":"run_error", "data": {
+                        "error":message, "error_code":code, "error_kind":code,
+                    }}));
+                    let mut finished = usage;
+                    finished["error"] = json!(message);
+                    finished["error_code"] = json!(code);
+                    finished["error_kind"] = json!(code);
+                    events.push(json!({"event_type":"run_finished", "data":finished}));
+                    (RunStatus::Failed, Some(message))
+                }
                 Ok(AgenticLoopOutcome::Completed) => {
                     if !loop_state.final_text.is_empty() {
                         events.push(json!({
@@ -8152,6 +8170,13 @@ impl AgenticRunLifecycleService {
                     (RunStatus::Paused, None)
                 }
                 Err(err) => {
+                    if !loop_state.final_text.is_empty() {
+                        events.push(json!({"event_type":"text_done", "data": {
+                            "full_text":loop_state.final_text,
+                            "model_item_id":loop_state.final_text_model_item_id,
+                            "partial":true,
+                        }}));
+                    }
                     let msg = err.to_string();
                     let error_kind = err.kind.as_str();
                     let error_code = classified_terminal_error_code(&err);
@@ -14193,10 +14218,21 @@ impl AgenticRunLifecycleService {
                             .as_str()
                             .to_owned(),
                     ),
+                    Ok(AgenticLoopOutcome::Completed) => state
+                        .interruption
+                        .as_ref()
+                        .map(|interruption| interruption.kind.label().to_owned()),
                     _ => None,
                 };
                 let (mut final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, emitted_events, &state);
+                // The finalizer returns the wait reason for a resumable outcome;
+                // it is not a terminal error message or a Context commit.
+                let (final_waiting_for, error_msg) = if final_status.is_resumable() {
+                    (error_msg, None)
+                } else {
+                    (None, error_msg)
+                };
                 let terminal_recovery_event_ids = merge_terminal_explain_recovery(
                     &mut final_events,
                     terminal_recovery_explain_events,
@@ -14454,6 +14490,7 @@ impl AgenticRunLifecycleService {
                             run.live_tx = None;
                         } else if run.status.try_transition(&final_status).is_ok() {
                             run.status = final_status;
+                            run.waiting_for = final_waiting_for.clone();
                         }
                         if !run.status.is_resumable() {
                             run.live_tx = None;
@@ -14494,28 +14531,35 @@ impl AgenticRunLifecycleService {
                             &[STATUS_RUNNING, STATUS_WAITING]
                         };
                     let mut terminal_persistence_failure = None;
-                    let terminal_result = match context_commit {
-                        Ok(context_commit) => {
-                            persist_ctx
-                                .persist_atomic_terminal_settlement(
-                                    &state,
-                                    terminal_expected_statuses,
-                                    execution_owner_generation,
-                                    persisted_status.as_str(),
-                                    None,
-                                    error_msg.as_deref(),
-                                    (persisted_status == RunStatus::Failed)
-                                        .then_some(terminal_error_code.as_deref())
-                                        .flatten(),
-                                    terminal_error_metadata
-                                        .as_ref()
-                                        .filter(|_| persisted_status == RunStatus::Failed),
-                                    terminal_cancellation_origin,
-                                    context_commit.as_ref(),
-                                )
-                                .await
+                    let is_terminal = durable_run_status_is_terminal(persisted_status.as_str());
+                    let terminal_result = if !is_terminal {
+                        // A paused execution retains its admitted Context base and
+                        // checkpoint custody. C0 belongs only to final outcomes.
+                        Ok(None)
+                    } else {
+                        match context_commit {
+                            Ok(context_commit) => {
+                                persist_ctx
+                                    .persist_atomic_terminal_settlement(
+                                        &state,
+                                        terminal_expected_statuses,
+                                        execution_owner_generation,
+                                        persisted_status.as_str(),
+                                        None,
+                                        error_msg.as_deref(),
+                                        (persisted_status == RunStatus::Failed)
+                                            .then_some(terminal_error_code.as_deref())
+                                            .flatten(),
+                                        terminal_error_metadata
+                                            .as_ref()
+                                            .filter(|_| persisted_status == RunStatus::Failed),
+                                        terminal_cancellation_origin,
+                                        context_commit.as_ref(),
+                                    )
+                                    .await
+                            }
+                            Err(error) => Err(error.to_string()),
                         }
-                        Err(error) => Err(error.to_string()),
                     };
                     match terminal_result {
                         Ok(Some(commit)) => {
@@ -14586,21 +14630,38 @@ impl AgenticRunLifecycleService {
                             }
                             canonical_result = persistence.map(|_| ());
                             if canonical_result.is_ok() {
-                                match run_engine
-                                    .commit_terminal_status_with_events_if_current_owner(
-                                        &bg_user_id,
-                                        &bg_session_id,
-                                        &bg_run_id,
-                                        terminal_expected_statuses,
-                                        execution_owner_generation,
-                                        persisted_status.as_str(),
-                                        None,
-                                        error_msg.as_deref(),
-                                        events_for_transition,
-                                    )
-                                    .await
-                                {
-                                    Ok(TerminalTransitionOutcome::Committed(durable)) => {
+                                let transition = if !is_terminal {
+                                    run_engine.transition_status_with_events_if_current_owner(
+                                        &bg_user_id, &bg_session_id, &bg_run_id,
+                                        terminal_expected_statuses, execution_owner_generation,
+                                        persisted_status.as_str(), final_waiting_for.as_deref(),
+                                        error_msg.as_deref(), events_for_transition,
+                                    ).await.and_then(|committed| {
+                                        committed.then_some(None).ok_or_else(|| "nonterminal settlement lost execution authority".to_string())
+                                    })
+                                } else {
+                                    run_engine
+                                        .commit_terminal_status_with_events_if_current_owner(
+                                            &bg_user_id,
+                                            &bg_session_id,
+                                            &bg_run_id,
+                                            terminal_expected_statuses,
+                                            execution_owner_generation,
+                                            persisted_status.as_str(),
+                                            None,
+                                            error_msg.as_deref(),
+                                            events_for_transition,
+                                        )
+                                        .await
+                                        .map(Some)
+                                };
+                                match transition {
+                                    Ok(None) => {
+                                        durable_status_committed = true;
+                                        streaming_events_committed = persist_streaming_events
+                                            && !streaming_events_for_durable.is_empty();
+                                    }
+                                    Ok(Some(TerminalTransitionOutcome::Committed(durable))) => {
                                         durable_status_committed = true;
                                         owner_terminal_committed = true;
                                         committed_returned_intents = durable
@@ -14615,7 +14676,7 @@ impl AgenticRunLifecycleService {
                                         streaming_events_committed = persist_streaming_events
                                             && !streaming_events_for_durable.is_empty();
                                     }
-                                    Ok(TerminalTransitionOutcome::Superseded(durable)) => {
+                                    Ok(Some(TerminalTransitionOutcome::Superseded(durable))) => {
                                         persist_streaming_events = false;
                                         publish_stream_terminal = false;
                                         if let Some(status) =
@@ -14829,7 +14890,9 @@ impl AgenticRunLifecycleService {
 
                 // Persist usage unconditionally — cancelled runs still consumed tokens
                 // and must have accurate usage in durable store for billing/audit.
-                if (owner_terminal_committed || preexisting_terminal_status.is_some())
+                if (owner_terminal_committed
+                    || preexisting_terminal_status.is_some()
+                    || (durable_status_committed && persisted_status.is_resumable()))
                     && !atomic_terminal_committed
                 {
                     astra_core::log_persist!(
@@ -19520,9 +19583,9 @@ fn server_subrun_outcome_status(
 }
 
 /// Project a loop-level `Completed` outcome into the richer child-result
-/// taxonomy. Structured interruptions are not all pauses: an immediately
-/// resumable cutoff is terminal partial evidence, while an explicit recovery
-/// action remains a durable execution hold.
+/// taxonomy. Recovery advice does not grant durable custody; only a real
+/// debugger pause stays nonterminal. Immediate cutoffs retain terminal partial
+/// evidence for parent aggregation.
 fn server_subrun_completed_agent_status(loop_state: &AgenticLoopState) -> &'static str {
     let Some(interruption) = loop_state.interruption.as_ref() else {
         return STATUS_COMPLETED;
@@ -19536,8 +19599,8 @@ fn server_subrun_completed_agent_status(loop_state: &AgenticLoopState) -> &'stat
         }
         ResumeAction::WaitAndRetry { .. }
         | ResumeAction::RequiresIntervention { .. }
-        | ResumeAction::CompactAndRetry => STATUS_PAUSED,
-        ResumeAction::StartNewSession => STATUS_FAILED,
+        | ResumeAction::CompactAndRetry
+        | ResumeAction::StartNewSession => STATUS_FAILED,
     }
 }
 
@@ -24462,6 +24525,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let classified_error_code = outcome.as_ref().err()
             .filter(|_| projected_status == STATUS_FAILED).map(classified_terminal_error_code);
         let durable_error_code = classified_error_code.as_deref()
+            .or_else(|| loop_state.interruption.as_ref()
+                .filter(|_| durable_status == STATUS_FAILED)
+                .map(|interruption| interruption.kind.label()))
             .or_else(|| server_subrun_durable_error_code(projected_status));
         let error_metadata = outcome.as_ref().err()
             .and_then(astra_services::models::ModelGatewayErrorMetadata::from_error);

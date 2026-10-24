@@ -383,6 +383,11 @@ persistent task. Root startup and cleanup do not load or retire provider-attempt
 WALs. Explicit handoff checkpoints carry the complete verified continuation;
 Run/Context commits and tool-side-effect admission retain their durable owners.
 
+Session metadata does not enable full provider request/response persistence.
+Ordinary Server chat does not automatically publish `llm_capture` artifacts or
+full-exchange local journal records. Explicit artifact publication and optional
+trace capture keep their existing owners and do not govern Run completion.
+
 Process failure can discard in-flight model output and diagnostics. An absent
 usage observation remains unknown and cannot authorize a side effect or establish
 a billing fact. Standalone accounting uses its existing ledger boundary.

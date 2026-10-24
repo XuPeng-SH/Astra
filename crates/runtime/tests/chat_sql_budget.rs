@@ -300,6 +300,14 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         let tool_call_count = readonly_rounds + usize::from(executes_agent);
         let b = bootstrap().await;
         let model = format!("mock-{}", b.ctx.suffix);
+        // Exercise the non-null deployment branch of the actual UNION query.
+        sqlx::query(
+            "UPDATE infra_llm_models SET max_completion_tokens = 1024 WHERE model_name = ?",
+        )
+        .bind(&model)
+        .execute(&b.ctx.pool)
+        .await
+        .unwrap();
         let mut responses = (0..readonly_rounds)
             .map(|round| {
                 answer(
@@ -509,6 +517,50 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         );
         let samples = capture.0.lock().unwrap().take().unwrap();
         let execution_ms = execution_started.elapsed().as_secs_f64() * 1000.0;
+        // Explicit cold-replay verification follows the ordinary request's
+        // complete drain and stopped SQL capture; it is not ordinary execution.
+        let run_id = events
+            .iter()
+            .find(|event| event["type"] == "session_info")
+            .and_then(|event| event["run_id"].as_str())
+            .unwrap();
+        let receipt: String = sqlx::query_scalar(
+            "SELECT terminal_receipt_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&b.ctx.user_id)
+        .bind(run_id)
+        .fetch_one(&b.ctx.pool)
+        .await
+        .unwrap();
+        let receipt: astra_services::runs::CommittedRunTerminalReceipt =
+            serde_json::from_str(&receipt).unwrap();
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/chat/runs/{run_id}/stream?last_index=0&replay_only=true"
+            ))
+            .header("authorization", &b.auth_header)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, replay) = collect_full_sse_stream(&b.ctx.app, request, 30).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{replay}");
+        let replay = parse_sse_events(&replay);
+        let mut accumulated = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+        for event in &replay {
+            astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &format!("data: {}\n\n", serde_json::to_string(event).unwrap()),
+                &mut accumulated,
+                &mut Vec::new(),
+            );
+        }
+        assert!(
+            replay
+                .iter()
+                .any(|event| event["type"] == "usage" && event["usage_scope"] == "run_total")
+        );
+        assert_eq!(accumulated.qualified_usage, receipt.receipt.usage);
+        assert!(accumulated.current_request_usage.is_none());
+
         let control_observation_sql = samples
             .iter()
             .filter(|sample| sample.sql == CONTROL_OBSERVATION_SQL)
@@ -592,6 +644,12 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             "the SQL observer must capture real database work"
         );
         let requests = b.ctx.native_provider_requests().await;
+        assert!(requests.iter().all(|request| {
+            request.body["max_completion_tokens"]
+                .as_u64()
+                .is_some_and(|limit| limit > 0 && limit <= 1024)
+        }));
+        assert_eq!(requests[0].body["max_completion_tokens"], 1024);
         assert_eq!(
             requests.len(),
             tool_call_count + 1 + usize::from(warm_context)

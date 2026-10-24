@@ -414,7 +414,9 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
     state.user_intent = state.message.clone();
     let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
     crate::server::run::lifecycle::tests::assert_empty_recovery_run_finalization(outcome, &state);
-    assert!(state.final_text.contains("unfinished"));
+    assert!(state.final_text.is_empty());
+    assert!(state.interruption.as_ref().is_some_and(|record| record.user_message.contains("unfinished")));
+    assert!(state.messages.iter().all(|message| message["role"] != "assistant"));
     assert_eq!(provider.requests.lock().await.len(), 2);
     assert_eq!(state.qualified_usage.unwrap().input_tokens(), Some(13));
     assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(5));

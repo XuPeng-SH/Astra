@@ -2241,17 +2241,23 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let live_terminal = events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("root terminal");
     let replay_terminal = replay_events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("replayed root terminal");
     assert_eq!(live_terminal["turn_evaluation"], replay_terminal["turn_evaluation"]);
-    let evaluation = astra_turn_core::evaluation::turn_evaluation_from_terminal(
-        &live_terminal["turn_evaluation"], Some(&session), &run_id,
-        live_terminal["owner_generation"].as_u64(), live_terminal["status"].as_str().unwrap(),
-    ).expect("real root evaluation must carry exact authority");
-    assert_eq!(evaluation.producer_scope.unwrap().run_id, run_id);
-    let child_evaluation = child_record.events.iter().find_map(|event| event.pointer("/data/turn_evaluation")).expect("real child terminal evaluation");
-    assert_eq!(child_evaluation["producer_scope"]["run_id"], child_run);
-    assert_eq!(child_evaluation["metadata"]["execution_owner_generation"], child_record.run_generation);
-    astra_turn_core::evaluation::turn_evaluation_from_terminal(
-        child_evaluation, Some(&session), child_run, Some(child_record.run_generation), &child_record.status,
-    ).expect("real child evaluation must carry exact authority");
+    for (terminal, id, generation, status) in [
+        (live_terminal, run_id.as_str(), root_record.run_generation, root_record.status.as_str()),
+        (replay_terminal, run_id.as_str(), root_record.run_generation, root_record.status.as_str()),
+    ] {
+        assert_eq!(terminal["owner_generation"], generation);
+        assert_eq!(terminal["status"], status);
+        if let Some(evaluation) = terminal.get("turn_evaluation") {
+            astra_turn_core::evaluation::turn_evaluation_from_terminal(evaluation, Some(&session), id, Some(generation), status)
+                .expect("optional evaluation must still have exact producer scope");
+        }
+    }
+    assert_eq!(root_record.status, "completed");
+    assert_eq!(child_record.status, "completed");
+    if pool.is_some() {
+        assert!(root_record.terminal_receipt_json.is_some());
+        assert!(child_record.terminal_receipt_json.is_some());
+    }
 
     assert!(
         !find_event_type(&replay_events, "agent_spawned").is_empty(),
@@ -2668,31 +2674,49 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     );
     let (child_replay_status, child_replay) = get_run_stream(&app, child_run_id, 0).await;
     assert_eq!(child_replay_status, StatusCode::OK);
-    let child_terminal_index = child_replay
+    // A readonly read_file is an observation, not durable effect custody.
+    // Verify the callback actually reached the child's next model request;
+    // generic cold tool cards are not a second result store.
+    assert_eq!(find_events(&events, "tool_request").len(), 1);
+    let requests = gateway.requests.lock().await;
+    let evidence_requests: Vec<_> = requests
+        .iter()
+        .filter_map(|request| request.body["messages"].as_array())
+        .filter_map(|messages| {
+            messages.iter().find(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == "call-child-read-file"
+            })
+        })
+        .collect();
+    assert_eq!(
+        evidence_requests.len(),
+        1,
+        "one child round consumes the file callback"
+    );
+    assert_eq!(
+        evidence_requests[0]["content"],
+        "pub fn run() -> Result<()> { Ok(()) }"
+    );
+    drop(requests);
+    let answer_index = child_replay
         .iter()
         .position(|event| {
-            event["type"].as_str() == Some("tool_call_end")
-                && event["call_id"].as_str() == Some(child_call_id.as_str())
+            event["type"] == "text_done"
+                && event["full_text"] == "edge child reviewed concrete file evidence: pub fn run()"
         })
-        .unwrap_or_else(|| panic!("child replay lost its durable tool terminal: {child_replay:?}"));
-    let child_finished_index = child_replay
+        .unwrap_or_else(|| panic!("child replay lost its complete answer: {child_replay:?}"));
+    let finished_index = child_replay
         .iter()
-        .position(|event| event["type"].as_str() == Some("run_finished"))
+        .position(|event| event["type"] == "run_finished")
         .unwrap_or_else(|| panic!("child replay lost run_finished: {child_replay:?}"));
-    assert!(
-        child_terminal_index < child_finished_index,
-        "child tool terminal must commit before run_finished: {child_replay:?}"
-    );
+    assert!(answer_index < finished_index);
+    assert_eq!(child_replay[finished_index]["status"], "completed");
     assert_eq!(
         child_replay
             .iter()
-            .filter(|event| {
-                event["type"].as_str() == Some("tool_call_end")
-                    && event["call_id"].as_str() == Some(child_call_id.as_str())
-            })
+            .filter(|event| event["type"] == "run_finished")
             .count(),
-        1,
-        "child replay must expose exactly one durable terminal occurrence"
+        1
     );
 
     let completed = find_event_type(&events, "agent_completed");
