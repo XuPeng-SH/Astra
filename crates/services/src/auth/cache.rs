@@ -13,9 +13,10 @@ const TTL: Duration = Duration::from_secs(30);
 const MAX_ENTRIES: usize = 1_024;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
-// Reserve more than the maximum bucket allocation, including keys and control
-// bytes. Entry accounting below additionally includes each inline value.
-const CONTAINER_BYTES: usize = MAX_ENTRIES * 2 * (std::mem::size_of::<Entry>() + 64);
+// Remove/insert churn can retain 4096 buckets for 1024 live entries. As in
+// the model cache, reserve keys, values and structural overhead for that
+// allocation, including storage retained by invalidate().
+const CONTAINER_BYTES: usize = MAX_ENTRIES * 4 * (std::mem::size_of::<([u8; 32], Entry)>() + 64);
 
 struct Entry {
     principal: AuthPrincipal,
@@ -218,25 +219,62 @@ mod tests {
 
     #[test]
     fn cache_retention_is_bounded_and_oversized_principals_stay_local() {
-        let cache = AuthenticationCache::default();
-        let expires = chrono::Utc::now().timestamp() + 60;
-        for index in 0..MAX_ENTRIES + 1 {
-            assert!(cache.publish(
-                AuthenticationCache::key(&index.to_string()),
-                0,
-                Instant::now(),
-                expires,
-                &principal()
-            ));
+        for content_bytes in [0, MAX_ENTRY_BYTES / 2] {
+            let cache = Arc::new(AuthenticationCache::default());
+            let expires = chrono::Utc::now().timestamp() + 300;
+            let mut value = principal();
+            value.user.display_name = Some("x".repeat(content_bytes));
+            // Exercise actual remove/insert churn under both the entry and byte
+            // limits, rather than checking the accounting formula against itself.
+            for index in 0..8 * MAX_ENTRIES {
+                assert!(cache.publish(
+                    AuthenticationCache::key(&index.to_string()),
+                    0,
+                    Instant::now(),
+                    expires,
+                    &value
+                ));
+            }
+            let state = cache.0.lock().unwrap();
+            if content_bytes == 0 {
+                assert_eq!(state.entries.len(), MAX_ENTRIES);
+            } else {
+                assert!(state.entries.len() < MAX_ENTRIES);
+            }
+            assert!(CONTAINER_BYTES + state.bytes <= MAX_BYTES);
+            assert_eq!(
+                state.bytes,
+                state
+                    .entries
+                    .values()
+                    .map(|entry| entry.bytes)
+                    .sum::<usize>()
+            );
+            let retained_capacity = state.entries.capacity();
+            drop(state);
+            drop(cache.mutation());
+            let state = cache.0.lock().unwrap();
+            assert!(state.entries.is_empty());
+            assert_eq!(state.bytes, 0);
+            // clear() removes tombstones but retains the bucket allocation.
+            assert!(state.entries.capacity() >= retained_capacity);
+            assert!(state.entries.capacity() <= 4 * MAX_ENTRIES * 7 / 8);
+            let buckets = (state.entries.capacity() * 8).div_ceil(7);
+            assert!(
+                buckets * (std::mem::size_of::<([u8; 32], Entry)>() + 1) + 16 <= CONTAINER_BYTES
+            );
         }
-        let state = cache.0.lock().unwrap();
-        assert_eq!(state.entries.len(), MAX_ENTRIES);
-        assert!(CONTAINER_BYTES + state.bytes <= MAX_BYTES);
-        drop(state);
+        let cache = AuthenticationCache::default();
         let mut large = principal();
         large.user.display_name = Some("x".repeat(MAX_ENTRY_BYTES));
         let key = AuthenticationCache::key("oversized");
-        assert!(cache.publish(key, 0, Instant::now(), expires, &large));
+        assert!(cache.publish(
+            key,
+            0,
+            Instant::now(),
+            chrono::Utc::now().timestamp() + 60,
+            &large
+        ));
         assert!(cache.lookup(&key).0.is_none());
     }
 
