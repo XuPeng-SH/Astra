@@ -256,8 +256,12 @@ their own provider account.
   default selection and a hidden key. Explicit flags and `--api-key-stdin`
   support non-interactive configuration. Custom endpoints reuse the existing
   OpenAI transport; adding user ownership does not create another agent loop.
-- Inference admission revalidates `(user_id, offering_id, is_active)` and
-  decrypts the current credential immediately before provider execution.
+- Inference admission validates `(user_id, offering_id, is_active)` and
+  materializes the route and credential. Server agent Runs reuse that exact
+  admission for at most 30 seconds from its original admission timestamp;
+  configuration-cache hits do not extend it. At the next provider boundary
+  after expiry, owner-scoped revalidation refreshes or rejects the material.
+  Recovery and explicit selection changes require a new admission.
   Server child fanout admits a bounded set of distinct Offerings with batched
   owner-scoped and deployment reads, preserving per-Offering freshness without
   one database round trip per child. The all-or-nothing batch is validated
@@ -1505,13 +1509,16 @@ An extreme mode where prompt and agent state never reach Astra Server requires a
 
 The following boundaries are normative for every inference surface:
 
-1. **Offering admission owns route material.** A run may remember the selected
-   effective Offering ID, but it must not treat a previously decrypted route as
-   authorization for a later provider request. Immediately before each provider
-   request, Server revalidates the Offering and materializes the current route and
-   credential generation. This check occurs per request, never per streamed token.
-   A disabled Offering therefore blocks the next request; credential and endpoint
-   rotation therefore affect the next request without restarting the run.
+1. **Offering admission owns route material.** A Server agent Run may reuse
+   the exact admitted Offering, route and credential for at most 30 seconds from
+   the original admission. Every provider boundary checks that admission clock;
+   resolving a cached configuration or reconstructing a host cannot renew it.
+   After expiry, the next provider boundary performs owner-scoped revalidation:
+   a disabled Offering is rejected, and credential or endpoint rotation refreshes
+   the route without restarting the Run. Recovery and explicit selection changes
+   require new admission. Standalone inference surfaces retain their own fresh
+   request admission; neither a selection-cache hit nor an Offering ID alone
+   authorizes provider execution.
 2. **The existing execution owner controls inference.** Agent calls borrow the
    Run's cancellation, pause, lease-loss and original deadline. They add no
    persistent inference owner or settlement debt. Standalone accounting retains
@@ -1644,7 +1651,9 @@ per-key locks after cancellation. Hash collisions can serialize unrelated cold
 fills; cache hits do not wait for a fill lock. Existing caller deadlines and
 admission budgets still apply. Invalidation clears values without replacing locks
 or cancelling in-flight fills, and is not a cross-Server revocation protocol.
-Provider execution retains its fresh owner-scoped database authorization read.
+The selection cache is not execution authority. Provider execution requires an
+admitted execution; Server agent Runs reuse it only within the original
+30-second admission window, then perform owner-scoped database revalidation.
 
 Prompt-cache identity includes actual provider, upstream model, connection, trust scope, and cache protocol. Per-turn runtime feedback remains outside the stable prompt prefix.
 
