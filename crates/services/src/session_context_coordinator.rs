@@ -2308,7 +2308,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             let admitted = run
                 .opening
                 .as_ref()
-                .and_then(crate::runs::DurableRunOpening::root_context)
+                .and_then(crate::runs::DurableRunOpening::context_authority)
                 .ok_or(SessionContextCoordinatorError::Fenced)?;
             if source != *request.source
                 || source.generation != producer_owner_generation
@@ -2322,7 +2322,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 || run.opening_hash.as_deref() != Some(request.opening_hash)
                 || run.context_admission_hash.as_deref()
                     != Some(source.admission_fingerprint().as_str())
-                || admitted.authority.admission_fingerprint() != source.admission_fingerprint()
+                || admitted.admission_fingerprint() != source.admission_fingerprint()
             {
                 return Err(SessionContextCoordinatorError::Fenced);
             }

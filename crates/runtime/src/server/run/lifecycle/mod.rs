@@ -5586,10 +5586,7 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
         };
         opening
             .ok_or("root Run is missing its immutable opening")?
-            .bind_root_context(astra_services::runs::RunContextOpening {
-                authority: admission.authority.clone(),
-                original_input: self.request.message.clone(),
-            })?;
+            .bind_context_authority(admission.authority.clone(), &self.request.message)?;
         self.admission = Some(admission);
         Ok(())
     }
@@ -22511,6 +22508,7 @@ impl ServerSubRunExecutor {
                 Some(config.agent_profile.agent_id.as_str()),
                 None,
                 crate::server::run::engine::RunStartContext {
+                    original_input: Some(config.task.clone()),
                     collaborator_stage: self
                         .native_execution
                         .as_ref()

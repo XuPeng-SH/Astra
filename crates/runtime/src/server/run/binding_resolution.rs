@@ -310,6 +310,7 @@ pub(crate) fn run_start_context_from_request(
                 .collect()
         });
     RunStartContext {
+        original_input: Some(request.message.clone()),
         initial_execution_contract: None,
         execution_authentication: request.execution_authentication.clone(),
         delegation_authority: crate::orchestration::DelegationAuthority::Allowed,

@@ -538,6 +538,8 @@ impl RunOwnerLeaseHeartbeat {
 /// mode differently from a durable explicit `headless` mode.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStartContext {
+    /// Exact original input, kept outside the bounded opening/status frames.
+    pub original_input: Option<String>,
     pub(crate) delegation_authority: crate::orchestration::DelegationAuthority,
     pub interaction_mode: RequestedTurnInteractionMode,
     pub interactive_client: Option<bool>,
@@ -602,6 +604,7 @@ pub struct RunStartContext {
 impl Default for RunStartContext {
     fn default() -> Self {
         Self {
+            original_input: None,
             interaction_mode: RequestedTurnInteractionMode::Headless,
             interactive_client: None,
             turn_intent_policy: TurnIntentExecutionPolicy::default(),
@@ -2169,8 +2172,15 @@ impl RunEngine {
                 completion_checks,
             ));
         }
+        let mut opening = astra_services::runs::DurableRunOpening::capture(&events)?;
+        if let Some(input) = context.original_input.take() {
+            opening
+                .as_mut()
+                .ok_or("Run input requires an immutable opening")?
+                .bind_input(input)?;
+        }
         let record = DurableRunRecord {
-            opening: None,
+            opening,
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,

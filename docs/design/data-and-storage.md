@@ -390,8 +390,14 @@ conversation or execution occurred.
 
 The immutable Run opening uses two canonical `LONGTEXT` columns on the same
 `agent_runs` row: `opening_events_json` holds admission facts and
-`opening_context_json` holds the optional original input and admitted Context
-base. Each part is stored once, in the same Run INSERT. One opening hash covers
+`opening_context_json` holds the original input and an optional admitted Context
+base. Root and delegated Runs use the same input carrier. Generic creation
+recaptures admission facts, preserves exact input (including an empty string),
+and rejects prebound Context authority; only the Root creation transaction may
+bind its captured Context grant. An input alone never authorizes Context access
+or skips the existing binding checks. The opening uses one v2 schema and hash
+framing, with no historical-data conversion or old-format read path.
+Each part is stored once, in the same Run INSERT. One opening hash covers
 the complete logical value, with an aggregate 8 MiB UTF-8 limit including JSON
 framing. Status, observation and opening replay read the event column directly;
 they do not extract it from a large Context document. Compact metadata reads

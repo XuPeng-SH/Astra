@@ -24640,12 +24640,9 @@ mod tests {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
-                opening.ok_or("missing Run opening")?.bind_root_context(
-                    astra_services::runs::RunContextOpening {
-                        authority: authority.clone(),
-                        original_input: "\n  inspect result\t\n".into(),
-                    },
-                )?;
+                let opening = opening.ok_or("missing Run opening")?;
+                opening.bind_input("\n  inspect result\t\n".into())?;
+                opening.bind_context_authority(authority.clone(), "\n  inspect result\t\n")?;
                 self.authority = Some(authority);
                 Ok(())
             }
@@ -24985,7 +24982,7 @@ mod tests {
                     .opening
                     .as_ref()
                     .unwrap()
-                    .root_context()
+                    .input()
                     .unwrap()
                     .original_input,
                 "\n  inspect result\t\n"
