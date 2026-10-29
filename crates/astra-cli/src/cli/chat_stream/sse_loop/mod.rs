@@ -862,12 +862,16 @@ async fn stream_chat_sse_inner(
         );
         // Callback records are only local observations, never a complete
         // Server ledger, even when their count happens to match a fallback.
-        let tool_outcomes = state.remote_summary.as_ref().and_then(|summary| {
-            crate::cli::stream::streaming_types::canonical_tool_outcomes(
-                summary.tool_ledger_receipt.canonical_aggregate(),
-                tool_calls_count,
-            )
-        });
+        let tool_outcomes = state
+            .remote_summary
+            .as_ref()
+            .filter(|summary| summary.has_complete_tool_ledger())
+            .and_then(|summary| {
+                crate::cli::stream::streaming_types::canonical_tool_outcomes(
+                    summary.tool_ledger_receipt.canonical_aggregate(),
+                    tool_calls_count,
+                )
+            });
         let usage_attribution = UsageAttribution::from_explain_analyze_events(
             &state.telemetry.explain_analyze_events,
             state
@@ -996,6 +1000,7 @@ async fn stream_chat_sse_inner(
     let tool_ledger_aggregate = state
         .remote_summary
         .as_ref()
+        .filter(|summary| summary.has_complete_tool_ledger())
         .map(|summary| summary.tool_ledger_receipt.canonical_aggregate())
         .unwrap_or(
             astra_turn_types::tool_ledger_receipt::ToolLedgerCanonicalAggregate {

@@ -65,22 +65,27 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         ResumeAction::ContinueImmediately,
         InterruptionStateSummary::default(),
     );
-    for (classified, reported_count, callback) in [
-        (false, Some(4), false),
-        (true, Some(4), false),
-        (false, None, false),
-        (true, None, false),
-        (true, Some(4), true),
-        (true, None, true),
-        (false, Some(4), true),
-        (false, None, true),
+    for (classified, reported_count, callback_count, mismatched_summary) in [
+        (false, Some(4), 0, false),
+        (true, Some(4), 0, false),
+        (false, None, 0, false),
+        (true, None, 0, false),
+        (true, Some(4), 1, false),
+        (true, None, 1, false),
+        (false, Some(4), 1, false),
+        (false, None, 1, false),
+        // A lower-bound count must not repair the original receipt mismatch.
+        (false, Some(1), 2, true),
+        (true, Some(1), 2, true),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("evidence.txt");
-        std::fs::write(&path, "local read evidence").unwrap();
+        std::fs::write(&path, "first evidence\nsecond evidence\n").unwrap();
         let callback_done = std::sync::Arc::new(tokio::sync::Notify::new());
         let terminal = if classified {
             serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_kind":"network", "error_code":"network", "error":"connection lost"})
+        } else if mismatched_summary {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"paused"})
         } else {
             serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_code":"execution_incomplete","error_kind":null,"error":interruption.user_message,"interruption":interruption.to_json()})
         };
@@ -99,12 +104,15 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             "execution_deadline_unix_ms":4_102_444_800_000_u64,
             "tool":"read_file", "args":{"path":path.to_str().unwrap()}
         });
-        let prefix = if callback {
-            format!("{prefix}data: {request}\n\n")
-        } else {
-            prefix
-        };
-        let suffix = [
+        let mut prefix = prefix;
+        for index in 0..callback_count {
+            let mut request = request.clone();
+            request["request_id"] = serde_json::json!(format!("read-{index}"));
+            request["args"]["start_line"] = serde_json::json!(index + 1);
+            request["args"]["end_line"] = serde_json::json!(index + 1);
+            prefix.push_str(&format!("data: {request}\n\n"));
+        }
+        let mut suffix = [
             serde_json::json!({"type":"text_done","full_text":"Partial result.","partial":true}),
             usage,
             terminal,
@@ -112,7 +120,30 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         .into_iter()
         .map(|event| format!("data: {event}\n\n"))
         .collect::<String>();
+        if mismatched_summary {
+            let wire = sse_text_response_with_execution_summary(
+                "Partial result.",
+                "partial-session",
+                2,
+                2,
+                &["read_file"],
+                1,
+                ("partial-run", 1),
+            );
+            let mut summary = wire
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|event| event["type"] == "turn_complete")
+                .unwrap();
+            summary["tool_calls_count"] = serde_json::json!(1);
+            summary["execution_state"] = serde_json::json!({"status":"interrupted","interruption_kind":"execution_incomplete"});
+            summary["interruption"] = interruption.to_json();
+            suffix.push_str(&format!("data: {summary}\n\n"));
+        }
+        let callbacks_received = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let notify = callback_done.clone();
+        let callbacks_received = callbacks_received.clone();
         let app =
             Router::new()
                 .route(
@@ -127,7 +158,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                                 Ok::<_, std::io::Error>(prefix)
                             })
                             .chain(futures_util::stream::once(async move {
-                                if callback {
+                                if callback_count > 0 {
                                     tokio::time::timeout(
                                         std::time::Duration::from_secs(5),
                                         notify.notified(),
@@ -145,8 +176,14 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                     "/tools/result",
                     post(move || {
                         let notify = callback_done.clone();
+                        let callbacks_received = callbacks_received.clone();
                         async move {
-                            notify.notify_one();
+                            if callbacks_received.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                + 1
+                                == callback_count
+                            {
+                                notify.notify_one();
+                            }
                             Json(serde_json::json!({"ok":true}))
                         }
                     }),
@@ -168,13 +205,13 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             assert_eq!(failure.partial.partial_text, "Partial result.");
             assert_eq!(
                 failure.partial.tool_calls_count,
-                reported_count.unwrap_or(u32::from(callback))
+                reported_count.unwrap_or(0).max(callback_count)
             );
             assert_eq!(
                 failure.partial.tool_call_records.len(),
-                usize::from(callback)
+                callback_count as usize
             );
-            if callback {
+            if callback_count > 0 {
                 assert!(failure.partial.tool_call_records[0].ok);
             }
             assert!(failure.partial.tool_outcomes.is_none());
@@ -185,15 +222,30 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         assert_eq!(result.full_text, "Partial result.");
         assert_eq!(
             result.tool_calls_count,
-            reported_count.unwrap_or(u32::from(callback))
+            reported_count.unwrap_or(0).max(callback_count)
         );
         assert!(result.canonical_tool_outcomes().is_none());
-        assert_eq!(result.tool_call_records.len(), usize::from(callback));
-        if callback {
+        assert_eq!(result.tool_call_records.len(), callback_count as usize);
+        if callback_count > 0 {
             assert!(result.tool_call_records[0].ok);
         }
         assert!(result.tool_record_coverage_partial);
         assert!(result.interruption.is_some());
+        let mut event = session_journal::JournalEvent::turn(
+            None,
+            1,
+            None,
+            "request",
+            &result.full_text,
+            result.tool_calls_count,
+            0,
+            0,
+            0,
+        )
+        .with_tool_calls(result.tool_call_records.clone());
+        result.apply_canonical_tool_outcomes(&mut event);
+        assert!(event.tool_outcomes.is_none());
+        assert!(event.tool_count.is_none());
     }
 }
 

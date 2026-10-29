@@ -837,11 +837,11 @@ impl StreamResult {
         &self,
         event: &mut astra_services::session_journal::JournalEvent,
     ) {
-        let Some(outcomes) = self.canonical_tool_outcomes() else {
-            return;
-        };
-        event.tool_count = Some(outcomes.executed);
-        event.tool_outcomes = Some(outcomes);
+        // with_tool_calls may have derived totals from a partial Edge detail
+        // window. Replace that inference even when canonical facts are absent.
+        let outcomes = self.canonical_tool_outcomes();
+        event.tool_count = outcomes.as_ref().map(|outcomes| outcomes.executed);
+        event.tool_outcomes = outcomes;
     }
 
     /// User input that should represent this committed turn in durable history.
