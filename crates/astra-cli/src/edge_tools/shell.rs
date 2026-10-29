@@ -5503,7 +5503,9 @@ impl ToolExecutor {
         let requested = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let path = match self.resolve_checked(requested) {
             Ok(path) => path,
-            Err(error) => return astra_tools::ToolResult::error(error),
+            Err(error) => {
+                return astra_tools::ToolResult::error(error).with_execution_not_started();
+            }
         };
         let mut context = self.default_executor.context().clone();
         context.cancel_token = cancel_token.map(|token| std::sync::Arc::new(token.clone()));
@@ -7409,10 +7411,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         let result = executor.list_dir(&serde_json::json!({"path": "/etc"}));
+        assert!(result.is_error);
         assert!(
-            result.contains("SANDBOX_DENIED") || result.contains("Sandbox"),
-            "list_dir outside project should be blocked: {result}"
+            result.output.contains("SANDBOX_DENIED") || result.output.contains("Sandbox"),
+            "list_dir outside project should be blocked: {result:?}"
         );
+        assert_eq!(result.metadata.unwrap()["disposition"], "rejected");
     }
 
     // ── str_replace diff preview ─────────────────────────────────────────────

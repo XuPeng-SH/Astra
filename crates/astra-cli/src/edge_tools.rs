@@ -5151,7 +5151,12 @@ impl ToolExecutor {
                         result.output
                     }
                 }
-                "list_dir" => self.list_dir(args),
+                "list_dir" => {
+                    let result = self.list_dir(args);
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
+                }
                 "grep" => {
                     let result = self.grep(args, cancel_token).await;
                     *source_is_error = Some(result.is_error);
@@ -6276,6 +6281,29 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 #[cfg(test)]
 pub(crate) mod tests {
     use serde_json::{Value, json};
+    #[tokio::test]
+    async fn sandbox_path_refusals_preserve_non_execution_through_dispatch() {
+        let (directory, executor) = temp_executor();
+        executor.set_current_visible_tool_schemas(&all_tool_schemas());
+        std::fs::write(directory.path().join("visible.txt"), "evidence").unwrap();
+        for tool in ["list_dir", "grep"] {
+            let allowed = executor
+                .execute_with_metadata(tool, &serde_json::json!({"path":".", "pattern":"evidence"}))
+                .await;
+            assert!(!allowed.is_error, "{tool}: {allowed:?}");
+            let rejected = executor
+                .execute_with_metadata(
+                    tool,
+                    &serde_json::json!({"path":"/etc", "pattern":"evidence"}),
+                )
+                .await;
+            assert!(rejected.is_error, "{tool}: {rejected:?}");
+            let fields = rejected.tool_result_fields.unwrap();
+            assert_eq!(fields["execution_started"], false);
+            assert_eq!(fields["disposition"], "rejected");
+        }
+    }
+
     #[tokio::test]
     async fn removed_repository_tools_are_not_executable_or_discoverable() {
         let dir = tempfile::tempdir().unwrap();

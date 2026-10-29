@@ -4374,18 +4374,10 @@ async fn execute_server_budgeted(
         .saturating_sub(now_unix_ms)
         .min(request.execution_timeout_ms);
     if remaining_execution_ms == 0 {
-        let mut result = EdgeToolExecResult {
-            work_attribution: request.work_attribution.clone(),
-
-            execution_completion: None,
-            request_id: request.request_id.clone(),
-            tool: request.tool.clone(),
-            args: args.clone(),
-            output: "Server-issued tool execution deadline expired before execution".to_string(),
-            tool_result_fields: None,
-            status: "failed".to_string(),
-            duration_ms: 0,
-        };
+        let mut result = request.rejected_result(
+            args,
+            "Server-issued tool execution deadline expired before execution".into(),
+        );
         settle_unexecuted_server_tool_result(host, &mut result).await;
         return result;
     }
@@ -4418,9 +4410,8 @@ async fn settle_unexecuted_server_tool_result(
     host: &mut CliSseStreamHost<'_>,
     result: &mut EdgeToolExecResult,
 ) {
-    let mut fields =
+    let fields =
         host.tool_result_fields_with_cli_runtime(&result.tool, result.tool_result_fields.take());
-    fields.extend(rejected_tool_result_fields());
     result.tool_result_fields = Some(fields.clone());
     host.edge_tool_round.push(result.clone());
     if let Some(body) = host.tool_result_request(
@@ -4861,16 +4852,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .await;
     }
 
-    fn on_server_tool_surface_admission(
+    async fn on_server_tool_surface_admission(
         &mut self,
         request: &ToolBatchRequest,
-    ) -> Result<(), String> {
+    ) -> Result<(), Box<EdgeToolExecResult>> {
         self.tool_result_identities.insert(
             request.request_id.clone(),
             ToolResultIdentity::from_batch_request(request),
         );
-        self.executor
+        match self
+            .executor
             .accept_server_tool_surface_admission(&request.tool)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let mut result = request.rejected_result(&request.args, error);
+                settle_unexecuted_server_tool_result(self, &mut result).await;
+                Err(Box::new(result))
+            }
+        }
     }
 
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
@@ -12796,7 +12796,9 @@ mod tests {
         ] {
             let mut request = parallel_batch_request("budget", id, "bash", args.clone());
             request.command_timeout_cap_ms = Some(200);
-            host.on_server_tool_surface_admission(&request).unwrap();
+            host.on_server_tool_surface_admission(&request)
+                .await
+                .unwrap();
             let results = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 host.execute_tools_batch(vec![request.clone()]),
@@ -13063,6 +13065,18 @@ mod tests {
                 "read_file",
                 serde_json::json!({"path": "message.txt"}),
             ),
+            parallel_batch_request(
+                "failure",
+                "failure-sandbox-list",
+                "list_dir",
+                serde_json::json!({"path": "/etc"}),
+            ),
+            parallel_batch_request(
+                "failure",
+                "failure-sandbox-grep",
+                "grep",
+                serde_json::json!({"path": "/etc", "pattern": "evidence"}),
+            ),
         ];
         let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
         let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -13082,12 +13096,17 @@ mod tests {
                 .iter()
                 .map(|result| result.status.as_str())
                 .collect::<Vec<_>>(),
-            ["completed", "failed", "completed"]
+            ["completed", "failed", "completed", "failed", "failed"]
         );
         assert!(
             results[2].output.contains("Error: literal file content"),
             "source success wins over rendered error prose"
         );
+        for rejected in &results[3..] {
+            let fields = rejected.tool_result_fields.as_ref().unwrap();
+            assert_eq!(fields["execution_started"], false);
+            assert_eq!(fields["disposition"], "rejected");
+        }
         assert!(
             !cancel.is_cancelled(),
             "one tool failure is not a batch cancellation"
@@ -13638,6 +13657,11 @@ mod tests {
     #[tokio::test]
     async fn cli_sse_host_mirrors_live_state_into_incremental_snapshot() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
@@ -13691,18 +13715,11 @@ mod tests {
                 parallel_batch_request(run, id, "unavailable_tool", serde_json::json!({}));
             request.run_id = run.into();
             request.session_id = "sess-live".into();
-            assert!(host.on_server_tool_surface_admission(&request).is_err());
-            host.on_tool_result(&EdgeToolExecResult {
-                work_attribution: None,
-                execution_completion: None,
-                request_id: id.into(),
-                tool: request.tool,
-                args: request.args,
-                output: "surface rejected".into(),
-                tool_result_fields: None,
-                status: "failed".into(),
-                duration_ms: 0,
-            });
+            let rejected = host
+                .on_server_tool_surface_admission(&request)
+                .await
+                .unwrap_err();
+            host.on_tool_result(&rejected);
         }
         assert_eq!(incremental_state.snapshot().tool_call_records.len(), 1);
         incremental_state.replace_tool_records(Vec::new());
@@ -15383,7 +15400,9 @@ mod tests {
             request.run_id = "skill-scope-run".to_string();
             request.turn_chain_id = "skill-scope-chain".to_string();
             request.admitted_skill_names = scope;
-            host.on_server_tool_surface_admission(&request).unwrap();
+            host.on_server_tool_surface_admission(&request)
+                .await
+                .unwrap();
             let mut settled = host.execute_tools_batch(vec![request.clone()]).await;
             let result = settled.pop().unwrap();
             assert_eq!(

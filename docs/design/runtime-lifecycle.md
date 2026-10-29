@@ -164,6 +164,11 @@ Failed-run usage retains its reported tool count. Missing aggregate result
 classes remain absent from the existing class-count map, rather than measured
 zeros; harness criteria cannot satisfy a zero-failure assertion without an
 observed class count.
+A shared callback transport does not merge parent and child accounting. Rejected
+or expired invocations report non-execution at their owning boundary, including
+local binding admission. Delivery failures retain child-scoped local observations;
+those records do not certify Server settlement or a complete root result. Journal
+diff retains them with incomplete coverage when invocation identity cannot reconcile them.
 
 ## State hierarchy
 

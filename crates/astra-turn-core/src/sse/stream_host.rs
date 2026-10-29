@@ -411,6 +411,26 @@ pub struct ToolBatchRequest {
     pub args: Value,
 }
 
+impl ToolBatchRequest {
+    /// Rejection before execution, retaining the effective invocation arguments.
+    pub fn rejected_result(&self, args: &Value, error: String) -> EdgeToolExecResult {
+        let mut fields = serde_json::Map::new();
+        astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+        EdgeToolExecResult {
+            work_attribution: self.work_attribution.clone(),
+            execution_completion: None,
+            request_id: self.request_id.clone(),
+            tool: self.tool.clone(),
+            args: args.clone(),
+            output: astra_text_utils::credential_redaction::redact_credentials_for_display(&error)
+                .0,
+            tool_result_fields: Some(fields),
+            status: "failed".into(),
+            duration_ms: 0,
+        }
+    }
+}
+
 fn pending_is_coalescible_tool_batch(pending: &[ChatTurnEdgePending]) -> bool {
     !pending.is_empty()
         && pending.iter().all(|item| match item {
@@ -529,11 +549,12 @@ pub trait SseStreamHost: Send {
 
     /// Reconcile the Server's exact wire-schema admission before an Edge
     /// executor applies its local binding, argument, permission and sandbox
-    /// gates. Hosts without a second local tool surface need no action.
-    fn on_server_tool_surface_admission(
+    /// gates. A rejecting host settles the scoped callback before returning its
+    /// observed result. Hosts without a second local tool surface need no action.
+    async fn on_server_tool_surface_admission(
         &mut self,
         _request: &ToolBatchRequest,
-    ) -> Result<(), String> {
+    ) -> Result<(), Box<EdgeToolExecResult>> {
         Ok(())
     }
 
@@ -1723,25 +1744,6 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     tool,
                     args,
                 };
-                if let Err(error) = host.on_server_tool_surface_admission(&request) {
-                    let mut fields = serde_json::Map::new();
-                    astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
-                    let result = EdgeToolExecResult {
-                        work_attribution: request.work_attribution.clone(),
-
-                        execution_completion: None,
-                        request_id: request.request_id,
-                        tool: request.tool,
-                        args: request.args,
-                        output: error,
-                        tool_result_fields: Some(fields),
-                        status: "failed".to_string(),
-                        duration_ms: 0,
-                    };
-                    host.on_tool_result(&result);
-                    tool_results.push(result);
-                    continue;
-                }
                 tool_batch.push(request);
             }
             ChatTurnEdgePending::ApprovalRequired {
@@ -1830,9 +1832,24 @@ async fn flush_pending_via_host<H: SseStreamHost>(
         return;
     }
 
+    // Admission can settle a rejected callback. Resolve approvals first, then
+    // stop at a delivery failure instead of posting for unrelated descendants.
+    let mut admitted = Vec::with_capacity(tool_batch.len());
+    for request in tool_batch {
+        match host.on_server_tool_surface_admission(&request).await {
+            Ok(()) => admitted.push(request),
+            Err(result) => {
+                host.on_tool_result(&result);
+                tool_results.push(*result);
+                if host.should_abort_edge_work() {
+                    return;
+                }
+            }
+        }
+    }
     // Execute tools — the host decides whether to parallelize.
-    if !tool_batch.is_empty() {
-        let results = host.execute_tools_batch(tool_batch).await;
+    if !admitted.is_empty() {
+        let results = host.execute_tools_batch(admitted).await;
         for result in results {
             host.on_tool_result(&result);
             tool_results.push(result);
@@ -3703,17 +3720,19 @@ mod tests {
 
             fn on_stream_complete(&mut self) {}
 
-            fn on_server_tool_surface_admission(
+            async fn on_server_tool_surface_admission(
                 &mut self,
                 request: &ToolBatchRequest,
-            ) -> Result<(), String> {
+            ) -> Result<(), Box<EdgeToolExecResult>> {
                 let tool = request.tool.as_str();
                 self.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(format!("admission:{tool}"));
                 if tool == "blocked" {
-                    Err("tool not admitted".into())
+                    Err(Box::new(
+                        request.rejected_result(&request.args, "tool not admitted".into()),
+                    ))
                 } else {
                     Ok(())
                 }
