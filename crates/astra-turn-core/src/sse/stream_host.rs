@@ -549,12 +549,12 @@ pub trait SseStreamHost: Send {
 
     /// Reconcile the Server's exact wire-schema admission before an Edge
     /// executor applies its local binding, argument, permission and sandbox
-    /// gates. A rejecting host settles the scoped callback before returning its
-    /// observed result. Hosts without a second local tool surface need no action.
-    async fn on_server_tool_surface_admission(
+    /// gates. This reconciliation must not wait on callback delivery or I/O.
+    /// Hosts without a second local tool surface need no action.
+    fn on_server_tool_surface_admission(
         &mut self,
         _request: &ToolBatchRequest,
-    ) -> Result<(), Box<EdgeToolExecResult>> {
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -1744,6 +1744,12 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     tool,
                     args,
                 };
+                if let Err(error) = host.on_server_tool_surface_admission(&request) {
+                    let result = request.rejected_result(&request.args, error);
+                    host.on_tool_result(&result);
+                    tool_results.push(result);
+                    continue;
+                }
                 tool_batch.push(request);
             }
             ChatTurnEdgePending::ApprovalRequired {
@@ -1832,24 +1838,8 @@ async fn flush_pending_via_host<H: SseStreamHost>(
         return;
     }
 
-    // Admission can settle a rejected callback. Resolve approvals first, then
-    // stop at a delivery failure instead of posting for unrelated descendants.
-    let mut admitted = Vec::with_capacity(tool_batch.len());
-    for request in tool_batch {
-        match host.on_server_tool_surface_admission(&request).await {
-            Ok(()) => admitted.push(request),
-            Err(result) => {
-                host.on_tool_result(&result);
-                tool_results.push(*result);
-                if host.should_abort_edge_work() {
-                    return;
-                }
-            }
-        }
-    }
-    // Execute tools — the host decides whether to parallelize.
-    if !admitted.is_empty() {
-        let results = host.execute_tools_batch(admitted).await;
+    if !tool_batch.is_empty() {
+        let results = host.execute_tools_batch(tool_batch).await;
         for result in results {
             host.on_tool_result(&result);
             tool_results.push(result);
@@ -3720,19 +3710,17 @@ mod tests {
 
             fn on_stream_complete(&mut self) {}
 
-            async fn on_server_tool_surface_admission(
+            fn on_server_tool_surface_admission(
                 &mut self,
                 request: &ToolBatchRequest,
-            ) -> Result<(), Box<EdgeToolExecResult>> {
+            ) -> Result<(), String> {
                 let tool = request.tool.as_str();
                 self.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(format!("admission:{tool}"));
                 if tool == "blocked" {
-                    Err(Box::new(
-                        request.rejected_result(&request.args, "tool not admitted".into()),
-                    ))
+                    Err("tool not admitted".into())
                 } else {
                     Ok(())
                 }

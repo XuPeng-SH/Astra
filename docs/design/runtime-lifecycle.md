@@ -166,9 +166,16 @@ zeros; harness criteria cannot satisfy a zero-failure assertion without an
 observed class count.
 A shared callback transport does not merge parent and child accounting. Rejected
 or expired invocations report non-execution at their owning boundary, including
-local binding admission. Delivery failures retain child-scoped local observations;
-those records do not certify Server settlement or a complete root result. Journal
-diff retains them with incomplete coverage when invocation identity cannot reconcile them.
+local binding admission. Delivery failures and unposted binding refusals retain
+child-scoped local observations when stream consumption returns; these records
+certify neither Server settlement nor a complete root result. Local binding
+reconciliation is synchronous, so refusal callbacks cannot delay unrelated
+invocations. The existing unposted-refusal protocol limitation remains: Server
+may wait for its timeout or another terminal boundary. The local marker is not
+crash durability while the stream remains open. Journal diff retains observations
+with incomplete coverage when invocation identity cannot reconcile them.
+Cancellation is checked at dispatch boundaries, including after local approvals
+and earlier callbacks; already-started settlement retains its existing owner.
 
 ## State hierarchy
 

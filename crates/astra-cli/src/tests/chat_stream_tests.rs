@@ -75,7 +75,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         CallbackFailed,
         CallbackFailedWithExpired,
         AdmissionRejected,
-        AdmissionCallbackFailed,
+        AdmissionAndCallbackFailed,
     }
     use Terminal::*;
     for (terminal_kind, reported_count, root_callbacks, child_callbacks) in [
@@ -95,20 +95,23 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         (Interrupted, None, 1, 3),
         (CallbackFailed, None, 0, 2),
         (CallbackFailedWithExpired, None, 0, 2),
-        (AdmissionRejected, Some(0), 0, 1),
-        (AdmissionCallbackFailed, None, 0, 2),
+        (AdmissionRejected, Some(1), 1, 1),
+        (AdmissionAndCallbackFailed, None, 0, 2),
     ] {
         let callback_failed = matches!(
             terminal_kind,
-            CallbackFailed | CallbackFailedWithExpired | AdmissionCallbackFailed
+            CallbackFailed | CallbackFailedWithExpired | AdmissionAndCallbackFailed
         );
-        let admission_rejected =
-            matches!(terminal_kind, AdmissionRejected | AdmissionCallbackFailed);
+        let admission_rejected = matches!(
+            terminal_kind,
+            AdmissionRejected | AdmissionAndCallbackFailed
+        );
         let expired_child = matches!(terminal_kind, CallbackFailedWithExpired);
         let classified = matches!(terminal_kind, Failed);
         let mismatched_summary = matches!(terminal_kind, Mismatched);
         let completed = matches!(terminal_kind, Completed | AdmissionRejected);
-        let callback_count = root_callbacks + child_callbacks;
+        let request_count = root_callbacks + child_callbacks;
+        let callback_count = request_count - u32::from(admission_rejected);
         let temp = tempfile::tempdir().unwrap();
         let _journal_guard = ProcessJournalDirGuard::new(temp.path());
         let path = temp.path().join("evidence.txt");
@@ -141,7 +144,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             "tool":"read_file", "args":{"path":path.to_str().unwrap()}
         });
         let mut prefix = prefix;
-        for index in 0..callback_count {
+        for index in 0..request_count {
             let mut request = request.clone();
             request["request_id"] = serde_json::json!(format!("read-{index}"));
             if index >= root_callbacks {
@@ -158,7 +161,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             if expired_child && index == 1 {
                 request["execution_deadline_unix_ms"] = serde_json::json!(1);
             }
-            if admission_rejected {
+            if admission_rejected && index + 1 == request_count {
                 request["tool"] = serde_json::json!("unavailable_tool");
                 request["args"] = serde_json::json!({});
             }
@@ -281,34 +284,28 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         .await;
         if admission_rejected {
             let bodies = callback_bodies.lock().unwrap();
-            assert_eq!(
-                bodies.len(),
-                1,
-                "no further admission posts after delivery failure"
-            );
-            assert_eq!(bodies[0]["run_id"], "child-run");
+            assert_eq!(bodies.len(), 1, "surface refusal sends no callback");
             assert_eq!(bodies[0]["request_id"], "read-0");
-            assert_eq!(bodies[0]["turn_chain_id"], "partial-chain");
-            assert_eq!(bodies[0]["status"], "failed");
-            assert_eq!(bodies[0]["tool_result_fields"]["execution_started"], false);
-            assert_eq!(bodies[0]["tool_result_fields"]["disposition"], "rejected");
-            if callback_failed {
-                let failure = result.unwrap_err();
-                assert_eq!(failure.partial.tool_calls_count, 0);
-                assert!(failure.partial.tool_call_records.is_empty());
+            if !callback_failed {
+                assert_eq!(bodies[0]["run_id"], "partial-run");
                 let events = session_journal::read_journal("partial-session").unwrap();
-                let observation = events
+                let observations = events
                     .iter()
-                    .find(|event| event.event_type == JournalEventType::SyncMarker)
-                    .unwrap();
+                    .filter(|event| event.event_type == JournalEventType::SyncMarker)
+                    .collect::<Vec<_>>();
+                assert_eq!(observations.len(), 1);
+                let observation = observations[0];
                 let records = observation.tool_calls.as_ref().unwrap();
                 assert_eq!(records.len(), 1);
+                assert_eq!(records[0].tool_call_id.as_deref(), Some("read-1"));
                 assert!(!records[0].was_executed());
+                assert!(records[0].execution_completion.is_none());
                 assert_eq!(
                     observation.producer_scope.as_ref().unwrap().run_id,
                     "child-run"
                 );
-                continue;
+                assert!(observation.tool_count.is_none());
+                assert!(observation.tool_outcomes.is_none());
             }
         }
         if callback_failed {
@@ -329,8 +326,9 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             let records = observation.tool_calls.as_ref().unwrap();
             assert_eq!(records.len(), 2);
             assert!(records[0].ok);
-            assert_eq!(records[1].ok, !expired_child);
-            assert_eq!(records[1].was_executed(), !expired_child);
+            let unexecuted_child = expired_child || admission_rejected;
+            assert_eq!(records[1].ok, !unexecuted_child);
+            assert_eq!(records[1].was_executed(), !unexecuted_child);
             assert!(
                 records[1]
                     .result_full
@@ -338,11 +336,13 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                     .unwrap()
                     .contains(if expired_child {
                         "deadline expired"
+                    } else if admission_rejected {
+                        "unavailable_tool"
                     } else {
                         "second evidence"
                     })
             );
-            // Both reads ran in the batch, but only its first result was posted.
+            // The first executed result was posted; the sibling observation is retained once.
             assert_eq!(
                 callbacks_received.load(std::sync::atomic::Ordering::SeqCst),
                 1
@@ -366,7 +366,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 .unwrap();
             let diff = crate::cli::journal_diff::compute_diff("partial-session", "partial-session")
                 .unwrap();
-            let executed = if expired_child { 1 } else { 2 };
+            let executed = if unexecuted_child { 1 } else { 2 };
             assert_eq!(diff.a_tool_calls_executed, executed);
             assert_eq!(diff.a_tool_sequence, vec!["read_file"; executed as usize]);
             assert!(!diff.a_tool_sequence_complete);
