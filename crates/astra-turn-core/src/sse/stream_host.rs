@@ -1745,6 +1745,9 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     args,
                 };
                 if let Err(error) = host.on_server_tool_surface_admission(&request) {
+                    if host.should_abort_edge_work() {
+                        return;
+                    }
                     let result = request.rejected_result(&request.args, error);
                     host.on_tool_result(&result);
                     tool_results.push(result);

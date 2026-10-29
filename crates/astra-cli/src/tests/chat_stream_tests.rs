@@ -76,6 +76,8 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         CallbackFailedWithExpired,
         AdmissionRejected,
         AdmissionAndCallbackFailed,
+        CancelledDuringCallback,
+        ConflictingIdentities,
     }
     use Terminal::*;
     for (terminal_kind, reported_count, root_callbacks, child_callbacks) in [
@@ -97,21 +99,31 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         (CallbackFailedWithExpired, None, 0, 2),
         (AdmissionRejected, Some(1), 1, 1),
         (AdmissionAndCallbackFailed, None, 0, 2),
+        (CancelledDuringCallback, None, 1, 1),
+        (ConflictingIdentities, None, 1, 3),
     ] {
         let callback_failed = matches!(
             terminal_kind,
-            CallbackFailed | CallbackFailedWithExpired | AdmissionAndCallbackFailed
+            CallbackFailed
+                | CallbackFailedWithExpired
+                | AdmissionAndCallbackFailed
+                | ConflictingIdentities
         );
         let admission_rejected = matches!(
             terminal_kind,
             AdmissionRejected | AdmissionAndCallbackFailed
         );
+        let cancel_during_callback = matches!(terminal_kind, CancelledDuringCallback);
+        let conflicting_identities = matches!(terminal_kind, ConflictingIdentities);
+        let cancellation = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        let callback_cancel = cancellation.clone();
         let expired_child = matches!(terminal_kind, CallbackFailedWithExpired);
         let classified = matches!(terminal_kind, Failed);
         let mismatched_summary = matches!(terminal_kind, Mismatched);
         let completed = matches!(terminal_kind, Completed | AdmissionRejected);
         let request_count = root_callbacks + child_callbacks;
-        let callback_count = request_count - u32::from(admission_rejected);
+        let callback_count =
+            request_count - u32::from(admission_rejected || cancel_during_callback);
         let temp = tempfile::tempdir().unwrap();
         let _journal_guard = ProcessJournalDirGuard::new(temp.path());
         let path = temp.path().join("evidence.txt");
@@ -120,6 +132,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             "first evidence\nsecond evidence\nthird evidence\nfourth evidence\n",
         )
         .unwrap();
+        let child_marker = temp.path().join("cancelled-child-must-not-write");
         let callback_done = std::sync::Arc::new(tokio::sync::Notify::new());
         let terminal = if classified {
             serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_kind":"network", "error_code":"network", "error":"connection lost"})
@@ -149,12 +162,14 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             request["request_id"] = serde_json::json!(format!("read-{index}"));
             if index >= root_callbacks {
                 request["run_id"] = serde_json::json!("child-run");
-                request["session_id"] =
-                    serde_json::json!(if callback_failed || admission_rejected {
-                        "partial-session"
-                    } else {
-                        "child-session"
-                    });
+                request["session_id"] = serde_json::json!(if callback_failed
+                    || admission_rejected
+                    || cancel_during_callback
+                {
+                    "partial-session"
+                } else {
+                    "child-session"
+                });
             }
             request["args"]["start_line"] = serde_json::json!(index + 1);
             request["args"]["end_line"] = serde_json::json!(index + 1);
@@ -164,6 +179,23 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             if admission_rejected && index + 1 == request_count {
                 request["tool"] = serde_json::json!("unavailable_tool");
                 request["args"] = serde_json::json!({});
+            }
+            if cancel_during_callback {
+                if index == 0 {
+                    request["tool"] = serde_json::json!("bash");
+                    request["args"] = serde_json::json!({"command":"printf first"});
+                } else {
+                    request["tool"] = serde_json::json!("write_file");
+                    request["args"] =
+                        serde_json::json!({"path":child_marker, "content":"must not execute"});
+                }
+            }
+            if conflicting_identities {
+                request["request_id"] =
+                    serde_json::json!(["root-x", "child-y", "child-y", "root-x"][index as usize]);
+                request["run_id"] = serde_json::json!(
+                    ["partial-run", "child-a", "child-b", "child-c"][index as usize]
+                );
             }
             prefix.push_str(&format!("data: {request}\n\n"));
         }
@@ -248,11 +280,16 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 .route(
                     "/tools/result",
                     post(move |Json(body): Json<serde_json::Value>| {
+                        let callback_cancel = callback_cancel.clone();
                         let bodies = bodies_for_route.clone();
                         let notify = callback_done.clone();
                         let callbacks_received = received_for_route.clone();
                         async move {
                             bodies.lock().unwrap().push(body);
+                            // Cancel while the first callback is in flight, before its HTTP acknowledgement.
+                            if cancel_during_callback {
+                                callback_cancel.cancel();
+                            }
                             if callbacks_received.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                                 + 1
                                 == callback_count
@@ -270,18 +307,60 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                         }
                     }),
                 );
+        let app = app.route(
+            "/chat/runs/{run_id}",
+            axum::routing::delete(|| async {
+                Json(serde_json::json!({"run_id":"partial-run", "status":"cancelled"}))
+            }),
+        );
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let registry = astra_runtime::skills::empty_unified_registry();
         let context = basic_chat_context(&api, &registry, "review results");
         let mut pm = PermissionManager::new(true);
-        let result = stream_chat_sse(ChatTurnParams::basic_cli(
-            &context,
-            "fake-token",
-            None,
-            &mut pm,
-        ))
-        .await;
+        let mut params = ChatTurnParams::basic_cli(&context, "fake-token", None, &mut pm);
+        if cancel_during_callback {
+            params.cancel_token = Some(cancellation.clone());
+        }
+        let result = stream_chat_sse(params).await;
+        if conflicting_identities {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 0);
+            assert!(failure.partial.tool_call_records.is_empty());
+            assert!(callback_bodies.lock().unwrap().is_empty());
+            let events = session_journal::read_journal("partial-session").unwrap();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.tool_calls.as_ref().is_none_or(Vec::is_empty))
+            );
+            continue;
+        }
+        if cancel_during_callback {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 1);
+            assert_eq!(failure.partial.tool_call_records.len(), 1);
+            assert_eq!(failure.partial.tool_call_records[0].name, "bash");
+            assert!(!child_marker.exists());
+            assert_eq!(callback_bodies.lock().unwrap().len(), 1);
+            let events = session_journal::read_journal("partial-session").unwrap();
+            let observations = events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SyncMarker)
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(
+                observations[0].producer_scope.as_ref().unwrap().run_id,
+                "child-run"
+            );
+            let records = observations[0].tool_calls.as_ref().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].name, "write_file");
+            assert!(!records[0].was_executed());
+            assert!(observations[0].tool_count.is_none());
+            assert!(observations[0].tool_outcomes.is_none());
+            continue;
+        }
         if admission_rejected {
             let bodies = callback_bodies.lock().unwrap();
             assert_eq!(bodies.len(), 1, "surface refusal sends no callback");

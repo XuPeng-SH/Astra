@@ -2147,6 +2147,20 @@ impl<'a> CliSseStreamHost<'a> {
             })
     }
 
+    fn callback_delivery_closed(&self) -> bool {
+        let session_admission_failed = self
+            .request_session_execution_lease
+            .as_ref()
+            .is_some_and(|lease| lease.admit_edge_work().is_err());
+        if session_admission_failed && let Some(cancel_token) = self.cancel_token {
+            cancel_token.cancel();
+        }
+        self.auth_failure
+            || self.callback_failure.is_some()
+            || session_admission_failed
+            || self.cancel_token.is_some_and(|token| token.is_cancelled())
+    }
+
     fn register_tool_result_identity(&mut self, request: &ToolBatchRequest) -> Result<(), String> {
         if self.auth_failure || self.callback_failure.is_some() {
             return Err("Edge callback admission is closed".into());
@@ -4443,7 +4457,7 @@ async fn settle_unexecuted_server_tool_result(
         host.tool_result_fields_with_cli_runtime(&result.tool, result.tool_result_fields.take());
     result.tool_result_fields = Some(fields.clone());
     host.edge_tool_round.push(result.clone());
-    if host.should_abort_edge_work() {
+    if host.callback_delivery_closed() {
         return;
     }
     if let Some(body) = host.tool_result_request(
@@ -4478,16 +4492,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn should_abort_edge_work(&self) -> bool {
-        let session_admission_failed = self
-            .request_session_execution_lease
-            .as_ref()
-            .is_some_and(|lease| lease.admit_edge_work().is_err());
-        if session_admission_failed && let Some(cancel_token) = self.cancel_token {
-            cancel_token.cancel();
-        }
-        self.auth_failure
-            || self.callback_failure.is_some()
-            || session_admission_failed
+        self.callback_delivery_closed()
             || self
                 .effective_tool_cancel_token()
                 .is_some_and(|token| token.is_cancelled())
@@ -8698,10 +8703,10 @@ pub(crate) async fn consume_turn_sse(
             std::mem::take(&mut host.edge_tool_round),
             &result.tool_results,
         );
-        if host.auth_failure || host.callback_failure.is_some() {
+        if abort.is_some() || host.callback_delivery_closed() {
             host.journal_child_callback_observations(
                 &edge_tool_round,
-                "Callback delivery failed; local tool observations, not Server settlement.",
+                "Interrupted callback lane; local tool observations, not Server settlement.",
             );
         } else {
             // The merge appends consumer-only results after the host's records.
@@ -12823,6 +12828,69 @@ mod tests {
             execution_deadline_unix_ms: u64::MAX,
             tool: tool.to_owned(),
             args,
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn local_approval_deadline_preserves_live_callback_settlement() {
+        for approve in [true, false] {
+            let (fixture, _) = ParallelBatchFixture::new().await;
+            let workspace = tempdir().unwrap();
+            let marker = workspace.path().join("approved-command-ran");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut cache = EdgeToolCache::new(8);
+            let mut permissions = crate::cli::permission_manager::PermissionManager::with_project(
+                false,
+                workspace.path(),
+            );
+            let (approval_tx, mut approval_rx) =
+                tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            host.perm_manager = Some(&mut permissions);
+            host.approval_request_tx = Some(approval_tx);
+            let mut request = parallel_batch_request(
+                "approval-deadline",
+                "approval-tool",
+                "bash",
+                serde_json::json!({"command":format!("touch '{}'", marker.display())}),
+            );
+            request.execution_timeout_ms = 2_000;
+            request.command_timeout_cap_ms = Some(2_000);
+            host.on_server_tool_surface_admission(&request).unwrap();
+            let mut execution = Box::pin(host.execute_tools_batch(vec![request.clone()]));
+            let approval = tokio::select! {
+                _ = &mut execution => panic!("command must wait for local approval"),
+                request = approval_rx.recv() => request.unwrap(),
+            };
+            let mut held_response = Some(approval.response_tx);
+            if approve {
+                held_response
+                    .take()
+                    .unwrap()
+                    .send(chat_stream::ApprovalResponse::AllowOnce)
+                    .unwrap();
+            }
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+                .await
+                .unwrap();
+            drop(held_response);
+            assert!(
+                !cancel.is_cancelled(),
+                "an invocation budget does not close the stream"
+            );
+            assert_eq!(marker.exists(), approve);
+            assert_eq!(results[0].status == "completed", approve);
+            if !approve {
+                assert!(
+                    !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(
+                        &results[0]
+                    )
+                    .was_executed()
+                );
+            }
+            fixture.assert_settlements(&[request], &results).await;
+            assert!(host.callback_failure.is_none());
         }
     }
 
