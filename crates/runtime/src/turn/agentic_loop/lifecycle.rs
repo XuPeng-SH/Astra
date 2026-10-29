@@ -5225,6 +5225,11 @@ mod tests {
                 false,
             ),
             ("GOFLAGS=-n go test ./...", false),
+            (
+                "export GOFLAGS=-n && GOWORK=off go test \"${PKGS:-./...}\"",
+                false,
+            ),
+            ("GOFLAGS=\"$FLAGS\" go test \"$PKGS\"", false),
             ("result=$(go test ./...)", false),
             ("cd /tmp && go test ./...", false),
         ] {

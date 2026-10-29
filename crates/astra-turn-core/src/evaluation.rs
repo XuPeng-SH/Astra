@@ -2663,6 +2663,14 @@ fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool)
         return None;
     }
     let has_go_validation = bash_command_has_go_validation(command);
+    // Every Go identity can enter recovery/checkpoint state, including the
+    // ordinary validator path. Never retain sensitive invocation text there.
+    if has_go_validation
+        && (astra_text_utils::credential_redaction::redact_credentials_for_display(command).1 != 0
+            || astra_text_utils::credential_redaction::redaction_marker_status(command).1)
+    {
+        return None;
+    }
     let alternative_status = has_go_validation
         && split_shell_control_segments_with_ops(command)?
             .iter()
@@ -2674,14 +2682,15 @@ fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool)
             // A recognizable but unproven invocation still owns its attempt.
             // Dropping it would preserve older Work proof; using only its tail
             // would wrongly attribute a preparation failure to the validator.
-            (!require_proof
-                && has_go_validation
-                && astra_text_utils::credential_redaction::redact_credentials_for_display(command)
-                    .1
-                    == 0
-                && !astra_text_utils::credential_redaction::redaction_marker_status(command).1)
-                .then(|| command.to_string())
+            (!require_proof && has_go_validation).then(|| command.to_string())
         })?;
+    // A failed prefix reader/output stage may prevent Go from running too.
+    // Use one complete invocation identity for all Go checks, not just scratch.
+    let operation = if has_go_validation {
+        command.to_string()
+    } else {
+        operation
+    };
     let arguments = serde_json::from_str::<serde_json::Value>(args).ok();
     match arguments.as_ref().and_then(|args| args.get("workdir")) {
         None => Some(operation),
@@ -3523,7 +3532,9 @@ fn shell_outer_words(segment: &str) -> Option<Vec<String>> {
         start = offset + body.len() + 1;
     }
     outer.push_str(&segment[start..]);
-    split_static_shell_words(&outer)
+    // Shape recognition must not require static trailing arguments. This
+    // tokenizer does not execute expansions; proof still uses the static lexer.
+    shell_words::split(&outer).ok()
 }
 
 fn shell_assignment(word: &str) -> bool {
@@ -8215,6 +8226,8 @@ mod tests {
         for command in [
             "GOFLAGS=-n; GOWORK=off go test ./...",
             "GOFLAGS=-n && GOWORK=off go test ./... || true",
+            "export GOFLAGS=-n && GOWORK=off go test \"${PKGS:-./...}\"",
+            "GOFLAGS=\"$FLAGS\" go test \"$PKGS\"",
         ] {
             let args = json!({"command":command}).to_string();
             assert_eq!(normalize_validation_prefix("bash", &args), None);
@@ -8269,6 +8282,25 @@ mod tests {
         assert!(!bash_command_has_post_mutation_validation(
             "value=$(cat result) unknown_command"
         ));
+        for command in [
+            "GOWORK=off go test -run password=synthetic-secret-value-123456 ./...",
+            "export GOFLAGS=-n && GOWORK=off go test ./... && echo password=synthetic-secret-value-123456",
+        ] {
+            let args = json!({"command":command}).to_string();
+            assert!(bash_command_has_go_validation(command));
+            assert_eq!(normalize_validation_prefix("bash", &args), None);
+            assert_eq!(normalize_validation_attempt_prefix("bash", &args), None);
+        }
+        let command = "cat /tmp/missing && GOWORK=off go vet ./...";
+        let args = json!({"command":command}).to_string();
+        assert_eq!(
+            normalize_validation_prefix("bash", &args).as_deref(),
+            Some(command)
+        );
+        assert_eq!(
+            normalize_validation_attempt_prefix("bash", &args).as_deref(),
+            Some(command)
+        );
     }
 
     #[test]
@@ -8413,14 +8445,13 @@ mod tests {
         let command =
             "cd /workspace && GOWORK=off go build ./... && GOWORK=off go vet ./... && echo OK";
         let args = serde_json::json!({"command": command}).to_string();
-        let expected = "cd /workspace && GOWORK=off go build ./... && GOWORK=off go vet ./...";
         assert_eq!(
             normalize_validation_attempt_prefix("bash", &args).as_deref(),
-            Some(expected)
+            Some(command)
         );
         assert_eq!(
             normalize_validation_prefix("bash", &args).as_deref(),
-            Some(expected)
+            Some(command)
         );
         assert!(bash_command_has_post_mutation_validation(command));
     }

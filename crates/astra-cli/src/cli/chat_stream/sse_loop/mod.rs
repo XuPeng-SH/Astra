@@ -1032,7 +1032,9 @@ async fn stream_chat_sse_inner(
         tool_record_coverage_partial: state
             .remote_summary
             .as_ref()
-            .is_some_and(|summary| !summary.has_complete_tool_ledger()),
+            .map_or(state.server_terminal_authoritative, |summary| {
+                !summary.has_complete_tool_ledger()
+            }),
         final_messages,
         deferred_tool_activations: state.deferred_tool_activations.clone(),
         run_transcript_messages,

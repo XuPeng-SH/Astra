@@ -56,6 +56,49 @@ fn basic_chat_context<'a>(
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
 #[tokio::test]
+async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
+    use astra_turn_core::interruption::{
+        InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+    };
+    let interruption = InterruptionRecord::new(
+        InterruptionKind::ExecutionIncomplete,
+        ResumeAction::ContinueImmediately,
+        InterruptionStateSummary::default(),
+    );
+    let body = [
+        serde_json::json!({"type":"session_info","session_id":"partial-session","run_id":"partial-run"}),
+        serde_json::json!({"type":"text_done","full_text":"Partial result.","partial":true}),
+        serde_json::json!({"type":"usage","usage_scope":"run_total","input_tokens":12,"output_tokens":3,"tool_call_count":4}),
+        serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed",
+            "error_code":"execution_incomplete","error_kind":null,"error":interruption.user_message,"interruption":interruption.to_json()}),
+    ].into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
+    let app = Router::new().route(
+        "/chat/stream",
+        post(move || {
+            let body = body.clone();
+            async move { (TEST_SSE_HEADERS, body) }
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "review results");
+    let mut pm = PermissionManager::new(true);
+    let result = stream_chat_sse(ChatTurnParams::basic_cli(
+        &context,
+        "fake-token",
+        None,
+        &mut pm,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(result.full_text, "Partial result.");
+    assert_eq!(result.tool_calls_count, 4);
+    assert!(result.tool_record_coverage_partial);
+    assert!(result.interruption.is_some());
+}
+
+#[tokio::test]
 async fn server_admission_cancelled_during_bearer_resolution_never_dispatches_a_new_attempt() {
     use std::sync::{
         Arc,

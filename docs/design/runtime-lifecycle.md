@@ -133,9 +133,11 @@ must not overlap the workspace in either direction; ancestor setup is rejected
 even for a benign mkdir. Shell configuration writes invalidate later validation
 proof with or without scratch preparation. Plain output and static printf
 formats using literal text, `%s` and `%%` remain neutral; variable-writing or
-dynamic formats do not. A recognizable unsafe validation keeps the complete
-invocation as attempt-only identity, so it cannot reuse older Work proof or
-clear a different operation's failure. An explicit verify receipt proves
+dynamic formats do not. Go checks use the complete invocation as identity,
+including any fallible prefix reader or output stage. A recognizable unsafe
+check retains only attempt identity; sensitive text is never retained in an
+identity, and an unrepresentable attempt invalidates older Work proof. Neither
+can clear a different operation's failure. An explicit verify receipt proves
 workspace freshness, but does not override a recognizable Go check's semantics
 or scope. These are invocation receipts under the existing trusted executor
 environment, not a guarantee about inherited tool configuration or test counts.

@@ -6931,6 +6931,21 @@ impl WorkValidationEvidence {
                 &record.name,
                 args,
             ) else {
+                // Sensitive or otherwise unrepresentable attempts must not
+                // preserve older proof. Their failures remain in the tool
+                // outcome ledger; do not copy unsafe text into recovery state.
+                if record.name == "bash"
+                    && super::lifecycle::extract_tool_args(Some(args))
+                        .as_ref()
+                        .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
+                        .is_some_and(astra_turn_core::evaluation::bash_command_has_go_validation)
+                {
+                    saw_validation = true;
+                    validation_is_stale = true;
+                    saw_current_positive_validation = false;
+                    saw_unverified_validation_success = true;
+                    evidence.latest_validation_operation = None;
+                }
                 continue;
             };
             saw_validation = true;
@@ -12279,6 +12294,10 @@ mod tests {
     fn go_work_validation_requires_scoped_success_of_the_same_operation() {
         let chain = "GOWORK=off go build ./... && GOWORK=off go vet ./...";
         for (failed, passed) in [
+            (
+                "cat /tmp/missing && GOWORK=off go vet ./...",
+                "GOWORK=off go vet ./...",
+            ),
             ("GOWORK=off go test ./...", "go test ./..."),
             ("GOWORK=off go test ./...", "GOWORK=off go build ./..."),
             (chain, "GOWORK=off go vet ./..."),
@@ -14415,6 +14434,52 @@ mod tests {
             entry.payload["signal"] == "failed_post_mutation_observation_repair_once"
                 && entry.payload["allowed_action"] == "post_mutation_repair"
         }));
+    }
+
+    #[test]
+    fn sensitive_validation_invalidates_proof_without_entering_recovery_state() {
+        for command in [
+            "GOWORK=off go test -run password=synthetic-secret-value-123456 ./...",
+            "export GOFLAGS=-n && GOWORK=off go test ./... && echo password=synthetic-secret-value-123456",
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            let mut sensitive = validation_record(command, "success");
+            sensitive.runtime_args_full = sensitive.args_full.take();
+            sensitive.workspace_mutation_scope =
+                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+            sensitive.workspace_mutation_receipt = astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+            state.stall.tool_call_records = vec![
+                validation_record("GOWORK=off go test ./...", "success"),
+                sensitive,
+            ];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Stale
+            );
+
+            state.stall.tool_call_records[1].result_class = Some("test_failure".into());
+            state.stall.tool_call_records[1].exit_semantics = Some("domain_negative".into());
+            state.hooks.completion_settlement.completion_action_window =
+                Some(super::super::host::CompletionActionWindow {
+                    action: CompletionAction::PostMutationObservation,
+                    attempts_remaining: 0,
+                    mismatch_corrections_remaining: 0,
+                    consumed: true,
+                    matched: true,
+                });
+            advance_completion_action_window_after_tool_round(&mut state);
+            let checkpoint = serde_json::to_string(&state.hooks.completion_settlement).unwrap();
+            assert!(!checkpoint.contains("synthetic-secret-value"));
+            assert!(
+                state
+                    .volatile_pending
+                    .iter()
+                    .all(|entry| !entry.payload.to_string().contains("synthetic-secret-value"))
+            );
+        }
     }
 
     #[test]

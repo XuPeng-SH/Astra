@@ -286,6 +286,9 @@ pub struct ChatTurnSseAccum {
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     /// `true` only for run totals, never a logical-request retry increment.
     pub usage_is_run_total: bool,
+    /// Attempt count reported by the run-total usage event. Failed terminals
+    /// may have this accounting without a completed-loop execution summary.
+    pub run_total_tool_calls: Option<u32>,
     /// Usage for the most recent physical model request. This is distinct
     /// from aggregate logical-response usage: the latter is useful for
     /// accounting but cannot describe the active context window after a tool
@@ -1655,6 +1658,13 @@ fn apply_one_event(
                     Some(validated)
                 };
             accum.usage_is_run_total = usage_scope == Some("run_total");
+            if accum.usage_is_run_total {
+                accum.run_total_tool_calls = event
+                    .get("tool_call_count")
+                    .or_else(|| nested.and_then(|usage| usage.get("tool_call_count")))
+                    .and_then(Value::as_u64)
+                    .and_then(|count| u32::try_from(count).ok());
+            }
             if matches!(usage_scope, Some("run_total" | "logical_request_total")) {
                 // `/chat/stream` carries the final physical exchange inside
                 // its terminal accounting event.  The run endpoint expands

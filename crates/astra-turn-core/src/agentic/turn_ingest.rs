@@ -172,6 +172,12 @@ pub fn ingest_remote_server_turn<'a>(
         observed.error_kind = Some(error.kind);
     }
     observed.tool_calls = &[];
+    if accum.has_authoritative_failed_terminal()
+        && accum.server_execution_summary.is_none()
+        && let Some(count) = accum.run_total_tool_calls
+    {
+        *st.total_tool_calls = st.total_tool_calls.saturating_add(count);
+    }
     // Error responses still own their partial bytes and model identity.
     // Ordinary ingest intentionally avoids committing them as an assistant
     // message, but they must survive in the returned failure projection.
@@ -544,7 +550,7 @@ mod tests {
                 let mut events = vec![
                     json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
                     json!({"type":"text_done", "full_text":"Preserved partial answer.", "model_item_id":"answer-1", "partial":true}),
-                    json!({"type":"usage", "input_tokens":12, "output_tokens":3}),
+                    json!({"type":"usage", "usage_scope":"run_total", "input_tokens":12, "output_tokens":3, "tool_call_count":4}),
                 ];
                 if with_provisional_error {
                     events.push(json!({"type":"run_error", "run_id":"root", "error_code":"execution_incomplete", "error_kind":null, "error":record.user_message}));
@@ -584,6 +590,7 @@ mod tests {
                 assert_eq!(pack.final_text, "Preserved partial answer.");
                 assert_eq!(pack.final_text_model_item_id.as_deref(), Some("answer-1"));
                 assert_eq!((pack.total_prompt, pack.total_completion), (12, 3));
+                assert_eq!(pack.total_tool_calls, 4);
                 assert!(
                     pack.messages.is_empty(),
                     "ordinary ingest must not commit a completed answer"

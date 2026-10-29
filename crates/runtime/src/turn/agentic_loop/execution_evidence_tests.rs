@@ -96,6 +96,11 @@ async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_
             "success",
         ),
         (
+            "export GOFLAGS=-n && GOWORK=off go test \"${PKGS:-./...}\"",
+            "success",
+            "success",
+        ),
+        (
             "printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
             "success",
             "success",
