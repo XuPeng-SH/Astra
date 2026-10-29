@@ -1724,6 +1724,8 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     args,
                 };
                 if let Err(error) = host.on_server_tool_surface_admission(&request) {
+                    let mut fields = serde_json::Map::new();
+                    astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
                     let result = EdgeToolExecResult {
                         work_attribution: request.work_attribution.clone(),
 
@@ -1732,7 +1734,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                         tool: request.tool,
                         args: request.args,
                         output: error,
-                        tool_result_fields: None,
+                        tool_result_fields: Some(fields),
                         status: "failed".to_string(),
                         duration_ms: 0,
                     };
@@ -3710,7 +3712,11 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(format!("admission:{tool}"));
-                Ok(())
+                if tool == "blocked" {
+                    Err("tool not admitted".into())
+                } else {
+                    Ok(())
+                }
             }
 
             fn on_session_id(&mut self, session_id: &str) {
@@ -3777,6 +3783,24 @@ mod tests {
                 "tool:tr-1".to_string(),
             ]
         );
+        let denied = sse_event(
+            "tool_request",
+            ",\"request_id\":\"tr-2\",\"tool\":\"blocked\",\"args\":{}",
+        );
+        let mut denied_stream = stream::iter(chunks_from_sse(&denied));
+        let (result, abort) = consume_sse_stream(
+            &mut denied_stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
+        assert_eq!(result.tool_results.len(), 1);
+        assert!(
+            !crate::headless_tool_journal::journal_record_edge_tool_result(&result.tool_results[0])
+                .was_executed()
+        );
+        assert_eq!(order.lock().unwrap().last().unwrap(), "admission:blocked");
     }
 
     #[tokio::test]

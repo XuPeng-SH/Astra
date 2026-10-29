@@ -53,14 +53,9 @@ fn approval_unavailable_tool_output(reason: &str) -> String {
 }
 
 fn rejected_tool_result_fields() -> Map<String, Value> {
-    Map::from_iter([
-        ("execution_started".to_string(), Value::Bool(false)),
-        (
-            "disposition".to_string(),
-            serde_json::to_value(ToolCallDisposition::Rejected)
-                .expect("tool disposition must serialize"),
-        ),
-    ])
+    let mut fields = Map::new();
+    astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+    fields
 }
 
 pub(crate) fn agent_control_action(args: &Value) -> Option<&str> {
@@ -3037,6 +3032,7 @@ impl<'a> CliSseStreamHost<'a> {
         for value in tool_result_fields.values_mut() {
             astra_text_utils::credential_redaction::redact_credentials_in_json(value);
         }
+        tool_result_fields.extend(rejected_tool_result_fields());
 
         if self.callback_tool_belongs_to_foreground(&req.request_id)
             && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
@@ -4422,8 +4418,9 @@ async fn settle_unexecuted_server_tool_result(
     host: &mut CliSseStreamHost<'_>,
     result: &mut EdgeToolExecResult,
 ) {
-    let fields =
+    let mut fields =
         host.tool_result_fields_with_cli_runtime(&result.tool, result.tool_result_fields.take());
+    fields.extend(rejected_tool_result_fields());
     result.tool_result_fields = Some(fields.clone());
     host.edge_tool_round.push(result.clone());
     if let Some(body) = host.tool_result_request(
@@ -6497,37 +6494,31 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         });
                     }
                     async move {
-                        if expired_before_start {
-                            return (
-                                crate::edge_tools::ToolExecutionOutcome::error(
-                                    "Server-issued tool execution deadline expired before execution"
-                                        .to_string(),
-                                ),
+                        let unstarted = |message: &str| {
+                            (
+                                crate::edge_tools::ToolExecutionOutcome {
+                                    tool_result_fields: Some(rejected_tool_result_fields()),
+                                    ..crate::edge_tools::ToolExecutionOutcome::error(
+                                        message.to_string(),
+                                    )
+                                },
                                 0u64,
+                            )
+                        };
+                        if expired_before_start {
+                            return unstarted(
+                                "Server-issued tool execution deadline expired before execution",
                             );
                         }
                         if cancel_token_for_tool.is_cancelled() {
-                            return (
-                                crate::edge_tools::ToolExecutionOutcome::error(
-                                    "Cancelled before tool execution started".to_string(),
-                                ),
-                                0u64,
-                            );
+                            return unstarted("Cancelled before tool execution started");
                         }
-                        // Capacity is process-wide, so another session may own every
-                        // permit for an arbitrarily long tool.  Durable cancellation
-                        // must win this wait; otherwise the SSE read-ahead observes the
-                        // terminal but cannot settle this batch until an unrelated
-                        // session releases capacity.
+                        // Cancellation must settle a batch waiting on another
+                        // session's capacity without claiming that its tools ran.
                         let Some(_permit) =
                             acquire_tool_permit_or_cancel(sem, Some(&cancel_token_for_tool)).await
                         else {
-                            return (
-                                crate::edge_tools::ToolExecutionOutcome::error(
-                                    "Cancelled before tool execution acquired capacity".to_string(),
-                                ),
-                                0u64,
-                            );
+                            return unstarted("Cancelled before tool execution acquired capacity");
                         };
                         let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
                             run_id: Some(&run_id),
@@ -13014,6 +13005,10 @@ mod tests {
                     .iter()
                     .all(|result| result.status == "failed" && result.duration_ms == 0)
             );
+            assert!(results.iter().all(|result| {
+                !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result)
+                    .was_executed()
+            }));
             assert!(host.callback_failure.is_none());
             assert_eq!(
                 sem.available_permits(),
@@ -13291,6 +13286,10 @@ mod tests {
             }])
             .await;
         assert_eq!(rejected[0].status, "failed");
+        assert!(
+            !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(&rejected[0])
+                .was_executed()
+        );
         host.on_tool_result(&rejected[0]);
         assert_eq!(incremental.snapshot().tool_call_records.len(), 2);
         assert!(
@@ -13406,6 +13405,12 @@ mod tests {
             serde_json::from_slice(&requests[0].body).expect("json callback");
         assert_eq!(callback["request_id"], "expired-1");
         assert_eq!(callback["status"], "failed");
+        assert_eq!(callback["tool_result_fields"]["disposition"], "rejected");
+        assert_eq!(callback["tool_result_fields"]["execution_started"], false);
+        assert!(
+            !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(&results[0])
+                .was_executed()
+        );
     }
 
     #[serial_test::serial]

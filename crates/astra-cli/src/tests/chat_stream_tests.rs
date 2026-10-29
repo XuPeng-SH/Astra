@@ -73,6 +73,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         Mismatched,
         Completed,
         CallbackFailed,
+        CallbackFailedWithExpired,
     }
     use Terminal::*;
     for (terminal_kind, reported_count, root_callbacks, child_callbacks) in [
@@ -91,8 +92,10 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         (Failed, None, 1, 3),
         (Interrupted, None, 1, 3),
         (CallbackFailed, None, 0, 2),
+        (CallbackFailedWithExpired, None, 0, 2),
     ] {
-        let callback_failed = matches!(terminal_kind, CallbackFailed);
+        let callback_failed = matches!(terminal_kind, CallbackFailed | CallbackFailedWithExpired);
+        let expired_child = matches!(terminal_kind, CallbackFailedWithExpired);
         let classified = matches!(terminal_kind, Failed);
         let mismatched_summary = matches!(terminal_kind, Mismatched);
         let completed = matches!(terminal_kind, Completed);
@@ -142,6 +145,9 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             }
             request["args"]["start_line"] = serde_json::json!(index + 1);
             request["args"]["end_line"] = serde_json::json!(index + 1);
+            if expired_child && index == 1 {
+                request["execution_deadline_unix_ms"] = serde_json::json!(1);
+            }
             prefix.push_str(&format!("data: {request}\n\n"));
         }
         let mut suffix = [
@@ -271,13 +277,19 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             assert!(observation.tool_outcomes.is_none());
             let records = observation.tool_calls.as_ref().unwrap();
             assert_eq!(records.len(), 2);
-            assert!(records.iter().all(|record| record.ok));
+            assert!(records[0].ok);
+            assert_eq!(records[1].ok, !expired_child);
+            assert_eq!(records[1].was_executed(), !expired_child);
             assert!(
                 records[1]
                     .result_full
                     .as_ref()
                     .unwrap()
-                    .contains("second evidence")
+                    .contains(if expired_child {
+                        "deadline expired"
+                    } else {
+                        "second evidence"
+                    })
             );
             // Both reads ran in the batch, but only its first result was posted.
             assert_eq!(
@@ -303,8 +315,9 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 .unwrap();
             let diff = crate::cli::journal_diff::compute_diff("partial-session", "partial-session")
                 .unwrap();
-            assert_eq!(diff.a_tool_calls_executed, 2);
-            assert_eq!(diff.a_tool_sequence, ["read_file", "read_file"]);
+            let executed = if expired_child { 1 } else { 2 };
+            assert_eq!(diff.a_tool_calls_executed, executed);
+            assert_eq!(diff.a_tool_sequence, vec!["read_file"; executed as usize]);
             assert!(!diff.a_tool_sequence_complete);
             let digest = crate::cli::journal_digest::build_digest(
                 "partial-session",
@@ -2486,9 +2499,12 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
                     result.expect_err("completed callback cannot authorize an unfinished run");
                 assert_eq!(failure.partial.partial_text, "MCP done!");
                 assert_eq!(failure.partial.tool_call_records.len(), 1);
-                let outcomes = failure.partial.tool_outcomes.unwrap();
-                assert_eq!(outcomes.executed, 1);
-                assert_eq!(outcomes.succeeded, 1);
+                assert_eq!(failure.partial.tool_calls_count, 1);
+                assert!(failure.partial.tool_call_records[0].ok);
+                assert!(
+                    failure.partial.tool_outcomes.is_none(),
+                    "a callback is not a complete Server ledger"
+                );
                 assert!(
                     !failure
                         .partial
