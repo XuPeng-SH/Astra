@@ -1499,6 +1499,16 @@ pub(crate) fn record_has_typed_workspace_observation_receipt(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
     let args = extract_tool_args(record.authoritative_args_full()).unwrap_or(Value::Null);
+    if record.name == "bash"
+        && astra_turn_core::tool_argument_hints::command_hint_from_args(&args)
+            .is_some_and(astra_turn_core::evaluation::bash_command_has_go_validation)
+        && (record.workspace_mutation_partial == Some(true)
+            || !astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
+            || astra_turn_core::evaluation::normalize_validation_prefix("bash", &args.to_string())
+                .is_none())
+    {
+        return false;
+    }
     let receipt = record
         .workspace_mutation_receipt
         .as_ref()
@@ -2475,6 +2485,13 @@ pub(crate) fn tool_call_can_observe_bound_workspace(
     args: Option<&Value>,
 ) -> bool {
     if name == "bash" {
+        if args
+            .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
+            .is_some_and(astra_turn_core::evaluation::bash_command_has_go_validation)
+        {
+            return args
+                .is_some_and(|args| bash_invocation_has_scoped_workspace_observation(root, args));
+        }
         // This only permits the bounded recovery action to run.  Settlement
         // still requires the executor-produced v2 receipt in the completed
         // record; see `record_can_observe_bound_workspace` below.
@@ -2507,14 +2524,15 @@ pub(crate) fn bash_invocation_has_scoped_workspace_observation(
     let Some(command) = astra_turn_core::tool_argument_hints::command_hint_from_args(args) else {
         return false;
     };
-    if astra_turn_core::evaluation::bash_command_has_go_validation(command)
+    let has_go_validation = astra_turn_core::evaluation::bash_command_has_go_validation(command);
+    if has_go_validation
         && (root.and_then(normalize_absolute_path).is_none()
             || astra_turn_core::evaluation::normalize_validation_prefix("bash", &args.to_string())
                 .is_none())
     {
         return false;
     }
-    if astra_turn_core::evaluation::bash_command_has_go_validation(command) {
+    if has_go_validation {
         let root = root
             .and_then(normalize_absolute_path)
             .expect("checked Go root");
@@ -2543,13 +2561,24 @@ pub(crate) fn record_can_observe_bound_workspace(
     root: Option<&str>,
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
+    let args = extract_tool_args(record.authoritative_args_full());
+    if record.name == "bash"
+        && args
+            .as_ref()
+            .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
+            .is_some_and(astra_turn_core::evaluation::bash_command_has_go_validation)
+        && !args
+            .as_ref()
+            .is_some_and(|args| bash_invocation_has_scoped_workspace_observation(root, args))
+    {
+        return false;
+    }
     // The observer ran on the owner side of the bound workspace.  This typed
     // receipt is the only portable way to carry that fact across Edge→server;
     // do not stat or canonicalize the server's unrelated local path.
     if record_has_typed_workspace_observation_receipt(record) {
         return true;
     }
-    let args = extract_tool_args(record.authoritative_args_full());
     if record.name == "bash" {
         if record.authoritative_args_full().is_some_and(|args| {
             (astra_turn_core::evaluation::normalize_validation_attempt_prefix("bash", args)
@@ -5183,6 +5212,49 @@ mod tests {
             .expect("weak receipt"),
         );
         assert!(!is_authoritative_unchanged_bash_observation_record(&weak));
+    }
+
+    #[test]
+    fn verify_receipt_does_not_replace_go_semantics_or_scope() {
+        for (command, accepted) in [
+            ("GOWORK=off go test ./...", true),
+            ("custom-check-command", true),
+            ("printf -v GOFLAGS %s -n && GOWORK=off go test ./...", false),
+            (
+                "GOFLAGS=$(cat /tmp/flags) && GOWORK=off go test ./...",
+                false,
+            ),
+            ("GOFLAGS=-n go test ./...", false),
+            ("result=$(go test ./...)", false),
+            ("cd /tmp && go test ./...", false),
+        ] {
+            let args = json!({"command":command,"mode":"verify"});
+            let record = ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                runtime_args_full: Some(args.to_string()),
+                result_class: Some("success".into()),
+                exit_semantics: Some("success".into()),
+                workspace_mutation_scope: Some(
+                    astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
+                ),
+                workspace_mutation_receipt:
+                    astra_tools::workspace_observation::explicit_workspace_verification_receipt()
+                        .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD),
+                ..Default::default()
+            };
+            assert_eq!(
+                record_can_observe_bound_workspace(Some("/workspace"), &record),
+                accepted,
+                "{command}"
+            );
+            assert_eq!(
+                tool_call_can_observe_bound_workspace(Some("/workspace"), "bash", Some(&args)),
+                accepted,
+                "{command}"
+            );
+        }
     }
 
     #[test]

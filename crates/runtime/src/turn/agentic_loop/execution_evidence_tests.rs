@@ -49,6 +49,8 @@ async fn run_written_go_verification(
 async fn go_verification_after_write_finishes_without_redundant_observation() {
     for command in [
         "go test ./...",
+        "printf '%s\\n' checking && GOWORK=off go test ./...",
+        "mkdir -p /tmp/astra-cache && printf '%s\\n' checking && GOWORK=off go test ./...",
         "mkdir -p /tmp/astra-cache && go test ./...",
         "mkdir -p /tmp/astra-cache && GOWORK=off go test ./... 2>&1 | tail -10",
         "GOWORK=off go test ./...",
@@ -90,6 +92,26 @@ async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_
         ),
         (
             "export GOFLAGS=-n && GOWORK=off go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "GOFLAGS=$(cat /tmp/flags) && GOWORK=off go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "printf '%5n' GOFLAGS && GOWORK=off go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "mkdir -p /tmp/astra-cache && printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
             "success",
             "success",
         ),

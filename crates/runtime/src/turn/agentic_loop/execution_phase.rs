@@ -12217,6 +12217,65 @@ mod tests {
     }
 
     #[test]
+    fn configuration_changed_validation_cannot_reuse_prior_work_proof() {
+        for command in [
+            "GOFLAGS=-n; GOWORK=off go test ./...",
+            "GOFLAGS=-n && GOWORK=off go test ./... || true",
+            "printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
+            "GOFLAGS=$(cat /tmp/flags) && GOWORK=off go test ./...",
+            "mkdir -p /tmp/astra-cache && printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            for (records, expected) in [
+                (
+                    vec![
+                        validation_record("GOWORK=off go test ./...", "success"),
+                        validation_record(command, "success"),
+                    ],
+                    WorkValidationState::Stale,
+                ),
+                (
+                    vec![
+                        validation_record(command, "test_failure"),
+                        validation_record("GOWORK=off go test ./...", "success"),
+                    ],
+                    WorkValidationState::Failed,
+                ),
+                (
+                    vec![
+                        validation_record(command, "test_failure"),
+                        validation_record(command, "success"),
+                    ],
+                    WorkValidationState::Stale,
+                ),
+            ] {
+                state.stall.tool_call_records = records.into_iter().map(|mut record| {
+                    record.runtime_args_full = record.args_full.clone();
+                    record.workspace_mutation_scope = Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+                    record.workspace_mutation_receipt = astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                        astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+                    ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+                    record
+                }).collect();
+                assert_eq!(
+                    WorkValidationEvidence::collect(&state, true).state,
+                    expected,
+                    "{command}"
+                );
+            }
+            state
+                .stall
+                .tool_call_records
+                .push(validation_record("GOWORK=off go test ./...", "success"));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed
+            );
+        }
+    }
+
+    #[test]
     fn go_work_validation_requires_scoped_success_of_the_same_operation() {
         let chain = "GOWORK=off go build ./... && GOWORK=off go vet ./...";
         for (failed, passed) in [

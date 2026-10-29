@@ -130,8 +130,15 @@ Its entire command remains the operation identity, so a bare check cannot clear
 a failure that may have occurred during setup. Shell configuration changes,
 opaque preparation and concurrent setup do not grant this proof. Scratch paths
 must not overlap the workspace in either direction; ancestor setup is rejected
-even for a benign mkdir. Shell-variable-capable printf stages remain opaque in
-this compound form instead of adding a shell format interpreter.
+even for a benign mkdir. Shell configuration writes invalidate later validation
+proof with or without scratch preparation. Plain output and static printf
+formats using literal text, `%s` and `%%` remain neutral; variable-writing or
+dynamic formats do not. A recognizable unsafe validation keeps the complete
+invocation as attempt-only identity, so it cannot reuse older Work proof or
+clear a different operation's failure. An explicit verify receipt proves
+workspace freshness, but does not override a recognizable Go check's semantics
+or scope. These are invocation receipts under the existing trusted executor
+environment, not a guarantee about inherited tool configuration or test counts.
 Executors enable pipefail for pipelines; commands that may disable that
 setting cannot use the final pipeline stage's success as validation evidence.
 An unchanged Bash fingerprint prevents a false mutation barrier but is not, by
