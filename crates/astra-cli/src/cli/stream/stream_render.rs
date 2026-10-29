@@ -8566,7 +8566,7 @@ pub(crate) async fn consume_turn_sse(
     let idle = stream_idle_timeout();
     let (
         mut sse_result,
-        host_edge_tool_round,
+        edge_tool_round,
         mut md_renderer,
         lines_written,
         auth_failure,
@@ -8621,6 +8621,15 @@ pub(crate) async fn consume_turn_sse(
             })
             .await;
         }
+        // Children share this physical callback lane. Only the foreground run
+        // owns the records used by its completion count and local journal;
+        // child receipts have already been delivered to their Server owner.
+        let mut edge_tool_round = merge_edge_tool_rounds(
+            std::mem::take(&mut host.edge_tool_round),
+            &result.tool_results,
+        );
+        edge_tool_round
+            .retain(|record| host.callback_tool_belongs_to_foreground(&record.request_id));
         let lw = host.render.lines_written;
         let md = host.render.md.take();
         let auth_failure = host.auth_failure;
@@ -8641,7 +8650,7 @@ pub(crate) async fn consume_turn_sse(
         let deferred_token_projection = host.deferred_token_projection.take();
         (
             result,
-            host.edge_tool_round,
+            edge_tool_round,
             md,
             lw,
             auth_failure,
@@ -8673,9 +8682,10 @@ pub(crate) async fn consume_turn_sse(
                 .await;
         let lw = render.lines_written;
         let md = render.md.take();
+        let tool_results = result.tool_results.clone();
         (
             result,
-            Vec::new(),
+            tool_results,
             md,
             lw,
             false,
@@ -8703,7 +8713,6 @@ pub(crate) async fn consume_turn_sse(
             .then(|| sse_result.accum.run_id.clone())
             .flatten()
     });
-    let edge_tool_round = merge_edge_tool_rounds(host_edge_tool_round, &sse_result.tool_results);
 
     let mut result = TurnResult {
         core: sse_result.accum,
