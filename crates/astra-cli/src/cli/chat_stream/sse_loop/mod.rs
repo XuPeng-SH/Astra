@@ -860,6 +860,16 @@ async fn stream_chat_sse_inner(
         let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
             &state.stall.tool_call_records,
         );
+        // Local callback records may cover only a subset of a Server run.
+        // Missing records cannot become a measured zero-failure aggregate.
+        let tool_outcomes = match state.remote_summary.as_ref() {
+            Some(summary) => crate::cli::stream::streaming_types::canonical_tool_outcomes(
+                summary.tool_ledger_receipt.canonical_aggregate(),
+                tool_calls_count,
+            ),
+            None => (tool_outcomes.is_consistent() && tool_outcomes.requested == tool_calls_count)
+                .then_some(tool_outcomes),
+        };
         let usage_attribution = UsageAttribution::from_explain_analyze_events(
             &state.telemetry.explain_analyze_events,
             state
@@ -887,7 +897,7 @@ async fn stream_chat_sse_inner(
                     .as_ref()
                     .map(|summary| summary.llm_rounds),
                 token_usage_coverage: state.token_usage_coverage(),
-                tool_outcomes: Some(tool_outcomes),
+                tool_outcomes,
                 applied_user_intents: state
                     .applied_user_intents
                     .iter()

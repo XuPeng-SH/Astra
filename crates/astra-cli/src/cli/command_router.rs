@@ -3793,7 +3793,9 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
     let classes = partial
         .tool_outcomes
         .as_ref()
-        .filter(|outcomes| outcomes.is_consistent())
+        .filter(|outcomes| {
+            outcomes.is_consistent() && outcomes.requested == partial.tool_calls_count
+        })
         .map(|outcomes| {
             serde_json::json!({
                 "succeeded": outcomes.succeeded,
@@ -5106,6 +5108,16 @@ mod exit_code_tests {
         );
         assert!(json["llm_rounds"].is_null());
         assert!(json["local_continuation"].is_null());
+    }
+
+    #[test]
+    fn failed_remote_run_does_not_invent_tool_result_classes() {
+        let mut failure = accepted_failed_run();
+        failure.partial.tool_calls_count = 4;
+        failure.partial.tool_outcomes = Some(Default::default());
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["tool_calls_count"], 4);
+        assert_eq!(json["tool_result_class_counts"], serde_json::json!({}));
     }
 
     #[test]

@@ -6253,8 +6253,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::ToolResultClassCount { class, min, max } => {
-            if class.trim().is_empty() {
-                return Err("ToolResultClassCount.class must not be empty".into());
+            if serde_json::to_value(
+                astra_turn_types::tool_ledger_receipt::ToolLedgerResultClassCounts::default(),
+            )
+            .map_err(|error| error.to_string())?
+            .get(class)
+            .is_none()
+            {
+                return Err(format!("unknown canonical tool result class: {class}"));
             }
             if min > max {
                 return Err(format!("ToolResultClassCount: min ({min}) > max ({max})"));
@@ -8092,10 +8098,10 @@ mod tests {
     #[test]
     fn tool_result_class_count_criterion() {
         let mut out = RunOutcome::new("m");
-        out.tool_result_class_counts.insert("env_failure".into(), 2);
+        out.tool_result_class_counts.insert("failed".into(), 2);
         let results = evaluate_deterministic(
             &[Criterion::ToolResultClassCount {
-                class: "env_failure".into(),
+                class: "failed".into(),
                 min: 1,
                 max: 2,
             }],
@@ -8112,6 +8118,15 @@ mod tests {
             max: 0,
         }];
         assert!(!evaluate_deterministic(&zero_failures, &missing)[0].passed);
+        assert!(
+            validate_criterion(&Criterion::ToolResultClassCount {
+                class: "execution_error".into(),
+                min: 0,
+                max: 0,
+            })
+            .is_err()
+        );
+        assert!(validate_criterion(&zero_failures[0]).is_ok());
         let mut observed_zero = missing;
         observed_zero
             .tool_result_class_counts

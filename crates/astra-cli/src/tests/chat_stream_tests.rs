@@ -65,37 +65,51 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         ResumeAction::ContinueImmediately,
         InterruptionStateSummary::default(),
     );
-    let body = [
+    for classified in [false, true] {
+        let terminal = if classified {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_kind":"network", "error_code":"network", "error":"connection lost"})
+        } else {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_code":"execution_incomplete","error_kind":null,"error":interruption.user_message,"interruption":interruption.to_json()})
+        };
+        let body = [
         serde_json::json!({"type":"session_info","session_id":"partial-session","run_id":"partial-run"}),
         serde_json::json!({"type":"text_done","full_text":"Partial result.","partial":true}),
         serde_json::json!({"type":"usage","usage_scope":"run_total","input_tokens":12,"output_tokens":3,"tool_call_count":4}),
-        serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed",
-            "error_code":"execution_incomplete","error_kind":null,"error":interruption.user_message,"interruption":interruption.to_json()}),
+        terminal,
     ].into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
-    let app = Router::new().route(
-        "/chat/stream",
-        post(move || {
-            let body = body.clone();
-            async move { (TEST_SSE_HEADERS, body) }
-        }),
-    );
-    let base = spawn_mock(app).await;
-    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = astra_runtime::skills::empty_unified_registry();
-    let context = basic_chat_context(&api, &registry, "review results");
-    let mut pm = PermissionManager::new(true);
-    let result = stream_chat_sse(ChatTurnParams::basic_cli(
-        &context,
-        "fake-token",
-        None,
-        &mut pm,
-    ))
-    .await
-    .unwrap();
-    assert_eq!(result.full_text, "Partial result.");
-    assert_eq!(result.tool_calls_count, 4);
-    assert!(result.tool_record_coverage_partial);
-    assert!(result.interruption.is_some());
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                let body = body.clone();
+                async move { (TEST_SSE_HEADERS, body) }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "review results");
+        let mut pm = PermissionManager::new(true);
+        let result = stream_chat_sse(ChatTurnParams::basic_cli(
+            &context,
+            "fake-token",
+            None,
+            &mut pm,
+        ))
+        .await;
+        if classified {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.partial_text, "Partial result.");
+            assert_eq!(failure.partial.tool_calls_count, 4);
+            assert!(failure.partial.tool_outcomes.is_none());
+            assert!(failure.partial.failed_run_terminal.is_some());
+            continue;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.full_text, "Partial result.");
+        assert_eq!(result.tool_calls_count, 4);
+        assert!(result.tool_record_coverage_partial);
+        assert!(result.interruption.is_some());
+    }
 }
 
 #[tokio::test]

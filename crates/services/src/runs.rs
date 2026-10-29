@@ -34846,6 +34846,7 @@ mod tests {
             error_code: Some("business_failure".into()),
             error_kind: Some(astra_core::ErrorKind::Unknown),
             error_metadata: None,
+            interruption: None,
             context: CanonicalTerminalContext::Unchanged,
             transcript: CanonicalTerminalTranscript {
                 item_count: 0,
@@ -34867,6 +34868,7 @@ mod tests {
             error_code: Some("business_failure"),
             error_kind: Some(astra_core::ErrorKind::Unknown),
             error_metadata: None,
+            interruption: None,
             cancellation_origin: None,
             prompt_tokens: 0,
             completion_tokens: 0,

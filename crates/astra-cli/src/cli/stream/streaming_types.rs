@@ -801,6 +801,27 @@ pub(crate) struct StreamResult {
     pub(crate) applied_user_intents: Vec<AppliedStreamUserIntent>,
 }
 
+pub(crate) fn canonical_tool_outcomes(
+    aggregate: astra_turn_types::tool_ledger_receipt::ToolLedgerCanonicalAggregate,
+    tool_calls_count: u32,
+) -> Option<astra_services::session_journal::ToolOutcomeSummary> {
+    if !aggregate.is_complete_for(tool_calls_count) {
+        return None;
+    }
+    let classes = aggregate.result_classes;
+    let outcomes = astra_services::session_journal::ToolOutcomeSummary {
+        requested: aggregate.attempted,
+        executed: classes.succeeded.saturating_add(classes.failed),
+        succeeded: classes.succeeded,
+        failed: classes.failed,
+        rejected: classes.rejected,
+        reused: classes.reused,
+        suppressed: classes.suppressed,
+        deferred: 0,
+    };
+    outcomes.is_consistent().then_some(outcomes)
+}
+
 impl StreamResult {
     /// Project the complete run-total ledger into the durable journal shape.
     /// Per-call records may be absent or only cover the Edge wrapper for a
@@ -809,22 +830,7 @@ impl StreamResult {
     pub(crate) fn canonical_tool_outcomes(
         &self,
     ) -> Option<astra_services::session_journal::ToolOutcomeSummary> {
-        let aggregate = self.tool_ledger_aggregate;
-        if !aggregate.is_complete_for(self.tool_calls_count) {
-            return None;
-        }
-        let classes = aggregate.result_classes;
-        let outcomes = astra_services::session_journal::ToolOutcomeSummary {
-            requested: aggregate.attempted,
-            executed: classes.succeeded.saturating_add(classes.failed),
-            succeeded: classes.succeeded,
-            failed: classes.failed,
-            rejected: classes.rejected,
-            reused: classes.reused,
-            suppressed: classes.suppressed,
-            deferred: 0,
-        };
-        outcomes.is_consistent().then_some(outcomes)
+        canonical_tool_outcomes(self.tool_ledger_aggregate, self.tool_calls_count)
     }
 
     pub(crate) fn apply_canonical_tool_outcomes(

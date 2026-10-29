@@ -12276,6 +12276,33 @@ mod tests {
     }
 
     #[test]
+    fn quoted_output_keeps_completed_work_validation_current() {
+        for command in [
+            r#"echo '<<' "$PWD""#,
+            r#"echo '`literal`' "$PWD""#,
+            r#"echo '# literal' "$PWD""#,
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            let mut observation = validation_record(command, "success");
+            observation.workspace_mutation_scope =
+                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+            observation.workspace_mutation_receipt = astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+            state.stall.tool_call_records = vec![
+                validation_record("GOWORK=off go test ./...", "success"),
+                observation,
+            ];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn go_work_validation_requires_scoped_success_of_the_same_operation() {
         let chain = "GOWORK=off go build ./... && GOWORK=off go vet ./...";
         for (failed, passed) in [

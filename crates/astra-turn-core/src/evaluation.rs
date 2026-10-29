@@ -2434,12 +2434,12 @@ fn command_substitution_end(command: &str, open_index: usize) -> Option<(usize, 
             index += 1;
             continue;
         }
-        if byte == b'\\' {
+        if byte == b'\\' && quote != Some(b'\'') {
             escaped = true;
             index += 1;
             continue;
         }
-        if byte == b'`' {
+        if byte == b'`' && quote != Some(b'\'') {
             return None;
         }
         if let Some(active_quote) = quote {
@@ -2532,7 +2532,7 @@ fn top_level_shell_delimiters(
             index += 1;
             continue;
         }
-        if byte == b'\\' {
+        if byte == b'\\' && quote != Some(b'\'') {
             escaped = true;
             index += 1;
             continue;
@@ -3638,10 +3638,7 @@ fn observation_wrapper_prefix(segment: &str) -> bool {
 /// escapes, and nested parentheses. `None` means an unterminated `$()` was
 /// found; an empty vector means the segment has no command substitutions.
 fn command_substitution_bodies(command: &str) -> Option<Vec<&str>> {
-    if command.len() > MAX_NESTED_SHELL_SCAN_BYTES
-        || command.contains('`')
-        || command.contains("<<")
-    {
+    if command.len() > MAX_NESTED_SHELL_SCAN_BYTES {
         return None;
     }
     let bytes = command.as_bytes();
@@ -3656,14 +3653,19 @@ fn command_substitution_bodies(command: &str) -> Option<Vec<&str>> {
             index += 1;
             continue;
         }
-        if byte == b'\\' {
+        if byte == b'\\' && quote != Some(b'\'') {
             escaped = true;
             index += 1;
             continue;
         }
-        if byte == b'#' && shell_comment_starts(bytes, index) {
+        if quote.is_none() && byte == b'#' && shell_comment_starts(bytes, index) {
             index = shell_comment_end(bytes, index);
             continue;
+        }
+        if (byte == b'`' && quote != Some(b'\''))
+            || (quote.is_none() && bytes.get(index..index + 2) == Some(b"<<"))
+        {
+            return None;
         }
         if let Some(active_quote) = quote {
             // `$()` is evaluated inside double quotes, but not inside single
