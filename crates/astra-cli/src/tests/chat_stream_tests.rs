@@ -76,7 +76,6 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         (false, None, 1, false),
         // A lower-bound count must not repair the original receipt mismatch.
         (false, Some(1), 2, true),
-        (true, Some(1), 2, true),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("evidence.txt");
@@ -137,6 +136,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 .find(|event| event["type"] == "turn_complete")
                 .unwrap();
             summary["tool_calls_count"] = serde_json::json!(1);
+            summary["observation_tool_calls_count"] = serde_json::json!(1);
             summary["execution_state"] = serde_json::json!({"status":"interrupted","interruption_kind":"execution_incomplete"});
             summary["interruption"] = interruption.to_json();
             suffix.push_str(&format!("data: {summary}\n\n"));
@@ -225,6 +225,9 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             reported_count.unwrap_or(0).max(callback_count)
         );
         assert!(result.canonical_tool_outcomes().is_none());
+        if mismatched_summary {
+            assert_eq!(result.llm_rounds, Some(1));
+        }
         assert_eq!(result.tool_call_records.len(), callback_count as usize);
         if callback_count > 0 {
             assert!(result.tool_call_records[0].ok);

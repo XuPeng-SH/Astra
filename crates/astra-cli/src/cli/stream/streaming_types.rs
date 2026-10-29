@@ -640,9 +640,15 @@ pub(crate) fn apply_partial_turn_data_to_error_event(
     if partial.cache_creation_tokens > 0 {
         event.cache_creation_tokens = Some(partial.cache_creation_tokens);
     }
-    if partial.tool_calls_count > 0 {
-        event.tool_count = Some(partial.tool_calls_count);
-    }
+    // The CLI count is attempted calls (possibly a lower bound); the journal
+    // count means executed calls. Only qualified outcomes can bridge them.
+    event.tool_outcomes = partial.tool_outcomes.clone().filter(|outcomes| {
+        outcomes.is_consistent() && outcomes.requested == partial.tool_calls_count
+    });
+    event.tool_count = event
+        .tool_outcomes
+        .as_ref()
+        .map(|outcomes| outcomes.executed);
     if !partial.tools_used.is_empty() {
         event.tools_used = Some(partial.tools_used.clone());
     }
@@ -1643,7 +1649,8 @@ mod tests {
 
         apply_partial_turn_data_to_error_event(&mut event, &partial);
 
-        assert_eq!(event.tool_count, Some(1));
+        assert!(event.tool_count.is_none());
+        assert!(event.tool_outcomes.is_none());
         assert_eq!(
             event.tools_used.as_deref(),
             Some(&["read_file".to_string()][..])
