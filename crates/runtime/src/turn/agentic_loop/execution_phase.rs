@@ -6931,21 +6931,6 @@ impl WorkValidationEvidence {
                 &record.name,
                 args,
             ) else {
-                // Sensitive or otherwise unrepresentable attempts must not
-                // preserve older proof. Their failures remain in the tool
-                // outcome ledger; do not copy unsafe text into recovery state.
-                if record.name == "bash"
-                    && super::lifecycle::extract_tool_args(Some(args))
-                        .as_ref()
-                        .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
-                        .is_some_and(astra_turn_core::evaluation::bash_command_has_go_validation)
-                {
-                    saw_validation = true;
-                    validation_is_stale = true;
-                    saw_current_positive_validation = false;
-                    saw_unverified_validation_success = true;
-                    evidence.latest_validation_operation = None;
-                }
                 continue;
             };
             saw_validation = true;
@@ -14440,6 +14425,11 @@ mod tests {
     fn sensitive_validation_invalidates_proof_without_entering_recovery_state() {
         for command in [
             "GOWORK=off go test -run password=synthetic-secret-value-123456 ./...",
+            "GOWORK=off go test -run '<<password=synthetic-secret-value-123456' ./...",
+            &format!(
+                "GOFLAGS=-n go test -run '{}' \"$PKGS\"",
+                "x".repeat(16 * 1024)
+            ),
             "export GOFLAGS=-n && GOWORK=off go test ./... && echo password=synthetic-secret-value-123456",
         ] {
             let mut state = make_state();
@@ -14478,6 +14468,30 @@ mod tests {
                     .volatile_pending
                     .iter()
                     .all(|entry| !entry.payload.to_string().contains("synthetic-secret-value"))
+            );
+            state.stall.tool_call_records.push(validation_record(
+                "GOWORK=off go test -run TestOther ./...",
+                "success",
+            ));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Failed
+            );
+            state
+                .stall
+                .tool_call_records
+                .push(validation_record(command, "success"));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Stale
+            );
+            state
+                .stall
+                .tool_call_records
+                .push(validation_record("GOWORK=off go test ./...", "success"));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed
             );
         }
     }

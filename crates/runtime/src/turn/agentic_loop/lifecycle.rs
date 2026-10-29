@@ -5225,6 +5225,9 @@ mod tests {
                 false,
             ),
             ("GOFLAGS=-n go test ./...", false),
+            ("GOFLAGS=-n go test -run '<<' ./...", false),
+            ("GOFLAGS=-n go test -run '`' ./...", false),
+            ("GOWORK=off go test -n ./... && cargo test", false),
             (
                 "export GOFLAGS=-n && GOWORK=off go test \"${PKGS:-./...}\"",
                 false,
@@ -5232,7 +5235,16 @@ mod tests {
             ("GOFLAGS=\"$FLAGS\" go test \"$PKGS\"", false),
             ("result=$(go test ./...)", false),
             ("cd /tmp && go test ./...", false),
-        ] {
+        ]
+        .into_iter()
+        .map(|(command, accepted)| (command.to_string(), accepted))
+        .chain(std::iter::once((
+            format!(
+                "GOFLAGS=-n go test -run '{}' \"$PKGS\"",
+                "x".repeat(16 * 1024)
+            ),
+            false,
+        ))) {
             let args = json!({"command":command,"mode":"verify"});
             let record = ToolCallRecord {
                 name: "bash".into(),

@@ -100,6 +100,12 @@ async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_
             "success",
             "success",
         ),
+        ("GOFLAGS=-n go test -run '<<' ./...", "success", "success"),
+        (
+            "GOWORK=off go test -n ./... && cargo test",
+            "success",
+            "success",
+        ),
         (
             "printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
             "success",

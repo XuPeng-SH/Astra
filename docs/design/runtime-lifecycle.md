@@ -135,9 +135,11 @@ proof with or without scratch preparation. Plain output and static printf
 formats using literal text, `%s` and `%%` remain neutral; variable-writing or
 dynamic formats do not. Go checks use the complete invocation as identity,
 including any fallible prefix reader or output stage. A recognizable unsafe
-check retains only attempt identity; sensitive text is never retained in an
-identity, and an unrepresentable attempt invalidates older Work proof. Neither
-can clear a different operation's failure. An explicit verify receipt proves
+check retains only attempt identity. Sensitive or unscannable invocations reuse
+the existing opaque exact-argument identity, so failures remain debts without
+copying credentials into recovery state. Only an exact retry can resolve that
+debt; an unproven success still needs a separate eligible validation. An
+inconclusive scan cannot grant generic verify authority. An explicit verify receipt proves
 workspace freshness, but does not override a recognizable Go check's semantics
 or scope. These are invocation receipts under the existing trusted executor
 environment, not a guarantee about inherited tool configuration or test counts.
@@ -155,6 +157,10 @@ reasons remain in the owning checkpoint and trace. Clients accept this partial
 closure only when the failed terminal, root identity, generation and interruption
 agree. Missing or conflicting evidence and actual classified errors retain the
 normal failure path.
+Failed-run usage retains its reported tool count. Missing aggregate result
+classes remain absent from the existing class-count map, rather than measured
+zeros; harness criteria cannot satisfy a zero-failure assertion without an
+observed class count.
 
 ## State hierarchy
 

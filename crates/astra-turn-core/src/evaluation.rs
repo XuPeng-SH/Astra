@@ -1008,11 +1008,7 @@ fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
         // working directories and other arguments that distinguish targets.
         // Without an authoritative target binding, preserve the full request
         // identity rather than clearing an unrelated verification failure.
-        return Some(format!(
-            "tool::{}::args::{}",
-            record.name,
-            hash_bounded_key(&crate::stall::canonical_tool_args(args))
-        ));
+        return Some(operation_args_identity(&record.name, args));
     }
 
     let preview = record.args_preview.as_deref().unwrap_or("").trim();
@@ -1030,6 +1026,13 @@ fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(|id| format!("tool::{}::call::{}", record.name, hash_bounded_key(id)))
+}
+
+fn operation_args_identity(name: &str, args: &str) -> String {
+    format!(
+        "tool::{name}::args::{}",
+        hash_bounded_key(&crate::stall::canonical_tool_args(args))
+    )
 }
 
 fn unresolved_tool_outcome_failure_counts(
@@ -2650,7 +2653,10 @@ pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
 /// A failed validator-shaped invocation retains debt even when its arguments
 /// cannot prove that a successful invocation actually validated the project.
 pub fn normalize_validation_attempt_prefix(name: &str, args: &str) -> Option<String> {
-    normalize_validation_prefix_kind(name, args, false)
+    normalize_validation_prefix_kind(name, args, false).or_else(|| {
+        (name == "bash" && bash_command_has_go_validation(&bash_command_text(args)))
+            .then(|| operation_args_identity(name, args))
+    })
 }
 
 fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool) -> Option<String> {
@@ -2662,12 +2668,15 @@ fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool)
     if command.is_empty() {
         return None;
     }
-    let has_go_validation = bash_command_has_go_validation(command);
+    let scan = has_go_validation(command, 0);
+    let has_go_validation = scan != Some(false);
     // Every Go identity can enter recovery/checkpoint state, including the
     // ordinary validator path. Never retain sensitive invocation text there.
-    if has_go_validation
-        && (astra_text_utils::credential_redaction::redact_credentials_for_display(command).1 != 0
-            || astra_text_utils::credential_redaction::redaction_marker_status(command).1)
+    if scan.is_none()
+        || (has_go_validation
+            && (astra_text_utils::credential_redaction::redact_credentials_for_display(command).1
+                != 0
+                || astra_text_utils::credential_redaction::redaction_marker_status(command).1))
     {
         return None;
     }
@@ -3004,38 +3013,47 @@ fn go_validation_candidate(segment: &str) -> Option<ValidationCandidate> {
 }
 
 /// Recognize a Go validation stage independently of whether its surrounding
-/// invocation is eligible to prove completion.
+/// invocation is eligible to prove completion. An inconclusive bounded scan
+/// also requires the strict validation path; it must not grant a generic
+/// verify receipt authority by pretending that no validator was present.
 pub fn bash_command_has_go_validation(command: &str) -> bool {
-    has_go_validation(command, 0)
+    has_go_validation(command, 0).unwrap_or(true)
 }
 
-fn has_go_validation(command: &str, depth: usize) -> bool {
+fn has_go_validation(command: &str, depth: usize) -> Option<bool> {
     if depth >= MAX_NESTED_SHELL_DEPTH {
-        return false;
+        return None;
     }
-    split_shell_control_segments_with_ops(command).is_some_and(|controls| {
-        controls.iter().any(|(segment, _)| {
-            split_top_level_pipeline_segments(segment).is_some_and(|parts| {
-                parts.iter().any(|part| {
-                    let part = part.trim();
-                    let part = part
-                        .strip_suffix("2>&1")
-                        .or_else(|| part.strip_suffix("1>&2"))
-                        .unwrap_or(part)
-                        .trim();
-                    shell_outer_words(part).is_some_and(|words| {
-                        let mut command = words.iter().skip_while(|word| shell_assignment(word));
-                        command.next().is_some_and(|word| word.as_str() == "go")
-                            && command.next().is_some_and(|word| {
-                                matches!(word.as_str(), "test" | "build" | "vet")
-                            })
-                    }) || command_substitution_bodies(part).is_some_and(|bodies| {
-                        bodies.iter().any(|body| has_go_validation(body, depth + 1))
-                    })
-                })
-            })
-        })
-    })
+    for (segment, _) in split_shell_control_segments_with_ops(command)? {
+        for part in split_top_level_pipeline_segments(segment)? {
+            let part = part.trim();
+            let part = part
+                .strip_suffix("2>&1")
+                .or_else(|| part.strip_suffix("1>&2"))
+                .unwrap_or(part)
+                .trim();
+            let (words, literal) = match split_static_shell_words(part) {
+                Some(words) => (words, true),
+                None => (shell_outer_words(part)?, false),
+            };
+            let mut command = words.iter().skip_while(|word| shell_assignment(word));
+            if command.next().is_some_and(|word| word.as_str() == "go")
+                && command
+                    .next()
+                    .is_some_and(|word| matches!(word.as_str(), "test" | "build" | "vet"))
+            {
+                return Some(true);
+            }
+            if !literal {
+                for body in command_substitution_bodies(part)? {
+                    if has_go_validation(body, depth + 1)? {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+    }
+    Some(false)
 }
 
 fn normalized_validation_segment(segment: &str, original: &str) -> Option<ValidationCandidate> {
@@ -3249,6 +3267,9 @@ fn bash_command_post_mutation_validation_prefix_kind(
             break;
         }
         if pipeline_blocked {
+            if require_proof && has_go_validation {
+                return None;
+            }
             latest.clear();
             has_validator = false;
             opaque_predecessor = true;
@@ -3270,6 +3291,9 @@ fn bash_command_post_mutation_validation_prefix_kind(
         if matches!(op_after, ShellControlOp::Or)
             || (matches!(op_after, ShellControlOp::Sequence) && sequence_has_rhs)
         {
+            if require_proof && has_go_validation && has_validator {
+                return None;
+            }
             latest.clear();
             has_validator = false;
         }
@@ -8228,6 +8252,8 @@ mod tests {
             "GOFLAGS=-n && GOWORK=off go test ./... || true",
             "export GOFLAGS=-n && GOWORK=off go test \"${PKGS:-./...}\"",
             "GOFLAGS=\"$FLAGS\" go test \"$PKGS\"",
+            "GOFLAGS=-n go test -run '<<' ./...",
+            "GOWORK=off go test -n ./... && cargo test",
         ] {
             let args = json!({"command":command}).to_string();
             assert_eq!(normalize_validation_prefix("bash", &args), None);
@@ -8284,12 +8310,15 @@ mod tests {
         ));
         for command in [
             "GOWORK=off go test -run password=synthetic-secret-value-123456 ./...",
+            "GOWORK=off go test -run '<<password=synthetic-secret-value-123456' ./...",
             "export GOFLAGS=-n && GOWORK=off go test ./... && echo password=synthetic-secret-value-123456",
         ] {
             let args = json!({"command":command}).to_string();
             assert!(bash_command_has_go_validation(command));
             assert_eq!(normalize_validation_prefix("bash", &args), None);
-            assert_eq!(normalize_validation_attempt_prefix("bash", &args), None);
+            let identity = normalize_validation_attempt_prefix("bash", &args).unwrap();
+            assert_eq!(identity, operation_args_identity("bash", &args));
+            assert!(!identity.contains("synthetic-secret-value"));
         }
         let command = "cat /tmp/missing && GOWORK=off go vet ./...";
         let args = json!({"command":command}).to_string();
@@ -8301,6 +8330,17 @@ mod tests {
             normalize_validation_attempt_prefix("bash", &args).as_deref(),
             Some(command)
         );
+        let oversized = format!(
+            "GOFLAGS=-n go test -run '{}' \"$PKGS\"",
+            "x".repeat(MAX_NESTED_SHELL_SCAN_BYTES)
+        );
+        let args = json!({"command":oversized}).to_string();
+        assert!(bash_command_has_go_validation(&oversized));
+        assert!(normalize_validation_prefix("bash", &args).is_none());
+        assert_eq!(
+            normalize_validation_attempt_prefix("bash", &args),
+            Some(operation_args_identity("bash", &args))
+        );
     }
 
     #[test]
@@ -8311,6 +8351,7 @@ mod tests {
             "go vet ./...",
             "GOWORK=off go test ./...",
             "GOWORK='off' go vet ./...",
+            "set -e; GOWORK=off go test ./...",
         ] {
             let args = serde_json::json!({"command": command}).to_string();
             assert_eq!(
@@ -8467,7 +8508,10 @@ mod tests {
             );
         }
         let sensitive = serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "password=synthetic-secret-value-123456"}).to_string();
-        assert!(normalize_validation_attempt_prefix("bash", &sensitive).is_none());
+        assert_eq!(
+            normalize_validation_attempt_prefix("bash", &sensitive),
+            Some(operation_args_identity("bash", &sensitive))
+        );
         for (first, second) in [
             (
                 serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/a"}),

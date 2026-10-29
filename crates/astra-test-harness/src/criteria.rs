@@ -2717,17 +2717,16 @@ fn evaluate_one_with_primary_cache(
             }
         }
         Criterion::ToolResultClassCount { class, min, max } => {
-            let count = outcome
-                .tool_result_class_counts
-                .get(class)
-                .copied()
-                .unwrap_or(0);
-            let pass = count >= *min && count <= *max;
+            let count = outcome.tool_result_class_counts.get(class).copied();
+            let pass = count.is_some_and(|count| count >= *min && count <= *max);
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
-                detail: format!("tool_result_class_count[{class}]={count}, expected {min}..={max}"),
+                detail: format!(
+                    "tool_result_class_count[{class}]={}, expected {min}..={max}",
+                    count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+                ),
                 full_detail: None,
                 score: None,
             }
@@ -8103,6 +8102,21 @@ mod tests {
             &out,
         );
         assert!(results[0].passed);
+        let missing = crate::runner::parse_json_outcome(
+            r#"{"text":"Partial result.","tool_calls_count":4,"tool_result_class_counts":{},"final_state":"interrupted"}"#,
+            "m",
+        );
+        let zero_failures = [Criterion::ToolResultClassCount {
+            class: "failed".into(),
+            min: 0,
+            max: 0,
+        }];
+        assert!(!evaluate_deterministic(&zero_failures, &missing)[0].passed);
+        let mut observed_zero = missing;
+        observed_zero
+            .tool_result_class_counts
+            .insert("failed".into(), 0);
+        assert!(evaluate_deterministic(&zero_failures, &observed_zero)[0].passed);
     }
 
     #[test]

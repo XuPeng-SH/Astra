@@ -3861,8 +3861,16 @@ fn final_json_output_with_context(
         sr.cache_creation_tokens,
     )
     .total_input_tokens();
-    let tool_result_class_counts = serde_json::to_value(sr.tool_ledger_aggregate.result_classes)
-        .expect("fixed tool result-class aggregate must serialize");
+    let tool_result_class_counts = if !sr
+        .tool_ledger_aggregate
+        .is_complete_for(sr.tool_calls_count)
+        || (sr.server_terminal_unverified && sr.tool_record_coverage_partial)
+    {
+        serde_json::json!({})
+    } else {
+        serde_json::to_value(sr.tool_ledger_aggregate.result_classes)
+            .expect("fixed tool result-class aggregate must serialize")
+    };
     let disposition = completion_disposition(sr, exit_code);
     serde_json::json!({
         "trace_id": trace_id,
@@ -5810,6 +5818,19 @@ mod final_json_output_tests {
         assert_eq!(output["tool_result_class_counts"]["succeeded"], 1);
         assert_eq!(output["tool_result_class_counts"]["failed"], 1);
         assert_eq!(output["tool_calls_count"], 2);
+    }
+
+    #[test]
+    fn final_json_does_not_invent_zero_classes_for_missing_remote_accounting() {
+        let mut sr = stream_result_for_json();
+        sr.tool_calls_count = 4;
+        sr.tool_ledger_aggregate = Default::default();
+        sr.server_terminal_authoritative = true;
+        sr.server_terminal_unverified = true;
+        sr.tool_record_coverage_partial = true;
+        let output = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(output["tool_calls_count"], 4);
+        assert_eq!(output["tool_result_class_counts"], serde_json::json!({}));
     }
 
     #[test]
