@@ -2172,9 +2172,9 @@ impl<'a> CliSseStreamHost<'a> {
         Ok(())
     }
 
-    fn journal_child_callback_observations<'a>(
+    fn journal_child_callback_observations<'result>(
         &self,
-        results: impl IntoIterator<Item = &'a EdgeToolExecResult>,
+        results: impl IntoIterator<Item = &'result EdgeToolExecResult>,
         note: &str,
     ) {
         use astra_services::session_journal::{JournalWriter, journal_content_redact_enabled};
