@@ -5843,6 +5843,18 @@ mod final_json_output_tests {
         let output = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
         assert_eq!(output["tool_calls_count"], 4);
         assert_eq!(output["tool_result_class_counts"], serde_json::json!({}));
+        sr.tool_calls_count = 0;
+        sr.server_terminal_unverified = false;
+        sr.tool_ledger_aggregate.consistent = false;
+        let unknown = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(unknown["tool_result_class_counts"], serde_json::json!({}));
+        assert!(sr.canonical_tool_outcomes().is_none());
+        sr.tool_ledger_aggregate =
+            astra_turn_types::tool_ledger_receipt::ToolLedgerReceipt::empty("run", 1)
+                .canonical_aggregate();
+        let measured = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(measured["tool_result_class_counts"]["failed"], 0);
+        assert_eq!(sr.canonical_tool_outcomes().unwrap().requested, 0);
     }
 
     #[test]

@@ -151,7 +151,10 @@ itself, evidence that any workspace observation or requested validation occurred
 An incomplete execution remains a terminal failed Run with preserved partial
 output. Its owner-stamped terminal carries the existing sanitized interruption
 record so thin clients can present the actionable continuation notice without
-inventing a protocol error or treating the partial as success. Public run errors
+inventing a protocol error or treating the partial as success. The existing C0
+terminal receipt owns that sanitized record for both committed live output and
+cold replay; a winning cancellation clears it. Claim and exact-commit recovery
+bind the record to the same public error identity and terminal outcome. Public run errors
 and stored error summaries use that record's user message; detailed runtime
 reasons remain in the owning checkpoint and trace. Clients accept this partial
 closure only when the failed terminal, root identity, generation and interruption

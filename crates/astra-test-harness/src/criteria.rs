@@ -8191,6 +8191,38 @@ mod tests {
     }
 
     #[test]
+    fn skill_case_requires_successful_argument_bound_invocation() {
+        let case: crate::case::Case = serde_yaml_ng::from_str(include_str!(
+            "../cases/skill_discovery_uses_skill_tool.yaml"
+        ))
+        .unwrap();
+        let criterion = case
+            .criteria
+            .iter()
+            .find(|criterion| matches!(criterion, Criterion::JournalToolCallCount { .. }))
+            .unwrap();
+        for ok in [false, true] {
+            let session = mk_session(&[(
+                "turn",
+                serde_json::json!({"tool_calls":[{
+                    "tool_call_id":"skill", "name":"skill", "ok":ok,
+                    "disposition": if ok { "executed" } else { "rejected" },
+                    "args_full":r#"{"skill_name":"analyze-session"}"#
+                }]}),
+            )]);
+            assert_eq!(
+                evaluate_deterministic_with_session(
+                    std::slice::from_ref(criterion),
+                    &outcome_with_tools(&["skill"]),
+                    Some(&session)
+                )[0]
+                .passed,
+                ok
+            );
+        }
+    }
+
+    #[test]
     fn root_only_tool_count_excludes_child_calls_and_requires_root_identity() {
         let criterion = Criterion::JournalToolCallCount {
             name: "bash".into(),

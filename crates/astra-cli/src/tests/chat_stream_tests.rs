@@ -65,25 +65,89 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         ResumeAction::ContinueImmediately,
         InterruptionStateSummary::default(),
     );
-    for classified in [false, true] {
+    for (classified, reported_count, callback) in [
+        (false, Some(4), false),
+        (true, Some(4), false),
+        (false, None, false),
+        (true, None, false),
+        (true, Some(4), true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("evidence.txt");
+        std::fs::write(&path, "local read evidence").unwrap();
+        let callback_done = std::sync::Arc::new(tokio::sync::Notify::new());
         let terminal = if classified {
             serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_kind":"network", "error_code":"network", "error":"connection lost"})
         } else {
             serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_code":"execution_incomplete","error_kind":null,"error":interruption.user_message,"interruption":interruption.to_json()})
         };
-        let body = [
-        serde_json::json!({"type":"session_info","session_id":"partial-session","run_id":"partial-run"}),
-        serde_json::json!({"type":"text_done","full_text":"Partial result.","partial":true}),
-        serde_json::json!({"type":"usage","usage_scope":"run_total","input_tokens":12,"output_tokens":3,"tool_call_count":4}),
-        terminal,
-    ].into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
-        let app = Router::new().route(
-            "/chat/stream",
-            post(move || {
-                let body = body.clone();
-                async move { (TEST_SSE_HEADERS, body) }
-            }),
+        let mut usage = serde_json::json!({"type":"usage","usage_scope":"run_total","input_tokens":12,"output_tokens":3});
+        if let Some(count) = reported_count {
+            usage["tool_call_count"] = serde_json::json!(count);
+        }
+        let prefix = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"session_info","session_id":"partial-session","run_id":"partial-run"})
         );
+        let request = serde_json::json!({
+            "type":"tool_request", "session_id":"partial-session", "run_id":"partial-run",
+            "turn_chain_id":"partial-chain", "request_id":"read-1", "schema_admitted_by_server":true,
+            "execution_timeout_ms":300_000, "command_timeout_cap_ms":30_000,
+            "execution_deadline_unix_ms":4_102_444_800_000_u64,
+            "tool":"read_file", "args":{"path":path.to_str().unwrap()}
+        });
+        let prefix = if callback {
+            format!("{prefix}data: {request}\n\n")
+        } else {
+            prefix
+        };
+        let suffix = [
+            serde_json::json!({"type":"text_done","full_text":"Partial result.","partial":true}),
+            usage,
+            terminal,
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let notify = callback_done.clone();
+        let app =
+            Router::new()
+                .route(
+                    "/chat/stream",
+                    post(move || {
+                        let prefix = prefix.clone();
+                        let suffix = suffix.clone();
+                        let notify = notify.clone();
+                        async move {
+                            use futures_util::StreamExt;
+                            let chunks = futures_util::stream::once(async move {
+                                Ok::<_, std::io::Error>(prefix)
+                            })
+                            .chain(futures_util::stream::once(async move {
+                                if callback {
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        notify.notified(),
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                                Ok::<_, std::io::Error>(suffix)
+                            }));
+                            (TEST_SSE_HEADERS, axum::body::Body::from_stream(chunks))
+                        }
+                    }),
+                )
+                .route(
+                    "/tools/result",
+                    post(move || {
+                        let notify = callback_done.clone();
+                        async move {
+                            notify.notify_one();
+                            Json(serde_json::json!({"ok":true}))
+                        }
+                    }),
+                );
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let registry = astra_runtime::skills::empty_unified_registry();
@@ -99,14 +163,25 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         if classified {
             let failure = result.unwrap_err();
             assert_eq!(failure.partial.partial_text, "Partial result.");
-            assert_eq!(failure.partial.tool_calls_count, 4);
+            assert_eq!(
+                failure.partial.tool_calls_count,
+                reported_count.unwrap_or(0)
+            );
+            assert_eq!(
+                failure.partial.tool_call_records.len(),
+                usize::from(callback)
+            );
+            if callback {
+                assert!(failure.partial.tool_call_records[0].ok);
+            }
             assert!(failure.partial.tool_outcomes.is_none());
             assert!(failure.partial.failed_run_terminal.is_some());
             continue;
         }
         let result = result.unwrap();
         assert_eq!(result.full_text, "Partial result.");
-        assert_eq!(result.tool_calls_count, 4);
+        assert_eq!(result.tool_calls_count, reported_count.unwrap_or(0));
+        assert!(result.canonical_tool_outcomes().is_none());
         assert!(result.tool_record_coverage_partial);
         assert!(result.interruption.is_some());
     }

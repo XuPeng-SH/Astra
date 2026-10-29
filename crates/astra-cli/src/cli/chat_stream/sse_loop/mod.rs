@@ -855,21 +855,16 @@ async fn stream_chat_sse_inner(
             state.total_tool_calls,
             state.telemetry.all_tools_used.iter().cloned(),
             &state.stall.tool_call_records,
-            !state.remote_summary.is_none(),
+            true, // Server total includes calls that never reached this Edge.
         );
-        let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
-            &state.stall.tool_call_records,
-        );
-        // Local callback records may cover only a subset of a Server run.
-        // Missing records cannot become a measured zero-failure aggregate.
-        let tool_outcomes = match state.remote_summary.as_ref() {
-            Some(summary) => crate::cli::stream::streaming_types::canonical_tool_outcomes(
+        // Callback records are only local observations, never a complete
+        // Server ledger, even when their count happens to match a fallback.
+        let tool_outcomes = state.remote_summary.as_ref().and_then(|summary| {
+            crate::cli::stream::streaming_types::canonical_tool_outcomes(
                 summary.tool_ledger_receipt.canonical_aggregate(),
                 tool_calls_count,
-            ),
-            None => (tool_outcomes.is_consistent() && tool_outcomes.requested == tool_calls_count)
-                .then_some(tool_outcomes),
-        };
+            )
+        });
         let usage_attribution = UsageAttribution::from_explain_analyze_events(
             &state.telemetry.explain_analyze_events,
             state
@@ -999,7 +994,14 @@ async fn stream_chat_sse_inner(
         .remote_summary
         .as_ref()
         .map(|summary| summary.tool_ledger_receipt.canonical_aggregate())
-        .unwrap_or_default();
+        .unwrap_or(
+            astra_turn_types::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
+                // An absent receipt is not a measured empty ledger. Reuse the
+                // aggregate's existing evidence-validity bit through JSON/journal.
+                consistent: false,
+                ..Default::default()
+            },
+        );
     let result = build_stream_result(StreamResultBuild {
         turn_evaluation: host.turn_evaluation.take(),
         tool_health_entries: p.tool_health_entries,
