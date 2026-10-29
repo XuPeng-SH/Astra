@@ -2661,7 +2661,39 @@ fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool)
     if command.is_empty() {
         return None;
     }
-    bash_command_post_mutation_validation_prefix_kind(command, require_proof)
+    if bash_command_has_go_validation(command)
+        && split_shell_control_segments_with_ops(command)?
+            .iter()
+            .any(|(_, op)| matches!(op, ShellControlOp::Or))
+    {
+        return None;
+    }
+    let operation = bash_command_post_mutation_validation_prefix_kind(command, require_proof)?;
+    let arguments = serde_json::from_str::<serde_json::Value>(args).ok();
+    match arguments.as_ref().and_then(|args| args.get("workdir")) {
+        None => Some(operation),
+        Some(serde_json::Value::String(workdir))
+            if !workdir.trim().is_empty()
+                && !workdir.contains(['\n', '\r'])
+                && astra_text_utils::credential_redaction::redact_credentials_for_display(
+                    workdir,
+                )
+                .1 == 0
+                && !astra_text_utils::credential_redaction::redaction_marker_status(workdir).1 =>
+        {
+            if std::path::Path::new(workdir)
+                .components()
+                .all(|part| part == std::path::Component::CurDir)
+            {
+                return Some(operation);
+            }
+            Some(format!(
+                "cd '{}' && {operation}",
+                workdir.replace('\'', "'\\''")
+            ))
+        }
+        _ => None,
+    }
 }
 
 struct ValidationCandidate {
@@ -2776,7 +2808,134 @@ fn typescript_args_prove_validation(words: &[String]) -> bool {
     true
 }
 
-fn normalized_validation_segment(segment: &str) -> Option<ValidationCandidate> {
+fn go_args_prove_local_validation(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg.starts_with('-') {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+            let takes_value = matches!(
+                flag,
+                "-mod"
+                    | "-count"
+                    | "-timeout"
+                    | "-run"
+                    | "-skip"
+                    | "-bench"
+                    | "-benchtime"
+                    | "-parallel"
+                    | "-cpu"
+                    | "-shuffle"
+                    | "-tags"
+                    | "-covermode"
+                    | "-coverpkg"
+                    | "-vet"
+                    | "-p"
+            );
+            if takes_value {
+                let value = match inline {
+                    Some(value) => value,
+                    None => {
+                        index += 1;
+                        let Some(value) = args.get(index) else {
+                            return false;
+                        };
+                        value
+                    }
+                };
+                if value.starts_with('-') || (flag == "-mod" && value != "readonly") {
+                    return false;
+                }
+            } else if !matches!(
+                flag,
+                "-v" | "-race"
+                    | "-short"
+                    | "-failfast"
+                    | "-cover"
+                    | "-json"
+                    | "-trimpath"
+                    | "-x"
+                    | "-a"
+            ) || inline.is_some_and(|value| !matches!(value, "true" | "false"))
+            {
+                // Dry-run, alternate tools/scope and explicit output writers
+                // are not observations of the final source state.
+                return false;
+            }
+        } else if !(arg == "."
+            || arg.starts_with("./")
+            || arg.starts_with("../")
+            || arg.starts_with('/')
+            || arg.ends_with(".go"))
+        {
+            // Go import paths and std/all resolve outside the workspace.
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn go_validation_candidate(segment: &str) -> Option<ValidationCandidate> {
+    let head = segment.split_whitespace().next()?;
+    if head != "go" && !head.contains('=') {
+        return None;
+    }
+    let words = split_static_shell_words(segment)?;
+    let command_start = words.iter().position(|word| word == "go")?;
+    let command = &words[command_start..];
+    if !matches!(
+        command.get(1).map(String::as_str),
+        Some("test" | "build" | "vet")
+    ) {
+        return None;
+    }
+    // Parse assignment words without executing a shell. Quoted command names
+    // and expanded/unsupported prefixes must not become environment wrappers.
+    // GOWORK=off explicitly selects the local module. Other environment
+    // values may redirect execution or contain secrets and remain opaque.
+    for (raw, parsed) in segment.split_whitespace().zip(&words).take(command_start) {
+        let (name, _) = raw.split_once('=')?;
+        if split_static_shell_words(raw)?.first() != Some(parsed)
+            || name != "GOWORK"
+            || parsed.split_once('=')?.1 != "off"
+        {
+            return None;
+        }
+    }
+    Some(ValidationCandidate {
+        // Configuration is part of operation equality. A differently
+        // configured success must not erase an earlier validation failure.
+        operation: segment.to_string(),
+        proof_eligible: go_args_prove_local_validation(&command[2..]),
+    })
+}
+
+/// Recognize a Go validation stage independently of whether its surrounding
+/// invocation is eligible to prove completion.
+pub fn bash_command_has_go_validation(command: &str) -> bool {
+    split_shell_control_segments_with_ops(command).is_some_and(|controls| {
+        controls.iter().any(|(segment, _)| {
+            split_top_level_pipeline_segments(segment).is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    let part = part.trim();
+                    let part = part
+                        .strip_suffix("2>&1")
+                        .or_else(|| part.strip_suffix("1>&2"))
+                        .unwrap_or(part)
+                        .trim();
+                    go_validation_candidate(part).is_some()
+                })
+            })
+        })
+    })
+}
+
+fn normalized_validation_segment(segment: &str, original: &str) -> Option<ValidationCandidate> {
+    if let Some(candidate) = go_validation_candidate(original) {
+        return Some(candidate);
+    }
     // Shell command names, subcommands and module names are case-sensitive.
     // TypeScript's --noEmit option is not: canonicalize only that option for
     // exact-operation recovery, preserving paths and other arguments.
@@ -2829,9 +2988,7 @@ fn normalized_validation_segment(segment: &str) -> Option<ValidationCandidate> {
         || segment == "npm test"
         || segment.starts_with("npm test ")
         || segment == "npm run build"
-        || segment.starts_with("npm run build ")
-        || segment == "go test"
-        || segment.starts_with("go test ");
+        || segment.starts_with("npm run build ");
     recognized.then(|| ValidationCandidate {
         operation: segment.to_string(),
         proof_eligible: true,
@@ -2899,11 +3056,17 @@ fn bash_command_post_mutation_validation_prefix_kind(
     command: &str,
     require_proof: bool,
 ) -> Option<String> {
-    let mut latest = None;
+    if !shell_command_preserves_pipeline_status(command) {
+        return None;
+    }
+    let mut latest = Vec::new();
+    let mut has_validator = false;
+    let mut opaque_predecessor = false;
     let control_segments = split_shell_control_segments_with_ops(command)?;
     for (segment_index, (raw_segment, op_after)) in control_segments.iter().enumerate() {
         let pipeline_segments = split_top_level_pipeline_segments(raw_segment)?;
-        let mut pipeline_latest = None;
+        let is_pipeline = pipeline_segments.len() > 1;
+        let mut pipeline_latest = Vec::new();
         let mut pipeline_blocked = false;
         for pipeline_segment in pipeline_segments {
             let segment = pipeline_segment.trim();
@@ -2924,14 +3087,24 @@ fn bash_command_post_mutation_validation_prefix_kind(
                 break;
             }
             if is_shell_control_segment(&normalized) {
+                if normalized.starts_with("cd ") && !is_pipeline {
+                    if !shell_control_segment_is_static_and_neutral(segment) {
+                        pipeline_blocked = true;
+                        break;
+                    }
+                    latest.push(segment.to_string());
+                }
                 continue;
             }
-            if let Some(candidate) = normalized_validation_segment(&normalized) {
-                if require_proof && !candidate.proof_eligible {
+            if let Some(candidate) = normalized_validation_segment(&normalized, segment) {
+                if (require_proof && !candidate.proof_eligible)
+                    || !pipeline_latest.is_empty()
+                    || (opaque_predecessor && go_validation_candidate(segment).is_some())
+                {
                     pipeline_blocked = true;
                     break;
                 }
-                pipeline_latest = Some(candidate.operation);
+                pipeline_latest.push(candidate.operation);
                 continue;
             }
             if is_positive_validation_segment(&normalized)
@@ -2950,9 +3123,12 @@ fn bash_command_post_mutation_validation_prefix_kind(
             break;
         }
         if pipeline_blocked {
-            latest = None;
-        } else if let Some(prefix) = pipeline_latest {
-            latest = Some(prefix);
+            latest.clear();
+            has_validator = false;
+            opaque_predecessor = true;
+        } else {
+            has_validator |= !pipeline_latest.is_empty();
+            latest.extend(pipeline_latest);
         }
         // A successful `&&` continuation is conditional on the validator
         // succeeding, so it does not mask that receipt. `;` and `||` both
@@ -2968,10 +3144,11 @@ fn bash_command_post_mutation_validation_prefix_kind(
         if matches!(op_after, ShellControlOp::Or)
             || (matches!(op_after, ShellControlOp::Sequence) && sequence_has_rhs)
         {
-            latest = None;
+            latest.clear();
+            has_validator = false;
         }
     }
-    latest
+    has_validator.then(|| latest.join(" && "))
 }
 
 /// Return whether a compound shell command contains a positive validation
@@ -2986,6 +3163,9 @@ fn bash_command_post_mutation_validation_prefix_kind(
 /// neutral.  This is evidence classification only; it never grants
 /// execution authority or changes the shell safety policy.
 pub fn bash_command_has_post_mutation_validation(command: &str) -> bool {
+    if !shell_command_preserves_pipeline_status(command) {
+        return false;
+    }
     let mut validation_after_barrier = false;
     let mut strict_receipt = false;
     let Some(control_segments) = split_shell_control_segments_with_ops(command) else {
@@ -2996,6 +3176,7 @@ pub fn bash_command_has_post_mutation_validation(command: &str) -> bool {
             return false;
         };
         let mut pipeline_validation = None;
+        let mut pipeline_validator_count = 0;
         let mut pipeline_blocked = false;
         for pipeline_segment in pipeline_segments {
             let segment = pipeline_segment.trim();
@@ -3018,8 +3199,9 @@ pub fn bash_command_has_post_mutation_validation(command: &str) -> bool {
             if is_shell_control_segment(&normalized) {
                 continue;
             }
-            if let Some(candidate) = normalized_validation_segment(&normalized) {
-                if !candidate.proof_eligible {
+            if let Some(candidate) = normalized_validation_segment(&normalized, segment) {
+                pipeline_validator_count += 1;
+                if !candidate.proof_eligible || pipeline_validator_count > 1 {
                     pipeline_blocked = true;
                     break;
                 }
@@ -3089,6 +3271,53 @@ pub fn bash_command_has_post_mutation_validation(command: &str) -> bool {
         }
     }
     validation_after_barrier
+}
+
+/// Bash executors enable pipefail for real pipelines. Commands that can
+/// override that setting cannot use the final stage's success as evidence.
+/// This is an evidence check only, never shell execution authorization.
+pub fn shell_command_preserves_pipeline_status(command: &str) -> bool {
+    if !command.contains('|') {
+        return true;
+    }
+    let Some(controls) = split_shell_control_segments_with_ops(command) else {
+        return false;
+    };
+    if !controls.iter().any(|(segment, _)| {
+        split_top_level_pipeline_segments(segment).is_some_and(|parts| parts.len() > 1)
+    }) {
+        return true;
+    }
+    controls.iter().all(|(segment, _)| {
+        let Some(parts) = split_top_level_pipeline_segments(segment) else {
+            return false;
+        };
+        parts.iter().all(|part| {
+            let part = part.trim();
+            let part = part
+                .strip_suffix("2>&1")
+                .or_else(|| part.strip_suffix("1>&2"))
+                .unwrap_or(part)
+                .trim();
+            let bracket = part
+                .strip_prefix('[')
+                .and_then(|body| body.strip_suffix(']'))
+                .map(|body| format!("test {}", body.trim()));
+            let Some(words) = split_static_shell_words(bracket.as_deref().unwrap_or(part)) else {
+                return false;
+            };
+            match words.first().map(String::as_str) {
+                Some(
+                    "source" | "." | "eval" | "builtin" | "command" | "shopt" | "trap" | "enable",
+                ) => false,
+                Some("set") => {
+                    shell_control_segment_is_static_and_neutral(part)
+                        && !words.iter().skip(1).any(|word| word.starts_with('+'))
+                }
+                _ => true,
+            }
+        })
+    })
 }
 
 fn is_status_neutral_segment(segment: &str) -> bool {
@@ -3338,7 +3567,6 @@ fn is_positive_validation_segment(segment: &str) -> bool {
                 || (matches!(words.next(), Some("run"))
                     && matches!(words.next(), Some("test" | "build")))
         }
-        "go" => words.next() == Some("test"),
         _ => false,
     }
 }
@@ -7778,6 +8006,121 @@ mod tests {
         assert!(split_static_shell_words("cp $DEST source").is_none());
         assert!(split_static_shell_words("cp src 'unterminated").is_none());
         assert!(split_static_shell_words("cp src | tee out").is_none());
+    }
+
+    #[test]
+    fn go_validation_preserves_static_configuration_and_rejects_opaque_scope() {
+        for command in [
+            "go test ./...",
+            "go build -mod=readonly ./...",
+            "go vet ./...",
+            "GOWORK=off go test ./...",
+            "GOWORK='off' go vet ./...",
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert_eq!(
+                normalize_validation_prefix("bash", &args).as_deref(),
+                Some(command)
+            );
+            assert!(
+                bash_command_has_post_mutation_validation(command),
+                "{command}"
+            );
+            assert!(!crate::cloud_approval_policy::bash_command_is_read_only(
+                command
+            ));
+        }
+        for command in [
+            "GOWORK=/tmp/other/go.work go test ./...",
+            "GOFLAGS='-C /tmp/other' go test ./...",
+            "PATH=/tmp go test ./...",
+            "SECRET=value go test ./...",
+            "NO_COLOR=secret GOWORK=off go test ./...",
+            "GOWORK=$(printf off) go test ./...",
+            "env GOWORK=off go test ./...",
+            "GOWORK=off go test --help",
+            "GOWORK=off go test -n ./...",
+            "go vet -C /tmp/other ./...",
+            "go test -C=/tmp/other ./...",
+            "go test -overlay=/tmp/other.json ./...",
+            "go test -exec=echo ./...",
+            "go test ./... || true",
+            "go test ./...; echo ok",
+            "go test ./... && touch source.go",
+            "set -e +o pipefail; GOWORK=off go test ./... | tail -10",
+            "source options.sh; go test ./... | tail -10",
+            "shopt -ou pipefail && GOWORK=off go test ./... | tail -10",
+            "shopt -u -o pipefail && GOWORK=off go test ./... | tail -10",
+            "GOWORK=off go vet ./... | go test ./...",
+            "GOWORK=off go vet fmt",
+            "GOWORK=off go test encoding/json",
+            "GOWORK=off go test -c ./...",
+            "GOWORK=off go test -list Test ./...",
+            "GOWORK=off go build -o ./source.go ./cmd/tool",
+            "GOWORK=off go test -coverprofile=./source.go ./...",
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert!(
+                normalize_validation_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+            assert!(
+                !bash_command_has_post_mutation_validation(command),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_chain_identity_does_not_attribute_failure_to_the_last_stage() {
+        let command =
+            "cd /workspace && GOWORK=off go build ./... && GOWORK=off go vet ./... && echo OK";
+        let args = serde_json::json!({"command": command}).to_string();
+        let expected = "cd /workspace && GOWORK=off go build ./... && GOWORK=off go vet ./...";
+        assert_eq!(
+            normalize_validation_attempt_prefix("bash", &args).as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            normalize_validation_prefix("bash", &args).as_deref(),
+            Some(expected)
+        );
+        assert!(bash_command_has_post_mutation_validation(command));
+    }
+
+    #[test]
+    fn go_operation_identity_preserves_workdir_cwd_and_quoted_arguments() {
+        for command in ["go test ./...", "cargo test", "python3 -m pytest"] {
+            let implicit = serde_json::json!({"command": command}).to_string();
+            let explicit = serde_json::json!({"command": command, "workdir": "."}).to_string();
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &implicit),
+                normalize_validation_prefix("bash", &explicit)
+            );
+        }
+        let sensitive = serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "password=synthetic-secret-value-123456"}).to_string();
+        assert!(normalize_validation_attempt_prefix("bash", &sensitive).is_none());
+        for (first, second) in [
+            (
+                serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/a"}),
+                serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/b"}),
+            ),
+            (
+                serde_json::json!({"command": "GOWORK=off go test -run 'Test  Name' ./..."}),
+                serde_json::json!({"command": "GOWORK=off go test -run 'Test Name' ./..."}),
+            ),
+            (
+                serde_json::json!({"command": "GOWORK=off go test ./... && cd pkg/b && GOWORK=off go vet ./..."}),
+                serde_json::json!({"command": "GOWORK=off go test ./... && GOWORK=off go vet ./..."}),
+            ),
+        ] {
+            let first = normalize_validation_attempt_prefix("bash", &first.to_string()).unwrap();
+            let second = normalize_validation_prefix("bash", &second.to_string()).unwrap();
+            assert_ne!(first, second);
+        }
+        let args =
+            serde_json::json!({"command": "prepare_step && GOWORK=off go vet ./..."}).to_string();
+        assert!(normalize_validation_attempt_prefix("bash", &args).is_none());
     }
 
     #[test]

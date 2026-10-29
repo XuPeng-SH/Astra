@@ -5068,6 +5068,7 @@ mod exit_code_tests {
                     status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
                     error: Some("provider stream stopped".into()),
                     error_kind: Some(astra_core::ErrorKind::StreamTransport),
+                    interruption: None,
                 }),
                 partial_text: "  real partial bytes\n".into(),
                 partial_text_model_item_id: Some("partial-model-item".into()),

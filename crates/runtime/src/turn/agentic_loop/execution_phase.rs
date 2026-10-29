@@ -6937,22 +6937,44 @@ impl WorkValidationEvidence {
             let positive = astra_turn_core::evaluation::tool_outcome_is_positive_success(record);
             let proof_operation =
                 astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args);
+            let arguments_prove_validation = proof_operation.is_some();
+            let proof_operation = proof_operation.filter(|_| {
+                record.workspace_mutation_observed != Some(true)
+                    && record.workspace_mutation_partial != Some(true)
+                    && super::lifecycle::extract_tool_args(Some(args)).is_some_and(|args| {
+                        super::lifecycle::bash_invocation_has_scoped_workspace_observation(
+                            state.hooks.workspace_root_hint.as_deref(),
+                            &args,
+                        )
+                    })
+            });
             if let Some(proof_operation) = proof_operation.as_ref() {
                 evidence.latest_validation_operation = Some(proof_operation.clone());
             }
             // Only the same canonical operation discharges a failure. A
             // narrowed or differently flagged command supplies independent evidence.
-            evidence
-                .unresolved_operations
-                .retain(|(candidate, _)| candidate != &operation);
             if !positive {
+                evidence
+                    .unresolved_operations
+                    .retain(|(candidate, _)| candidate != &operation);
                 evidence.unresolved_operations.push((operation, index));
                 // A fresh failed validator exposes debt even after a mutation.
                 validation_is_stale = false;
             } else if proof_operation.is_some() {
+                evidence
+                    .unresolved_operations
+                    .retain(|(candidate, _)| candidate != &operation);
                 validation_is_stale = false;
                 saw_current_positive_validation = true;
             } else {
+                if !arguments_prove_validation {
+                    // An attempt-only invocation can resolve its own execution
+                    // failure, but it cannot preserve earlier validation proof.
+                    evidence
+                        .unresolved_operations
+                        .retain(|(candidate, _)| candidate != &operation);
+                }
+                saw_current_positive_validation = false;
                 // Invocation success without proof-eligible arguments cannot
                 // authorize delivery, even when its exact failure is cleared.
                 saw_unverified_validation_success = true;
@@ -12142,6 +12164,8 @@ mod tests {
             ok,
             args_full: args_full.map(ToString::to_string),
             disposition: Some(ToolCallDisposition::Executed),
+            result_class: ok.then(|| "success".into()),
+            exit_semantics: ok.then(|| "success".into()),
             ..Default::default()
         };
         // Provider-neutral fixtures model the same owner fact production
@@ -12190,6 +12214,100 @@ mod tests {
             disposition: Some(ToolCallDisposition::Executed),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn go_work_validation_requires_scoped_success_of_the_same_operation() {
+        let chain = "GOWORK=off go build ./... && GOWORK=off go vet ./...";
+        for (failed, passed) in [
+            ("GOWORK=off go test ./...", "go test ./..."),
+            ("GOWORK=off go test ./...", "GOWORK=off go build ./..."),
+            (chain, "GOWORK=off go vet ./..."),
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            state.stall.tool_call_records = vec![
+                validation_record(failed, "test_failure"),
+                validation_record(passed, "success"),
+            ];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Failed,
+                "{passed} must not discharge {failed}"
+            );
+            state
+                .stall
+                .tool_call_records
+                .push(validation_record(failed, "success"));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed
+            );
+        }
+        let mut state = make_state();
+        state.hooks.workspace_root_hint = Some("/workspace".into());
+        state.stall.tool_call_records = vec![validation_record(
+            "GOWORK=off go vet /tmp/other/...",
+            "success",
+        )];
+        assert_eq!(
+            WorkValidationEvidence::collect(&state, true).state,
+            WorkValidationState::Stale
+        );
+        for (failed_args, passed_args) in [
+            (
+                serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/a"}),
+                serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/b"}),
+            ),
+            (
+                serde_json::json!({"command": "GOWORK=off go test -run 'Test  Name' ./..."}),
+                serde_json::json!({"command": "GOWORK=off go test -run 'Test Name' ./..."}),
+            ),
+        ] {
+            let mut failed = validation_record("", "test_failure");
+            failed.runtime_args_full = Some(failed_args.to_string());
+            let mut passed = validation_record("", "success");
+            passed.runtime_args_full = Some(passed_args.to_string());
+            state.stall.tool_call_records = vec![failed, passed];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Failed
+            );
+            state
+                .stall
+                .tool_call_records
+                .last_mut()
+                .unwrap()
+                .runtime_args_full = Some(failed_args.to_string());
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed
+            );
+        }
+        state.stall.tool_call_records = vec![
+            validation_record("GOWORK=off go test -n ./...", "test_failure"),
+            validation_record("GOWORK=off go build ./...", "success"),
+            validation_record("GOWORK=off go test -n ./...", "success"),
+        ];
+        assert_eq!(
+            WorkValidationEvidence::collect(&state, true).state,
+            WorkValidationState::Stale
+        );
+        let mut external = validation_record("cd /tmp && GOWORK=off go vet ./...", "success");
+        external.runtime_args_full = Some(
+            serde_json::json!({"command": "cd /tmp && GOWORK=off go vet ./...", "mode": "verify"})
+                .to_string(),
+        );
+        external.workspace_mutation_scope =
+            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+        external.workspace_mutation_receipt =
+            astra_tools::workspace_observation::explicit_workspace_verification_receipt()
+                .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+        state.stall.tool_call_records = vec![external];
+        assert_eq!(
+            WorkValidationEvidence::collect(&state, true).state,
+            WorkValidationState::Stale
+        );
     }
 
     #[test]
@@ -20396,6 +20514,8 @@ mod tests {
             name: "bash".into(),
             ok: true,
             disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            result_class: Some("success".into()),
+            exit_semantics: Some("success".into()),
             args_full: Some(
                 serde_json::json!({
                     "command": "python3 -m pytest tests/test_knot.py"

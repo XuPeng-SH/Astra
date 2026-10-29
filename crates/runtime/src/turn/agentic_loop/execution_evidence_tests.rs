@@ -7,6 +7,107 @@ use astra_config::user_profile::{MutationCompletionScope, TurnIntent};
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use serde_json::json;
 
+async fn run_written_go_verification(
+    command: &str,
+    result_class: &str,
+    exit_semantics: &str,
+) -> (AgenticLoopState, MockHost) {
+    let write = make_edge_tool_with_args(
+        "write_file",
+        json!({"path": "/workspace/main.go", "content": "package main\n"}),
+        "written",
+    );
+    let mut checked =
+        make_edge_tool_with_args("bash", json!({"command": command}), "observed result");
+    checked.tool_result_fields.as_mut().unwrap().extend([
+        (
+            "exit_code".into(),
+            json!(if exit_semantics == "success" { 0 } else { 1 }),
+        ),
+        ("result_class".into(), json!(result_class)),
+        ("exit_semantics".into(), json!(exit_semantics)),
+    ]);
+    let mut host = MockHost::new(vec![
+        edge_tool_result(vec![write], 10, 2, None),
+        edge_tool_result(vec![checked], 10, 2, None),
+        text_result("Implemented and checked the change.", 10, 2, None),
+        text_result("Implemented and checked the change.", 10, 2, None),
+        text_result("Implemented and checked the change.", 10, 2, None),
+    ])
+    .with_valid_tools(&["write_file", "bash", "read_file"]);
+    let mut state = make_state();
+    state.hooks.workspace_root_hint = Some("/workspace".into());
+    state.turn_intent =
+        Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::MustMutate));
+    run_agentic_loop_with_host(&mut host, &mut state)
+        .await
+        .unwrap();
+    (state, host)
+}
+
+#[tokio::test]
+async fn go_verification_after_write_finishes_without_redundant_observation() {
+    for command in [
+        "go test ./...",
+        "GOWORK=off go test ./...",
+        "GOWORK=off go test -skip TestIntegration -covermode=atomic -coverpkg=./... ./...",
+        "GOWORK=off go build ./... && GOWORK=off go vet ./... && echo BUILD_VET_OK",
+        "cd /workspace && GOWORK=off go build -mod=readonly ./pkg/one/ ./pkg/two/ && GOWORK=off go vet -mod=readonly ./pkg/one/ ./pkg/two/ && echo BUILD_VET_OK",
+    ] {
+        let (state, host) = run_written_go_verification(command, "success", "success").await;
+        assert!(
+            state.interruption.is_none(),
+            "{command}: {:?}",
+            state.interruption
+        );
+        assert_eq!(
+            host.turn_count(),
+            3,
+            "{command}: no redundant recovery rounds"
+        );
+        assert_eq!(state.stall.tool_call_records.len(), 2);
+        assert_eq!(
+            host.final_output_ready,
+            vec!["Implemented and checked the change."]
+        );
+    }
+}
+
+#[tokio::test]
+async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_configuration() {
+    for (command, class, semantics) in [
+        (
+            "sh -c 'exit 1' && GOWORK=off go test ./...",
+            "inconclusive",
+            "domain_negative",
+        ),
+        (
+            "GOWORK=off go test ./... | head -1",
+            "success",
+            "pipeline_truncated",
+        ),
+        (
+            "export GOFLAGS=-n && GOWORK=off go test ./...",
+            "success",
+            "success",
+        ),
+        ("true || GOWORK=off go test ./...", "success", "success"),
+    ] {
+        let (state, host) = run_written_go_verification(command, class, semantics).await;
+        assert_eq!(
+            state.interruption.as_ref().map(|record| record.kind),
+            Some(InterruptionKind::ExecutionIncomplete),
+            "{command}"
+        );
+        assert_eq!(host.turn_count(), 5);
+        assert_eq!(
+            state.stall.tool_call_records.len(),
+            2,
+            "no invented recovery tool"
+        );
+    }
+}
+
 fn external_request() -> AgenticLoopState {
     let mut state = make_state();
     state.task_profile =

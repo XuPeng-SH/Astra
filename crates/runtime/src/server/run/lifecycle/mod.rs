@@ -8083,10 +8083,10 @@ impl AgenticRunLifecycleService {
                         .as_ref()
                         .expect("checked interruption");
                     let code = interruption.kind.label();
-                    let message = interruption
-                        .error_detail
-                        .clone()
-                        .unwrap_or_else(|| format!("execution stopped: {code}"));
+                    // Runtime diagnostics remain in the owning checkpoint and
+                    // trace. Both the live event and durable run projection
+                    // expose the existing actionable interruption message.
+                    let message = interruption.user_message.clone();
                     if !loop_state.final_text.is_empty() {
                         events.push(json!({"event_type":"text_done", "data": {
                             "full_text":loop_state.final_text,
@@ -8101,6 +8101,12 @@ impl AgenticRunLifecycleService {
                     finished["error"] = json!(message);
                     finished["error_code"] = json!(code);
                     finished["error_kind"] = json!(error_kind);
+                    if interruption.kind == InterruptionKind::ExecutionIncomplete {
+                        let mut public = interruption.clone();
+                        public.error_detail = None;
+                        public.stall_signal = None;
+                        finished["interruption"] = public.to_json();
+                    }
                     events.push(json!({"event_type":"run_finished", "data":finished}));
                     (RunStatus::Failed, Some(message))
                 }

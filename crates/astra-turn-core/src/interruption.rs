@@ -259,7 +259,7 @@ impl ResumeMode {
 ///
 /// Captures enough context for the next turn/session to understand what happened
 /// and what to do. Persisted to checkpoint and journal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptionRecord {
     /// Classification of the interruption.
     pub kind: InterruptionKind,

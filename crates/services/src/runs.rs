@@ -26161,6 +26161,17 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 ] {
                     insert_if_present(obj, &data, key);
                 }
+                if let Some(mut interruption) = data
+                    .get("interruption")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                {
+                    if let Some(fields) = interruption.as_object_mut() {
+                        fields.remove("error_detail");
+                        fields.remove("stall_signal");
+                    }
+                    obj.insert("interruption".into(), interruption);
+                }
             }
             out
         }

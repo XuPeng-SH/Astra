@@ -118,6 +118,27 @@ workspace did not change. Parallel verification calls carrying that receipt do
 not invalidate each other's evidence. Opaque commands, failed or malformed
 receipts, and a concurrent writer retain the freshness barrier.
 
+Canonical Go observations include `go test`, `go build`, and `go vet`, with
+literal scope-preserving environment assignments such as `GOWORK=off`.
+They require a positively successful executed result within the bound workspace;
+dry-run, redirected-scope and opaque wrapper forms are not positive proof.
+Environment configuration and ordered validation stages remain part of operation
+identity: a successful vet does not clear a failed test or a failed build/vet
+chain. Executors enable pipefail for pipelines; commands that may disable that
+setting cannot use the final pipeline stage's success as validation evidence.
+An unchanged Bash fingerprint prevents a false mutation barrier but is not, by
+itself, evidence that any workspace observation or requested validation occurred.
+
+An incomplete execution remains a terminal failed Run with preserved partial
+output. Its owner-stamped terminal carries the existing sanitized interruption
+record so thin clients can present the actionable continuation notice without
+inventing a protocol error or treating the partial as success. Public run errors
+and stored error summaries use that record's user message; detailed runtime
+reasons remain in the owning checkpoint and trace. Clients accept this partial
+closure only when the failed terminal, root identity, generation and interruption
+agree. Missing or conflicting evidence and actual classified errors retain the
+normal failure path.
+
 ## State hierarchy
 
 ```text

@@ -1510,8 +1510,6 @@ pub(crate) fn record_has_typed_workspace_observation_receipt(
         && record.workspace_mutation_observed != Some(true)
         && ((astra_tools::workspace_observation::is_typed_workspace_observer(&record.name)
             && astra_tools::workspace_observation::is_typed_workspace_observation_receipt(receipt))
-            || (record.name == "bash"
-                && is_authoritative_unchanged_bash_observation_record(record))
             || (record.runtime_args_full.is_some()
                 && astra_tools::workspace_observation::is_explicit_workspace_verification_request(
                     &record.name,
@@ -1709,6 +1707,9 @@ fn scoped_command_path_tokens(words: &[String]) -> Vec<(usize, &str)> {
 /// `echo`, `true`, and `sleep` are safe but carry no state receipt. Keep this
 /// positive capability separate from permission classification.
 pub(crate) fn bash_command_has_workspace_observation_shape(command: &str) -> bool {
+    if !astra_turn_core::evaluation::shell_command_preserves_pipeline_status(command) {
+        return false;
+    }
     let Some(segments) =
         astra_turn_core::evaluation::split_shell_control_segments_with_ops(command)
     else {
@@ -1762,19 +1763,26 @@ pub(crate) fn bash_command_has_workspace_observation_shape(command: &str) -> boo
 /// paths (for example a test log under `/tmp`); only the segment carrying the
 /// surviving receipt must be workspace-scoped. Cwd transitions remain
 /// authoritative, and unknown/concurrent syntax fails closed.
-pub(crate) fn bash_command_has_scoped_workspace_observation(
+fn bash_command_has_scoped_workspace_observation(
     command: &str,
     workspace_root: Option<&str>,
+    workdir: Option<&str>,
 ) -> bool {
+    if !astra_turn_core::evaluation::shell_command_preserves_pipeline_status(command) {
+        return false;
+    }
     let Some(root) = workspace_root.and_then(normalize_absolute_path) else {
-        return bash_command_has_workspace_observation_shape(command);
+        return workdir.is_none() && bash_command_has_workspace_observation_shape(command);
     };
     let Some(segments) =
         astra_turn_core::evaluation::split_shell_control_segments_with_ops(command)
     else {
         return false;
     };
-    let mut cwd = Some(root.clone());
+    let mut cwd = match workdir {
+        Some(workdir) => normalize_workspace_path(workdir, workspace_root),
+        None => Some(root.clone()),
+    };
     let mut observed = false;
     let mut unobserved_opaque_mutation = false;
     for (segment_index, (raw_segment, op_after)) in segments.iter().enumerate() {
@@ -2043,6 +2051,7 @@ fn shell_segment_has_positive_observation(segment: &str) -> bool {
         return false;
     }
     let mut upstream_workspace_receipt = false;
+    let mut validator_count = 0;
     for raw_pipeline in &pipelines {
         let pipeline = raw_pipeline
             .trim()
@@ -2074,14 +2083,19 @@ fn shell_segment_has_positive_observation(segment: &str) -> bool {
         // operand-aware receipt calculated above.
         let literal_test_without_operand =
             matches!(head.as_str(), "test" | "[") && !shell_file_test_has_workspace_operand(&words);
-        let canonical_receipt =
+        let validator =
             astra_turn_core::evaluation::bash_command_post_mutation_validation_prefix(pipeline)
-                .is_some()
-                || (!literal_test_without_operand
-                    && astra_turn_core::evaluation::bash_command_has_post_mutation_validation(
-                        pipeline,
-                    ))
-                || shell_pipeline_executes_literal_script_artifact(pipeline);
+                .is_some();
+        validator_count += usize::from(validator);
+        if validator_count > 1 {
+            return false;
+        }
+        let canonical_receipt = validator
+            || (!literal_test_without_operand
+                && astra_turn_core::evaluation::bash_command_has_post_mutation_validation(
+                    pipeline,
+                ))
+            || shell_pipeline_executes_literal_script_artifact(pipeline);
         // A reader without an operand may consume a previous pipeline stage
         // (e.g. `cargo test | tail -20`), but it may only inherit a receipt
         // from a prior stage that itself has a workspace operand or a
@@ -2491,12 +2505,8 @@ pub(crate) fn tool_call_can_observe_bound_workspace(
         }) {
             return true;
         }
-        let Some(command) = args
-            .and_then(|args| astra_turn_core::tool_argument_hints::command_hint_from_args(args))
-        else {
-            return false;
-        };
-        return bash_command_has_scoped_workspace_observation(command, root);
+        return args
+            .is_some_and(|args| bash_invocation_has_scoped_workspace_observation(root, args));
     }
     if !crate::turn::tool_side_effects::tool_call_may_observe_workspace(name, args) {
         return false;
@@ -2508,6 +2518,28 @@ pub(crate) fn tool_call_can_observe_bound_workspace(
     });
     explicit_path
         .is_none_or(|path| root.is_none() || normalize_workspace_path(path, root).is_some())
+}
+
+pub(crate) fn bash_invocation_has_scoped_workspace_observation(
+    root: Option<&str>,
+    args: &Value,
+) -> bool {
+    let Some(command) = astra_turn_core::tool_argument_hints::command_hint_from_args(args) else {
+        return false;
+    };
+    if astra_turn_core::evaluation::bash_command_has_go_validation(command)
+        && (root.and_then(normalize_absolute_path).is_none()
+            || astra_turn_core::evaluation::normalize_validation_prefix("bash", &args.to_string())
+                .is_none())
+    {
+        return false;
+    }
+    let workdir = match args.get("workdir") {
+        None => None,
+        Some(Value::String(workdir)) if !workdir.trim().is_empty() => Some(workdir.as_str()),
+        _ => return false,
+    };
+    bash_command_has_scoped_workspace_observation(command, root, workdir)
 }
 
 /// Scope an executed observation to the bound workspace. Direct read tools
@@ -2524,6 +2556,21 @@ pub(crate) fn record_can_observe_bound_workspace(
     }
     let args = extract_tool_args(record.authoritative_args_full());
     if record.name == "bash" {
+        if record.authoritative_args_full().is_some_and(|args| {
+            (astra_turn_core::evaluation::normalize_validation_attempt_prefix("bash", args)
+                .is_some()
+                || extract_tool_args(Some(args))
+                    .and_then(|args| {
+                        astra_turn_core::tool_argument_hints::command_hint_from_args(&args)
+                            .map(astra_turn_core::evaluation::bash_command_has_go_validation)
+                    })
+                    .unwrap_or(false))
+                && (record.workspace_mutation_observed == Some(true)
+                    || record.workspace_mutation_partial == Some(true)
+                    || !astra_turn_core::evaluation::tool_outcome_is_positive_success(record))
+        }) {
+            return false;
+        }
         // Verify mode is an explicit receipt contract.  Do not silently
         // downgrade a missing/forged v2 receipt to the legacy command-shape
         // classifier, or a cached/model-authored result could clear a
@@ -5173,7 +5220,11 @@ mod tests {
         );
 
         failed.ok = true;
-        assert!(record_has_typed_workspace_observation_receipt(&failed));
+        assert!(is_authoritative_unchanged_bash_observation_record(&failed));
+        assert!(
+            !record_has_typed_workspace_observation_receipt(&failed),
+            "unchanged fingerprints cannot prove an observation occurred"
+        );
 
         let mut weak = failed;
         weak.workspace_mutation_receipt = Some(
@@ -5184,6 +5235,78 @@ mod tests {
             .expect("weak receipt"),
         );
         assert!(!is_authoritative_unchanged_bash_observation_record(&weak));
+    }
+
+    #[test]
+    fn go_observation_requires_scoped_positive_execution_not_just_unchanged_bytes() {
+        let args = json!({"command": "GOWORK=off go vet ./..."}).to_string();
+        let mut record = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            runtime_args_full: Some(args),
+            result_class: Some("success".into()),
+            exit_semantics: Some("success".into()),
+            ..Default::default()
+        };
+        assert!(record_can_observe_bound_workspace(
+            Some("/workspace"),
+            &record
+        ));
+        for root in [None, Some(""), Some("relative")] {
+            assert!(!record_can_observe_bound_workspace(root, &record));
+        }
+        for class in [
+            "test_failure",
+            "pipeline_truncated",
+            "empty_result",
+            "background_handoff",
+        ] {
+            record.result_class = Some(class.into());
+            assert!(
+                !record_can_observe_bound_workspace(Some("/workspace"), &record),
+                "{class}"
+            );
+        }
+        record.result_class = Some("success".into());
+        record.exit_semantics = Some("domain_negative".into());
+        assert!(!record_can_observe_bound_workspace(
+            Some("/workspace"),
+            &record
+        ));
+        record.exit_semantics = Some("success".into());
+        record.workspace_mutation_observed = Some(true);
+        assert!(!record_can_observe_bound_workspace(
+            Some("/workspace"),
+            &record
+        ));
+        record.workspace_mutation_observed = None;
+        record.workspace_mutation_partial = Some(true);
+        assert!(!record_can_observe_bound_workspace(
+            Some("/workspace"),
+            &record
+        ));
+        record.workspace_mutation_partial = None;
+        record.workspace_mutation_scope =
+            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+        record.workspace_mutation_receipt =
+            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            )
+            .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+        for command in [
+            "true",
+            "GOWORK=off go test -n ./...",
+            "cd /tmp && GOWORK=off go vet ./...",
+            "set -e +o pipefail; GOWORK=off go test ./... | tail -10",
+        ] {
+            record.runtime_args_full = Some(json!({"command": command}).to_string());
+            assert!(is_authoritative_unchanged_bash_observation_record(&record));
+            assert!(
+                !record_can_observe_bound_workspace(Some("/workspace"), &record),
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -5738,7 +5861,7 @@ mod tests {
             "rm /tmp/scratch && cd /tmp/project && cargo test -q",
         ] {
             assert!(
-                bash_command_has_scoped_workspace_observation(command, root),
+                bash_command_has_scoped_workspace_observation(command, root, None),
                 "a final bound-workspace receipt must survive earlier external scratch work: {command}"
             );
         }
@@ -5750,7 +5873,7 @@ mod tests {
             "cat /tmp/unrelated",
         ] {
             assert!(
-                !bash_command_has_scoped_workspace_observation(command, root),
+                !bash_command_has_scoped_workspace_observation(command, root, None),
                 "external/stale evidence must not satisfy the bound-workspace contract: {command}"
             );
         }
@@ -5766,7 +5889,7 @@ mod tests {
             "cd /app && bash acceptance.sh",
         ] {
             assert!(
-                bash_command_has_scoped_workspace_observation(command, root),
+                bash_command_has_scoped_workspace_observation(command, root, None),
                 "executing a literal script from the bound workspace observes the delivered artifact: {command}"
             );
         }
@@ -5786,7 +5909,7 @@ mod tests {
             "cd /app && python3 solution.py > result.txt",
         ] {
             assert!(
-                !bash_command_has_scoped_workspace_observation(command, root),
+                !bash_command_has_scoped_workspace_observation(command, root, None),
                 "inline, dynamic, or external interpreter input is not bound-workspace evidence: {command}"
             );
         }

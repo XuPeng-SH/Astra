@@ -1288,18 +1288,24 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     // A validated root failure retains observed output. Local transport and
     // protocol failures still tombstone it; all aborts discard executable work.
     if abort.is_some() {
-        let preserve_failed_output = abort_message.is_none()
-            && accum.has_authoritative_failed_terminal()
-            && accum
-                .run_terminal
-                .as_ref()
-                .and_then(|terminal| terminal.error_kind)
-                == abort;
+        let interrupted_terminal = abort_message.is_none()
+            && abort == Some(astra_core::ErrorKind::ContractViolation)
+            && accum.has_authoritative_interrupted_terminal();
+        let preserve_failed_output = interrupted_terminal
+            || (abort_message.is_none()
+                && accum.has_authoritative_failed_terminal()
+                && accum
+                    .run_terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.error_kind)
+                    == abort);
         accum.stream_complete = false;
         if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
             abort = accum.error_kind;
         }
-        accum.error_kind = abort;
+        if !interrupted_terminal {
+            accum.error_kind = abort;
+        }
         // A canonical save failure invalidates completion, not text already
         // received. Keep its partial display while discarding executable work.
         if !preserve_failed_output
