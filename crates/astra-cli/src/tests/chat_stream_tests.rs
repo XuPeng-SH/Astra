@@ -134,7 +134,11 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             request["request_id"] = serde_json::json!(format!("read-{index}"));
             if index >= root_callbacks {
                 request["run_id"] = serde_json::json!("child-run");
-                request["session_id"] = serde_json::json!("child-session");
+                request["session_id"] = serde_json::json!(if callback_failed {
+                    "partial-session"
+                } else {
+                    "child-session"
+                });
             }
             request["args"]["start_line"] = serde_json::json!(index + 1);
             request["args"]["end_line"] = serde_json::json!(index + 1);
@@ -254,7 +258,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             let failure = result.unwrap_err();
             assert_eq!(failure.partial.tool_calls_count, 0);
             assert!(failure.partial.tool_call_records.is_empty());
-            let events = session_journal::read_journal("child-session").unwrap();
+            let events = session_journal::read_journal("partial-session").unwrap();
             let observation = events
                 .iter()
                 .find(|event| event.event_type == JournalEventType::SyncMarker)
@@ -280,6 +284,34 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 callbacks_received.load(std::sync::atomic::Ordering::SeqCst),
                 1
             );
+            let mut root_error = session_journal::JournalEvent::turn_error(
+                Some("partial-session"),
+                1,
+                None,
+                "request",
+                "callback failed",
+                1,
+            )
+            .with_producer_scope(Some("partial-run"));
+            crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
+                &mut root_error,
+                &failure.partial,
+            );
+            session_journal::JournalWriter::new("partial-session")
+                .unwrap()
+                .append(&root_error)
+                .unwrap();
+            let diff = crate::cli::journal_diff::compute_diff("partial-session", "partial-session")
+                .unwrap();
+            assert_eq!(diff.a_tool_calls_executed, 2);
+            assert_eq!(diff.a_tool_sequence, ["read_file", "read_file"]);
+            assert!(!diff.a_tool_sequence_complete);
+            let digest = crate::cli::journal_digest::build_digest(
+                "partial-session",
+                crate::cli::journal_digest::DigestFocus::All,
+            )
+            .unwrap();
+            assert_eq!(digest.aggregates.total_tool_calls, 0);
             continue;
         }
         if classified {
