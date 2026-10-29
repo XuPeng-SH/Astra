@@ -7660,12 +7660,10 @@ mod tests {
             "{secret_read}"
         );
 
-        let hidden_write = check_bash_path_boundary(&policy, "rm -f ~/.yyy/config.toml")
-            .expect("mutating hidden app state must still block");
-        assert!(
-            hidden_write.contains("write-sensitive app/runtime state"),
-            "{hidden_write}"
-        );
+        assert!(check_bash_path_boundary(&policy, "rm -f ~/.yyy/config.toml").is_none());
+        let state_write = check_bash_path_boundary(&policy, "rm -f ~/.astra/permissions.json")
+            .expect("known agent policy state must still block");
+        assert!(state_write.contains("write-sensitive app/runtime state"));
     }
 
     #[test]

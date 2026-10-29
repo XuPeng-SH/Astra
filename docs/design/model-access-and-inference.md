@@ -1876,3 +1876,14 @@ system, tool, and cache-marker hashes remain diagnostic metadata; they never
 substitute for provider-final identities in structural break classification.
 Protocol changes are attributed separately; protocol-native marker changes are
 represented by the exact component identity that contains those markers.
+
+### Typed judgment generation allowance
+
+Typed completion callers distinguish the minimum serialized answer budget from
+total generation allowance. The shared judgment request provides a bounded
+8,192-token total allowance for ordinary judgments, covering reasoning and the
+answer together. Larger answer envelopes retain their explicit minimum and remain
+subject to the transport and model limits. Model admission
+still checks the complete answer minimum, and Server dispatch caps total generation
+at the admitted model limit. Non-normal finishes remain unscorable; increasing the
+allowance never turns a truncated response into a judgment.

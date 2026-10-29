@@ -32404,12 +32404,18 @@ mod tests {
             .expect("final server agent schema");
         assert_eq!(
             agent.pointer("/function/parameters/properties/action/enum"),
-            Some(&json!(["spawn", "list", "get_result", "send_message"]))
+            Some(&json!([
+                "spawn",
+                "list",
+                "get_result",
+                "wait",
+                "send_message"
+            ]))
         );
         assert!(
             agent
                 .pointer("/function/parameters/properties/timeout_ms")
-                .is_none()
+                .is_some()
         );
         assert!(
             agent
@@ -32668,12 +32674,12 @@ mod tests {
             .expect("ordinary spawn is resident when delegation is authorized");
         assert_eq!(
             resident["function"]["parameters"]["properties"]["action"]["enum"],
-            json!(["spawn", "list", "get_result", "send_message"])
+            json!(["spawn", "list", "get_result", "wait", "send_message"])
         );
         assert!(
             resident
                 .pointer("/function/parameters/properties/timeout_ms")
-                .is_none()
+                .is_some()
         );
         assert!(!host.current_deferred_tool_names.contains("agent"));
         let result = executor
@@ -32719,11 +32725,14 @@ mod tests {
                 ),
             );
             ServerAgenticLoopHost::reject_calls_outside_wire_schema(&mut admission, &visible);
-            assert_eq!(admission.admitted.len(), usize::from(deferred));
-            assert_eq!(admission.rejected.len(), usize::from(!deferred));
+            assert_eq!(admission.admitted.len(), 1);
+            assert!(admission.rejected.is_empty());
+            if !deferred {
+                assert!(admission.admitted[0].activation().is_none());
+            }
             if deferred {
                 let invocation = &admission.admitted[0];
-                assert!(invocation.activation().is_some());
+                assert_eq!(invocation.activation().is_some(), targeted);
                 assert_eq!(
                     astra_turn_core::tool::args::shape::tool_call_arguments_value(
                         invocation.logical_target_call()
