@@ -2152,6 +2152,55 @@ impl<'a> CliSseStreamHost<'a> {
             })
     }
 
+    fn journal_child_callback_observations(&self, results: &[EdgeToolExecResult]) {
+        use astra_services::session_journal::{JournalWriter, journal_content_redact_enabled};
+        let mut children = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for result in results {
+            if self.callback_tool_belongs_to_foreground(&result.request_id) {
+                continue;
+            }
+            let Some(identity) = self.tool_result_identities.get(&result.request_id) else {
+                continue;
+            };
+            let mut record =
+                astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result);
+            if journal_content_redact_enabled() {
+                record.args_full = None;
+                record.result_full = None;
+                record.result_preview = None;
+                record.error = None;
+            } else {
+                let mut args = result.args.clone();
+                astra_text_utils::credential_redaction::redact_credentials_in_json(&mut args);
+                record.args_full = Some(args.to_string());
+            }
+            children
+                .entry((&identity.session_id, &identity.run_id))
+                .or_default()
+                .push(record);
+        }
+        for ((session_id, run_id), records) in children {
+            // A callback failure leaves acknowledgement uncertain for the batch.
+            // Preserve local observations without inventing Server settlement or
+            // adding child calls to the foreground terminal's aggregate.
+            let mut event = JournalEvent::sync_marker(
+                Some(session_id),
+                None,
+                None,
+                Some("Callback delivery failed; local tool observations, not Server settlement."),
+            )
+            .with_producer_scope(Some(run_id));
+            event.tool_calls = Some(records);
+            let writer = match self.owner_auth_snapshot.as_ref() {
+                Some(owner) => JournalWriter::for_owner(&owner.owner_scope, session_id),
+                None => JournalWriter::new(session_id),
+            };
+            if let Err(error) = writer.and_then(|writer| writer.append(&event)) {
+                tracing::warn!(%session_id, %run_id, %error, "failed to retain child callback observations");
+            }
+        }
+    }
+
     fn tool_result_request(
         &self,
         request_id: &str,
@@ -8622,12 +8671,14 @@ pub(crate) async fn consume_turn_sse(
             .await;
         }
         // Children share this physical callback lane. Only the foreground run
-        // owns the records used by its completion count and local journal;
-        // child receipts have already been delivered to their Server owner.
+        // owns the records used by its completion count and local journal.
         let mut edge_tool_round = merge_edge_tool_rounds(
             std::mem::take(&mut host.edge_tool_round),
             &result.tool_results,
         );
+        if host.auth_failure || host.callback_failure.is_some() {
+            host.journal_child_callback_observations(&edge_tool_round);
+        }
         edge_tool_round
             .retain(|record| host.callback_tool_belongs_to_foreground(&record.request_id));
         let lw = host.render.lines_written;

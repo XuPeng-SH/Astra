@@ -72,6 +72,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         Interrupted,
         Mismatched,
         Completed,
+        CallbackFailed,
     }
     use Terminal::*;
     for (terminal_kind, reported_count, root_callbacks, child_callbacks) in [
@@ -89,7 +90,9 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         (Completed, Some(2), 1, 3),
         (Failed, None, 1, 3),
         (Interrupted, None, 1, 3),
+        (CallbackFailed, None, 0, 2),
     ] {
+        let callback_failed = matches!(terminal_kind, CallbackFailed);
         let classified = matches!(terminal_kind, Failed);
         let mismatched_summary = matches!(terminal_kind, Mismatched);
         let completed = matches!(terminal_kind, Completed);
@@ -180,7 +183,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         }
         let callbacks_received = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let notify = callback_done.clone();
-        let callbacks_received = callbacks_received.clone();
+        let received_for_route = callbacks_received.clone();
         let app =
             Router::new()
                 .route(
@@ -195,13 +198,16 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                                 Ok::<_, std::io::Error>(prefix)
                             })
                             .chain(futures_util::stream::once(async move {
-                                if callback_count > 0 {
+                                if callback_count > 0 && !callback_failed {
                                     tokio::time::timeout(
                                         std::time::Duration::from_secs(5),
                                         notify.notified(),
                                     )
                                     .await
                                     .unwrap();
+                                }
+                                if callback_failed {
+                                    std::future::pending::<()>().await;
                                 }
                                 Ok::<_, std::io::Error>(suffix)
                             }));
@@ -213,7 +219,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                     "/tools/result",
                     post(move || {
                         let notify = callback_done.clone();
-                        let callbacks_received = callbacks_received.clone();
+                        let callbacks_received = received_for_route.clone();
                         async move {
                             if callbacks_received.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                                 + 1
@@ -221,7 +227,14 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                             {
                                 notify.notify_one();
                             }
-                            Json(serde_json::json!({"ok":true}))
+                            (
+                                if callback_failed {
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                                } else {
+                                    axum::http::StatusCode::OK
+                                },
+                                Json(serde_json::json!({"ok":!callback_failed})),
+                            )
                         }
                     }),
                 );
@@ -237,6 +250,38 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             &mut pm,
         ))
         .await;
+        if callback_failed {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 0);
+            assert!(failure.partial.tool_call_records.is_empty());
+            let events = session_journal::read_journal("child-session").unwrap();
+            let observation = events
+                .iter()
+                .find(|event| event.event_type == JournalEventType::SyncMarker)
+                .unwrap();
+            assert_eq!(
+                observation.producer_scope.as_ref().unwrap().run_id,
+                "child-run"
+            );
+            assert!(observation.tool_count.is_none());
+            assert!(observation.tool_outcomes.is_none());
+            let records = observation.tool_calls.as_ref().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|record| record.ok));
+            assert!(
+                records[1]
+                    .result_full
+                    .as_ref()
+                    .unwrap()
+                    .contains("second evidence")
+            );
+            // Both reads ran in the batch, but only its first result was posted.
+            assert_eq!(
+                callbacks_received.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            continue;
+        }
         if classified {
             let failure = result.unwrap_err();
             assert_eq!(failure.partial.partial_text, "Partial result.");
