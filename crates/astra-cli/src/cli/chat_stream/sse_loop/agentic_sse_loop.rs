@@ -164,10 +164,13 @@ where
 
     let mut tools_used = normalize_name_list(tools_used);
     tools_used.sort_unstable();
-    let tool_calls_count = if aggregate_authoritative || record_tool_calls_count == 0 {
+    let tool_calls_count = if aggregate_authoritative {
         fallback_count
     } else {
-        record_tool_calls_count
+        // Without a complete aggregate both sources are lower bounds. A
+        // partial callback list must neither erase remote calls nor vanish
+        // when the Server could not report its total.
+        fallback_count.max(record_tool_calls_count)
     };
     (tool_calls_count, tools_used)
 }
@@ -251,11 +254,11 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         run_transcript_messages,
         applied_user_intents,
     } = ctx;
-    let (_, tools_used) = resolved_tool_metrics(
+    let (tool_calls_count, tools_used) = resolved_tool_metrics(
         tool_calls_count,
         tools_used,
         &tool_call_records,
-        server_terminal_authoritative || tool_record_coverage_partial,
+        tool_ledger_aggregate.is_complete_for(tool_calls_count),
     );
     let mut interruption = interruption;
     let mut server_terminal_unverified = server_terminal_unverified;

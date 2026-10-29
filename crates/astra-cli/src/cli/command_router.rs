@@ -5112,12 +5112,19 @@ mod exit_code_tests {
 
     #[test]
     fn failed_remote_run_does_not_invent_tool_result_classes() {
-        let mut failure = accepted_failed_run();
-        failure.partial.tool_calls_count = 4;
-        failure.partial.tool_outcomes = Some(Default::default());
-        let json = super::hard_failure_json_output(failure);
-        assert_eq!(json["tool_calls_count"], 4);
-        assert_eq!(json["tool_result_class_counts"], serde_json::json!({}));
+        for (count, outcomes) in [
+            (0, None),
+            (1, None),
+            (4, None),
+            (4, Some(Default::default())),
+        ] {
+            let mut failure = accepted_failed_run();
+            failure.partial.tool_calls_count = count;
+            failure.partial.tool_outcomes = outcomes;
+            let json = super::hard_failure_json_output(failure);
+            assert_eq!(json["tool_calls_count"], count);
+            assert_eq!(json["tool_result_class_counts"], serde_json::json!({}));
+        }
     }
 
     #[test]

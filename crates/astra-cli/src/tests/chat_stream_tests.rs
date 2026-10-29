@@ -71,6 +71,9 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         (false, None, false),
         (true, None, false),
         (true, Some(4), true),
+        (true, None, true),
+        (false, Some(4), true),
+        (false, None, true),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("evidence.txt");
@@ -165,7 +168,7 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             assert_eq!(failure.partial.partial_text, "Partial result.");
             assert_eq!(
                 failure.partial.tool_calls_count,
-                reported_count.unwrap_or(0)
+                reported_count.unwrap_or(u32::from(callback))
             );
             assert_eq!(
                 failure.partial.tool_call_records.len(),
@@ -180,8 +183,15 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
         }
         let result = result.unwrap();
         assert_eq!(result.full_text, "Partial result.");
-        assert_eq!(result.tool_calls_count, reported_count.unwrap_or(0));
+        assert_eq!(
+            result.tool_calls_count,
+            reported_count.unwrap_or(u32::from(callback))
+        );
         assert!(result.canonical_tool_outcomes().is_none());
+        assert_eq!(result.tool_call_records.len(), usize::from(callback));
+        if callback {
+            assert!(result.tool_call_records[0].ok);
+        }
         assert!(result.tool_record_coverage_partial);
         assert!(result.interruption.is_some());
     }

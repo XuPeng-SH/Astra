@@ -855,7 +855,10 @@ async fn stream_chat_sse_inner(
             state.total_tool_calls,
             state.telemetry.all_tools_used.iter().cloned(),
             &state.stall.tool_call_records,
-            true, // Server total includes calls that never reached this Edge.
+            state
+                .remote_summary
+                .as_ref()
+                .is_some_and(|summary| summary.has_complete_tool_ledger()),
         );
         // Callback records are only local observations, never a complete
         // Server ledger, even when their count happens to match a fallback.
