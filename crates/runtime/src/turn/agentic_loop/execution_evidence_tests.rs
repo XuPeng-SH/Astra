@@ -49,6 +49,8 @@ async fn run_written_go_verification(
 async fn go_verification_after_write_finishes_without_redundant_observation() {
     for command in [
         "go test ./...",
+        "mkdir -p /tmp/astra-cache && go test ./...",
+        "mkdir -p /tmp/astra-cache && GOWORK=off go test ./... 2>&1 | tail -10",
         "GOWORK=off go test ./...",
         "GOWORK=off go test -skip TestIntegration -covermode=atomic -coverpkg=./... ./...",
         "GOWORK=off go build ./... && GOWORK=off go vet ./... && echo BUILD_VET_OK",
@@ -92,6 +94,51 @@ async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_
             "success",
         ),
         ("true || GOWORK=off go test ./...", "success", "success"),
+        (
+            "mkdir -p /tmp/astra-cache && go test ./...",
+            "inconclusive",
+            "domain_negative",
+        ),
+        (
+            "mkdir -p /tmp/astra-cache && go test ./...",
+            "test_failure",
+            "domain_negative",
+        ),
+        (
+            "mkdir -p /tmp/astra-cache | cat && go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "GOFLAGS=$(cat /tmp/flags) && mkdir -p /tmp/astra-cache && go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "go env -w GOFLAGS=-n && mkdir -p /tmp/astra-cache && go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "go generate ./... && mkdir -p /tmp/astra-cache && go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "printf -v PATH /tmp/fakebin && mkdir -p /tmp/astra-cache && go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "printf '%n' PATH && mkdir -p /tmp/astra-cache && go test ./...",
+            "success",
+            "success",
+        ),
+        (
+            "mkdir -p /tmp/astra-cache && export PATH=/tmp/fakebin && go test ./... && cargo test",
+            "success",
+            "success",
+        ),
     ] {
         let (state, host) = run_written_go_verification(command, class, semantics).await;
         assert_eq!(

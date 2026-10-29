@@ -1,5 +1,7 @@
+pub(crate) use astra_turn_core::evaluation::path_is_external_volatile_scratch;
+use astra_turn_core::evaluation::{external_scratch_setup, normalize_absolute_path};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -1613,28 +1615,6 @@ pub(crate) fn record_explicit_path(
         .map(ToString::to_string)
 }
 
-fn normalize_absolute_path(path: &str) -> Option<PathBuf> {
-    let path = Path::new(path);
-    if !path.is_absolute() {
-        return None;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(Path::new("/")),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            Component::Normal(value) => normalized.push(value),
-        }
-    }
-    Some(normalized)
-}
-
 /// A shell-expanded path is not a durable scope receipt.  Resolving it as a
 /// literal relative path can accidentally place an external `$TMPDIR`/glob
 /// under the bound workspace and promote unrelated validation to success.
@@ -2534,6 +2514,21 @@ pub(crate) fn bash_invocation_has_scoped_workspace_observation(
     {
         return false;
     }
+    if astra_turn_core::evaluation::bash_command_has_go_validation(command) {
+        let root = root
+            .and_then(normalize_absolute_path)
+            .expect("checked Go root");
+        let Some(segments) =
+            astra_turn_core::evaluation::split_shell_control_segments_with_ops(command)
+        else {
+            return false;
+        };
+        if segments.iter().any(|(segment, _)| {
+            external_scratch_setup(segment, None) && !external_scratch_setup(segment, root.to_str())
+        }) {
+            return false;
+        }
+    }
     let workdir = match args.get("workdir") {
         None => None,
         Some(Value::String(workdir)) if !workdir.trim().is_empty() => Some(workdir.as_str()),
@@ -2593,25 +2588,6 @@ pub(crate) fn record_can_observe_bound_workspace(
         return root.is_none() || normalize_workspace_path(&path, root).is_some();
     }
     true
-}
-
-pub(crate) fn path_is_external_volatile_scratch(path: &str, workspace_root: Option<&str>) -> bool {
-    let Some(path) = normalize_absolute_path(path) else {
-        return false;
-    };
-    let workspace_root = workspace_root
-        .and_then(normalize_absolute_path)
-        .filter(|root| root != Path::new("/"));
-    if workspace_root
-        .as_ref()
-        .is_some_and(|root| path.starts_with(root))
-    {
-        return false;
-    }
-    ["/tmp", "/var/tmp", "/dev/shm"]
-        .into_iter()
-        .filter_map(normalize_absolute_path)
-        .any(|root| path == root || path.starts_with(root))
 }
 
 /// Return concrete targets only for a simple, unambiguous shell mutation.
@@ -2869,34 +2845,6 @@ fn shell_local_or_read_only(segment: &str) -> bool {
         .map(|word| word.trim_matches(['\'', '"']).to_ascii_lowercase());
     head.as_deref() == Some("cd")
         || astra_turn_core::cloud_approval_policy::bash_command_is_read_only(segment)
-}
-
-/// Prove a small class of shell-local setup mutations whose every destination
-/// is already outside the bound workspace.  Reviewers commonly create a
-/// scratch directory before redirecting `git show` output into it; treating
-/// `mkdir -p /tmp/...` as an opaque writer recreates the same false mutation
-/// epoch as an external redirect.  Unknown writers, relative paths, and any
-/// workspace target remain barriers.
-fn external_scratch_setup(segment: &str, workspace_root: Option<&str>) -> bool {
-    let normalized = astra_turn_core::cloud_approval_policy::strip_benign_fd_redirects(segment);
-    let Some(args) = astra_turn_core::evaluation::split_static_shell_words(&normalized) else {
-        return false;
-    };
-    let Some(head) = args.first().map(String::as_str) else {
-        return false;
-    };
-    if !matches!(head, "mkdir" | "touch" | "rm") {
-        return false;
-    }
-    let paths = args
-        .iter()
-        .skip(1)
-        .filter(|arg| !arg.starts_with('-'))
-        .collect::<Vec<_>>();
-    !paths.is_empty()
-        && paths.iter().all(|path| {
-            Path::new(path).is_absolute() && path_is_external_volatile_scratch(path, workspace_root)
-        })
 }
 
 /// Validate the bounded `for ...; do read-only body; done > /tmp/file` shape
@@ -5235,6 +5183,46 @@ mod tests {
             .expect("weak receipt"),
         );
         assert!(!is_authoritative_unchanged_bash_observation_record(&weak));
+    }
+
+    #[test]
+    fn go_scratch_setup_requires_a_concrete_external_scope_and_settled_result() {
+        let mut record = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            runtime_args_full: Some(
+                json!({"command": "mkdir -p /tmp/astra-cache && go test ./..."}).to_string(),
+            ),
+            result_class: Some("success".into()),
+            exit_semantics: Some("success".into()),
+            ..Default::default()
+        };
+        assert!(record_can_observe_bound_workspace(
+            Some("/workspace"),
+            &record
+        ));
+        for root in [
+            None,
+            Some("/"),
+            Some("/tmp"),
+            Some("/tmp/astra-cache"),
+            Some("/tmp/astra-cache/repo"),
+            Some("relative"),
+        ] {
+            assert!(
+                !record_can_observe_bound_workspace(root, &record),
+                "{root:?}"
+            );
+        }
+        for (changed, partial) in [(Some(true), None), (None, Some(true))] {
+            record.workspace_mutation_observed = changed;
+            record.workspace_mutation_partial = partial;
+            assert!(!record_can_observe_bound_workspace(
+                Some("/workspace"),
+                &record
+            ));
+        }
     }
 
     #[test]

@@ -124,7 +124,15 @@ They require a positively successful executed result within the bound workspace;
 dry-run, redirected-scope and opaque wrapper forms are not positive proof.
 Environment configuration and ordered validation stages remain part of operation
 identity: a successful vet does not clear a failed test or a failed build/vet
-chain. Executors enable pipefail for pipelines; commands that may disable that
+chain. A literal external scratch setup followed by `&&` may precede a Go
+check, using the existing scratch-scope contract and a concrete bound root.
+Its entire command remains the operation identity, so a bare check cannot clear
+a failure that may have occurred during setup. Shell configuration changes,
+opaque preparation and concurrent setup do not grant this proof. Scratch paths
+must not overlap the workspace in either direction; ancestor setup is rejected
+even for a benign mkdir. Shell-variable-capable printf stages remain opaque in
+this compound form instead of adding a shell format interpreter.
+Executors enable pipefail for pipelines; commands that may disable that
 setting cannot use the final pipeline stage's success as validation evidence.
 An unchanged Bash fingerprint prevents a false mutation barrier but is not, by
 itself, evidence that any workspace observation or requested validation occurred.

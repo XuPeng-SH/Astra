@@ -12223,6 +12223,14 @@ mod tests {
             ("GOWORK=off go test ./...", "go test ./..."),
             ("GOWORK=off go test ./...", "GOWORK=off go build ./..."),
             (chain, "GOWORK=off go vet ./..."),
+            (
+                "mkdir -p /tmp/astra-cache && go test ./...",
+                "go test ./...",
+            ),
+            (
+                "mkdir -p /tmp/astra-cache && go test ./... && echo OK",
+                "mkdir -p /tmp/astra-cache && go test ./...",
+            ),
         ] {
             let mut state = make_state();
             state.hooks.workspace_root_hint = Some("/workspace".into());
@@ -12242,6 +12250,19 @@ mod tests {
             assert_eq!(
                 WorkValidationEvidence::collect(&state, true).state,
                 WorkValidationState::Passed
+            );
+        }
+        for root in ["/", "/tmp", "/tmp/astra-cache", "/tmp/astra-cache/repo"] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some(root.into());
+            state.stall.tool_call_records = vec![validation_record(
+                "mkdir -p /tmp/astra-cache && go test ./...",
+                "success",
+            )];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Stale,
+                "{root}"
             );
         }
         let mut state = make_state();

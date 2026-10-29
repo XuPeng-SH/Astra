@@ -17,6 +17,7 @@ use crate::orchestration::agent_result_wire::{
 };
 use astra_services::session_journal::{JournalEvent, ToolCallRecord};
 use serde_json::{Value, json};
+use std::path::{Component, Path, PathBuf};
 
 /// Signals detected during evaluation.
 #[derive(Debug, Clone, PartialEq)]
@@ -2808,6 +2809,75 @@ fn typescript_args_prove_validation(words: &[String]) -> bool {
     true
 }
 
+/// Normalize an absolute evidence path lexically, without accessing the filesystem.
+pub fn normalize_absolute_path(path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Some(normalized)
+}
+
+/// Whether a lexical scratch destination is outside a concrete workspace binding.
+pub fn path_is_external_volatile_scratch(path: &str, workspace_root: Option<&str>) -> bool {
+    let Some(path) = normalize_absolute_path(path) else {
+        return false;
+    };
+    let workspace_root = workspace_root.and_then(normalize_absolute_path);
+    if workspace_root
+        .as_ref()
+        .is_some_and(|root| path.starts_with(root) || root.starts_with(&path))
+    {
+        return false;
+    }
+    ["/tmp", "/var/tmp", "/dev/shm"]
+        .into_iter()
+        .filter_map(normalize_absolute_path)
+        .any(|root| path == root || path.starts_with(root))
+}
+
+/// Prove a small class of shell-local setup mutations whose every destination
+/// is already outside the bound workspace.  Reviewers commonly create a
+/// scratch directory before redirecting `git show` output into it; treating
+/// `mkdir -p /tmp/...` as an opaque writer recreates the same false mutation
+/// epoch as an external redirect.  Unknown writers, relative paths, and any
+/// workspace target remain barriers.
+pub fn external_scratch_setup(segment: &str, workspace_root: Option<&str>) -> bool {
+    let normalized = crate::cloud_approval_policy::strip_benign_fd_redirects(segment);
+    let Some(args) = split_static_shell_words(&normalized) else {
+        return false;
+    };
+    let Some(head) = args.first().map(String::as_str) else {
+        return false;
+    };
+    if !matches!(head, "mkdir" | "touch" | "rm") {
+        return false;
+    }
+    let paths = args
+        .iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .collect::<Vec<_>>();
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            Path::new(path).is_absolute() && path_is_external_volatile_scratch(path, workspace_root)
+        })
+}
+
 fn go_args_prove_local_validation(args: &[String]) -> bool {
     let mut index = 0;
     while let Some(arg) = args.get(index) {
@@ -3062,6 +3132,8 @@ fn bash_command_post_mutation_validation_prefix_kind(
     let mut latest = Vec::new();
     let mut has_validator = false;
     let mut opaque_predecessor = false;
+    let mut has_scratch_setup = false;
+    let has_go_validation = bash_command_has_go_validation(command);
     let control_segments = split_shell_control_segments_with_ops(command)?;
     for (segment_index, (raw_segment, op_after)) in control_segments.iter().enumerate() {
         let pipeline_segments = split_top_level_pipeline_segments(raw_segment)?;
@@ -3094,6 +3166,16 @@ fn bash_command_post_mutation_validation_prefix_kind(
                     }
                     latest.push(segment.to_string());
                 }
+                continue;
+            }
+            if has_go_validation
+                && !is_pipeline
+                && !has_validator
+                && !opaque_predecessor
+                && matches!(op_after, ShellControlOp::And)
+                && external_scratch_setup(segment, None)
+            {
+                has_scratch_setup = true;
                 continue;
             }
             if let Some(candidate) = normalized_validation_segment(&normalized, segment) {
@@ -3147,6 +3229,39 @@ fn bash_command_post_mutation_validation_prefix_kind(
             latest.clear();
             has_validator = false;
         }
+    }
+    if has_scratch_setup {
+        // Setup belongs to the failed operation too: an overall failure may
+        // have stopped before the validator. Never let a bare check discharge
+        // that debt. Static words also exclude shell-local assignments and
+        // substitutions that can change the later validator's configuration.
+        if !has_validator
+            || opaque_predecessor
+            || control_segments.iter().any(|(segment, op)| {
+                !matches!(op, ShellControlOp::And | ShellControlOp::Neutral)
+                    || split_top_level_pipeline_segments(segment).is_none_or(|parts| {
+                        parts.iter().any(|part| {
+                            let part =
+                                crate::cloud_approval_policy::strip_benign_fd_redirects(part);
+                            split_static_shell_words(&part).is_none_or(|words| {
+                                words.is_empty()
+                                    // printf can write shell variables through
+                                    // -v or %n; static words are not proof that
+                                    // it is merely an output stage.
+                                    || words[0] == "printf"
+                                    || (words[0].contains('=')
+                                        && go_validation_candidate(part.trim()).is_none())
+                            })
+                        })
+                    })
+            })
+            || astra_text_utils::credential_redaction::redact_credentials_for_display(command).1
+                != 0
+            || astra_text_utils::credential_redaction::redaction_marker_status(command).1
+        {
+            return None;
+        }
+        return Some(command.to_string());
     }
     has_validator.then(|| latest.join(" && "))
 }
@@ -8069,6 +8184,84 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn external_scratch_scope_excludes_workspace_overlap_in_both_directions() {
+        for (root, external) in [
+            (None, true),
+            (Some("/workspace"), true),
+            (Some("/tmp/sibling"), true),
+            (Some("/tmp/astra-cache"), false),
+            (Some("/tmp/astra-cache/repo"), false),
+            (Some("/tmp"), false),
+            (Some("/"), false),
+        ] {
+            assert_eq!(
+                external_scratch_setup("rm -rf /tmp/astra-cache", root),
+                external,
+                "{root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_scratch_setup_retains_the_whole_go_validation_operation() {
+        for command in [
+            "mkdir -p /tmp/astra-cache && go test ./...",
+            "cd /workspace && mkdir -p /tmp/astra-cache && GOWORK=off go build ./... && GOWORK=off go vet ./... && echo OK",
+            "rm -f /var/tmp/astra-log && touch /tmp/astra-log && GOWORK=off go test ./...",
+            "mkdir -p /tmp/astra-cache && GOWORK=off go test ./... 2>&1 | tail -10",
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &args).as_deref(),
+                Some(command)
+            );
+            assert_eq!(
+                normalize_validation_prefix("bash", &args).as_deref(),
+                Some(command)
+            );
+            assert!(!crate::cloud_approval_policy::bash_command_is_read_only(
+                command
+            ));
+        }
+        for command in [
+            "mkdir -p /tmp/astra-cache; go test ./...",
+            "mkdir -p /tmp/astra-cache || go test ./...",
+            "mkdir -p /tmp/astra-cache | cat && go test ./...",
+            "mkdir -p relative-cache && go test ./...",
+            "mkdir -p /workspace/cache && go test ./...",
+            "mkdir -p /tmp/astra-cache && export GOFLAGS=-n && go test ./...",
+            "go env -w GOFLAGS=-n && mkdir -p /tmp/astra-cache && go test ./...",
+            "go generate ./... && mkdir -p /tmp/astra-cache && go test ./...",
+            "GOFLAGS=$(cat /tmp/flags) && mkdir -p /tmp/astra-cache && go test ./...",
+            "GOFLAGS=-n && mkdir -p /tmp/astra-cache && go test ./...",
+            "printf -v PATH /tmp/fakebin && mkdir -p /tmp/astra-cache && go test ./...",
+            "printf -vPATH /tmp/fakebin && mkdir -p /tmp/astra-cache && go test ./...",
+            "printf '%n' PATH && mkdir -p /tmp/astra-cache && go test ./...",
+            "mkdir -p /tmp/astra-cache && export PATH=/tmp/fakebin && go test ./... && cargo test",
+            "mkdir -p /tmp/astra-cache && go test ./... && touch /tmp/late",
+            "mkdir -p /tmp/astra-cache && go test ./... && echo password=synthetic-secret-value-123456",
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert!(
+                normalize_validation_attempt_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+            assert!(
+                normalize_validation_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+        }
+        // The preparation rule is shared, but other validation families keep
+        // their existing operation identity and behavior.
+        let args =
+            serde_json::json!({"command":"mkdir -p /tmp/astra-cache && cargo test"}).to_string();
+        assert_eq!(
+            normalize_validation_prefix("bash", &args).as_deref(),
+            Some("cargo test")
+        );
     }
 
     #[test]
