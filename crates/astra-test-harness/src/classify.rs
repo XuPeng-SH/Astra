@@ -130,17 +130,6 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         return FailureClass::InfraRateLimit;
     }
 
-    // The runtime's empty-response code is provider evidence. Recovery prose
-    // such as "choose another authorized model" does not establish auth failure.
-    if outcome.exit_code != 0
-        && (outcome.error_code.as_deref() == Some("empty_completion")
-            || outcome.interruption_kind.as_deref() == Some("empty_completion"))
-    {
-        return FailureClass::InfraProviderError {
-            provider: extract_provider(&outcome.model, stderr),
-        };
-    }
-
     if stderr.contains("HTTP 400")
         || stderr.contains("HTTP 500")
         || stderr.contains("HTTP 502")
@@ -680,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_provider_failure_is_not_auth_recovery_prose() {
+    fn empty_completion_is_not_auth_recovery_prose() {
         let mut outcome = make_outcome().with_exit_code(3).with_stderr(
             "Choose another authorized model, or explicitly retry after the provider recovers.",
         );
@@ -688,12 +677,9 @@ mod tests {
         outcome.model = "provider/model".into();
         outcome.error_kind = Some("api_error".into());
         outcome.error_code = Some("empty_completion".into());
-        assert_eq!(
-            classify(&outcome, &[]),
-            FailureClass::InfraProviderError {
-                provider: "provider".into()
-            }
-        );
+        // Empty completion does not identify whether the provider or adapter
+        // lost the response; retain that uncertainty instead of guessing auth.
+        assert_eq!(classify(&outcome, &[]), FailureClass::Unknown);
         outcome.error_code = None;
         outcome.error_kind = Some("auth".into());
         outcome.stderr.clear();

@@ -1983,7 +1983,7 @@ impl ToolExecutor {
             visited.insert(canon);
         }
         self.list_dir_recursive(&dir, depth, 0, &mut out, &mut visited);
-        astra_tools::ToolResult::ok(if out.is_empty() {
+        astra_tools::ToolResult::text(if out.is_empty() {
             "(empty)".to_string()
         } else {
             truncate_output(out, tool_output_limit())
