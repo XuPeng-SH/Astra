@@ -20125,7 +20125,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_agent_wire_defers_observation_and_keeps_spawn_required_fields() {
+    fn resident_agent_wire_exposes_wait_and_keeps_spawn_required_fields() {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             astra_tools::schemas::all_tool_schemas(),
             &astra_config::ToolSurfaceConfig::default(),
@@ -20190,9 +20190,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|branch| branch["properties"]["action"]["enum"] != json!(["wait"]))
+                .any(|branch| branch["properties"]["action"]["enum"] == json!(["wait"]))
         );
-        assert!(schema["properties"].get("timeout_ms").is_none());
+        assert!(schema["properties"].get("timeout_ms").is_some());
         let canonical_tools = astra_tools::schemas::all_tool_schemas()
             .into_iter()
             .filter(|tool| tool["function"]["name"] == "agent")
@@ -20224,7 +20224,7 @@ mod tests {
                 &observation,
                 &body["tools"][0],
             )
-            .is_err()
+            .is_ok()
         );
         astra_tools::schemas::validate_tool_arguments_against_schema(
             "agent",
