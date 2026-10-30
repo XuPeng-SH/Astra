@@ -10,7 +10,7 @@ use astra_services::observation_capture::{
     all_agent_event_rows_were_inserted, canonical_observation_payload_hash, classify_capture,
     record_observation_collisions,
 };
-use astra_turn_core::contracts::{TurnAuxiliaryEventRecord, TurnSkillSelectionRecord};
+use astra_turn_core::contracts::TurnAuxiliaryEventRecord;
 use astra_turn_core::trace_event::TraceEvent;
 use uuid::Uuid;
 
@@ -833,29 +833,4 @@ mod tests {
             "trace token usage must be canonical-only: {err}"
         );
     }
-}
-
-pub(crate) async fn insert_turn_skill_selection(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    record: &TurnSkillSelectionRecord,
-) -> Result<(), sqlx::Error> {
-    query(
-        "INSERT INTO skill_selection_events \
-         (event_id, session_id, user_id, agent_id, user_query, selected_skills, skill_name, skill_version, selection_method, execution_success, execution_time_ms, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(&record.event_id)
-    .bind(&record.session_id)
-    .bind(&record.user_id)
-    .bind(&record.agent_id)
-    .bind(&record.user_query)
-    .bind(serde_json::json!(record.selected_skills).to_string())
-    .bind(&record.skill_name)
-    .bind(&record.skill_version)
-    .bind(&record.selection_method)
-    .bind(record.execution_success)
-    .bind(record.execution_time_ms)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }

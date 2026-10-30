@@ -128,19 +128,12 @@ pub(super) fn build_core_state(
             .with_uc_native(uc_provider)
             .with_pool(shared_pool.clone()),
     ))
-    .with_sandbox_service(Arc::new(
-        DatabaseSandboxService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
     .with_data_versioning_service(Arc::new(
         DatabaseDataVersioningService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
     ))
     .with_marketplace_service(Arc::new(
         DatabaseMarketplaceService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_marketplace_stats_service(Arc::new(
-        DatabaseMarketplaceStatsService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
     ))
     .with_session_audit_service(Arc::new(
         DatabaseSessionAuditService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
@@ -180,10 +173,6 @@ pub(super) fn install_turn_persistence_services(
     memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
 ) -> AppState {
     state
-        .with_turn_hook_db_writer(Arc::new(
-            DatabaseTurnHookDbWriter::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
-        ))
         .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(memoria_port)))
         .with_turn_auxiliary_event_writer(Arc::new(
             DatabaseTurnAuxiliaryEventWriter::new(settings.matrixone.clone())

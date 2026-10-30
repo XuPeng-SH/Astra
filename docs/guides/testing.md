@@ -491,7 +491,7 @@ when the terminal does not answer.
 
 ## Live MatrixOne system E2E
 
-CI runs four independent online jobs: `core-runtime`, `core-turn-core`,
+CI runs three independent online jobs: `core-runtime`,
 `core-services`, and `integration`. Each runner starts its own MatrixOne and
 Memoria stack and keeps `ASTRA_TEST_DB_IT_TEST_THREADS=1`. The core shards use
 distinct database suffixes as well. This parallelizes package builds and test
@@ -520,8 +520,8 @@ npm --prefix web run build
 Missing Web build artifacts fail the test; they do not silently skip coverage.
 
 `make test-online` still runs the complete suite, and `ASTRA_ONLINE_LANE=core`
-still runs all three core groups. To reproduce a CI shard, choose
-`ASTRA_ONLINE_LANE=core-runtime`, `core-turn-core`, `core-services`, or
+still runs both core groups. To reproduce a CI shard, choose
+`ASTRA_ONLINE_LANE=core-runtime`, `core-services`, or
 `integration` and run `make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci`
 with `ASTRA_TEST_DB_IT_TEST_THREADS=1`. Parallel CI isolation comes from separate
 service stacks; distinct database names alone do not remove shared-host load.

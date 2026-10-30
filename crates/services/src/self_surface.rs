@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::session_journal::{self, JournalEvent, JournalEventType};
-use crate::session_restore::{HybridRestoreService, RestoredSession};
+use crate::session_restore::{RestoredSession, SessionRestoreService};
 use crate::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 use astra_core::canonical_names::normalize_name_list as normalized_names;
 
@@ -512,7 +512,7 @@ async fn load_local_artifacts(session_id: &str) -> Result<LoadedSelfSurfaceArtif
     let workspace = session_workspace::read_workspace_optional(session_id)
         .map_err(|error| format!("failed to read workspace for session {session_id}: {error}"))?;
     let journal_events = read_journal_events(session_id)?;
-    let restore_service = HybridRestoreService::local_only();
+    let restore_service = SessionRestoreService::local_only();
     let restored = restore_service.restore_local_session(session_id).await?;
     if workspace.is_none() && restored.is_none() && journal_events.is_empty() {
         return Err(format!(

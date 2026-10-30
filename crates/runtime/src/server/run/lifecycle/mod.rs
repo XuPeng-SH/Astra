@@ -127,10 +127,7 @@ use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError, AgentLiveSignal,
     AgentLiveTermination, SharedAgentLiveEventSink,
 };
-use astra_turn_core::contracts::{
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord,
-};
+use astra_turn_core::contracts::{TurnObserverRequest, TurnObserverWorker};
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 use astra_turn_types::UserIntentStatus;
@@ -5722,8 +5719,6 @@ pub struct AgenticRunLifecycleService {
     /// Per-run progress event channel receivers (Phase F.3).
     /// Key: run_id → receiver that the WS handler drains.
     progress_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<ProgressEvent>>>>,
-    /// Hook DB writer for decision audit + skill selection persistence.
-    hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     /// Memoria observer worker for cross-session knowledge extraction.
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     /// Auxiliary event writer for ask_user lifecycle audit events.
@@ -5852,7 +5847,6 @@ impl AgenticRunLifecycleService {
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
-            hook_db_writer: None,
             observer_worker: None,
             auxiliary_event_writer: None,
             trace_ingestion: None,
@@ -6260,11 +6254,6 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::AgentBindingService>,
     ) -> Self {
         self.agent_binding_service = service;
-        self
-    }
-
-    pub fn with_hook_db_writer(mut self, writer: Arc<dyn TurnHookDbWriter>) -> Self {
-        self.hook_db_writer = Some(writer);
         self
     }
 
@@ -13823,7 +13812,6 @@ impl AgenticRunLifecycleService {
                 .map(|heartbeat| heartbeat.terminal_authority()),
             owner_pod_id: self.run_engine.execution_owner_pod_id().map(str::to_owned),
             user_message,
-            hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             metrics_registry: self.metrics_registry.clone(),
         };

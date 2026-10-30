@@ -26,7 +26,6 @@ pub mod introspection;
 pub mod judgment_presentation;
 pub mod llm_trusted_domains;
 pub mod marketplace;
-pub mod marketplace_stats;
 pub mod mcp_registry;
 pub mod model_request_context;
 pub mod model_routing;
@@ -43,7 +42,6 @@ pub mod delegation_model_requirement;
 pub mod resource_governor;
 pub mod runs;
 pub mod runtime_maintenance;
-pub mod sandbox;
 pub mod self_surface;
 pub mod semantic_judgment_observation;
 pub mod semantic_read_observation_store;
@@ -215,11 +213,6 @@ pub use llm_trusted_domains::{
 pub use marketplace::{
     DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService,
 };
-pub use marketplace_stats::{
-    DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
-    QualityReportData, SkillMarketplaceStats, SkillSearchQuery, SkillSearchResponse,
-    SkillSearchResult,
-};
 pub use mcp_registry::{
     DatabaseMcpRegistryService, McpBindingRequestData, McpDiscoveredToolData, McpRegisterRecord,
     McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
@@ -289,10 +282,6 @@ pub use runs::{
     run_list_cursor_db_updated_at, run_list_cursor_run_id, transform_run_event_for_client,
     validate_run_list_limit,
 };
-pub use sandbox::{
-    DatabaseSandboxService, SandboxCreateRequestData, SandboxRecord, SandboxService,
-    UnconfiguredSandboxService,
-};
 pub use self_surface::{
     AcceptanceSurface, BudgetState, BudgetSurface, CapabilitySurface, EnvironmentSurface,
     EventPreview, EvolutionRecord, EvolutionSurface, GoalSurface, HealthSurface, JournalSurface,
@@ -352,7 +341,7 @@ pub use state_sync::MatrixOneSyncService;
 pub use storage::{
     CleanupResult, RefreshCleanupBatch, RefreshCleanupStatus, RetentionPolicy,
     cleanup_expired_data, cleanup_refresh_session_batch, database_user_from_row,
-    ensure_core_schema, log_session_audit, resolve_active_skill_versions, session_record_from_row,
+    ensure_core_schema, log_session_audit, session_record_from_row,
 };
 pub use sync_outbox::{
     SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS, SYNC_OUTBOX_ACKED_RETAINED_RECORDS,

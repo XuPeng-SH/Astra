@@ -128,7 +128,6 @@ pub(super) async fn build_runtime_wiring(
     .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_agent_binding_service(state.agent_binding_service.clone())
     .with_reflect_service(state.reflect_service.clone())
-    .with_hook_db_writer(state.turn_persistence.hook_db_writer.clone())
     .with_observer_worker(state.turn_persistence.observer_worker.clone())
     .with_auxiliary_event_writer(state.turn_persistence.auxiliary_event_writer.clone())
     .with_run_concurrency_limit(run_concurrency_limit)

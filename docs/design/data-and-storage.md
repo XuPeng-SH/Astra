@@ -74,6 +74,10 @@ are retired. In-flight model recovery remains unsupported.
 
 ## Schema bootstrap
 
+The unused database CSL backend and its table declaration are retired. Server
+continuation uses canonical Context and Run checkpoints; CLI continuation uses
+its file CSL. Fresh schemas omit the database CSL table.
+
 Bootstrap supports a fresh database or the current schema contract. Canonical
 CREATE declarations define the complete table shape; startup validates it
 without ALTER-based upgrades, historical backfills, or retired-table cleanup.
@@ -161,6 +165,28 @@ comes only from the admitted canonical Context, including an empty head. It does
 not probe CSL or raw transcript rows to reconstruct missing Context. Imported or
 legacy-only transcripts remain readable as history; they do not silently become
 model context. Explicit Run resume continues through its checkpoint custody owner.
+
+Server Session resume materializes the owner-scoped canonical Context before
+activating the Session. Both full hydration and continuation fail when that
+state is missing or invalid; neither consults Server-local recovery files.
+Full hydration retains diagnostic token totals, title and branch hints, but
+these cannot authorize execution. CLI local journal/workspace and checkpoint
+recovery remain explicit local operations. The unused cloud
+`session_checkpoints` table and checkpoint-only Server fallback are retired;
+Run checkpoint custody remains with `run_checkpoints`.
+
+Fresh schemas also omit `skill_selection_events`, `infra_sandbox_metadata`
+and `skill_metrics`. The separate skill-selection writer copied queries and
+reported success without deriving it from execution. Actual skill resolution,
+activation, tool outcomes, decision audit and observer dispatch retain their
+existing owners. The metadata-only Sandbox CRUD API and its database-snapshot
+alias are removed; execution isolation belongs to the selected capacity provider
+and workspace. Marketplace report aggregation, global quality statistics and
+ranked search are removed; registry visibility, installation and personal-skill
+evaluation remain. No replacement projections or compatibility paths are added.
+These cuts apply to fresh databases. They do not delete existing physical tables
+or historical rows, and do not define a mixed-version deployment or data-retention
+transition.
 
 ## Retention
 

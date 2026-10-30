@@ -234,7 +234,7 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
 
     let marketplace = request_status(
         app.clone(),
-        request("GET", "/marketplace/search", auth_headers, Body::empty()),
+        request("GET", "/marketplace/installed", auth_headers, Body::empty()),
     )
     .await;
     assert_ne!(marketplace, StatusCode::NOT_FOUND);
@@ -307,4 +307,46 @@ async fn legacy_task_plan_and_todo_surfaces_are_not_routable() {
     )
     .await;
     assert_eq!(skills_test, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn retired_metadata_routes_are_not_registered() {
+    let app = build_test_router(build_guardrail_state());
+    let headers = &[
+        ("authorization", "Bearer test-token"),
+        ("content-type", "application/json"),
+    ];
+    for (method, path) in [
+        ("POST", "/sandbox"),
+        ("GET", "/sandbox"),
+        ("GET", "/sandbox/example"),
+        ("DELETE", "/sandbox/example"),
+        ("POST", "/data-versioning/sandbox/example/checkpoint"),
+        ("POST", "/marketplace/quality-report"),
+        ("GET", "/marketplace/stats/example"),
+        ("GET", "/marketplace/search"),
+    ] {
+        assert_eq!(
+            request_status(
+                app.clone(),
+                request(method, path, headers, Body::from("{}"))
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "{method} {path}"
+        );
+    }
+    assert_ne!(
+        request_status(
+            app,
+            request(
+                "GET",
+                "/data-versioning/checkpoints",
+                headers,
+                Body::empty()
+            )
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
 }

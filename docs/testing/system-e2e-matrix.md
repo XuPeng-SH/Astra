@@ -83,7 +83,7 @@ Shared helpers: `crates/runtime/tests/system_matrix_http_e2e/harness.rs`
 
 - **Shared database**: All tests use the same MatrixOne database from `AppSettings` (typically `astra_runtime`). There is **no separate schema per test**.
 - **Row isolation**: Each `bootstrap()` registers a **new user** (`prod_matrix_{uuid}`), creates a **new** `session_id`, and uses an `edge_agent_id` / `suffix` unique to that run. API state and SQL assertions are scoped by those IDs.
-- **Parallel runs**: Tests are safe to run in parallel by default (`cargo` / `make test-online` without `ASTRA_TEST_DB_IT_TEST_THREADS=1`). The full journey uses a **suffix-scoped marketplace skill name** (`e2e_matrix_mkt_{suffix}`) so concurrent runs do not fight over the same global marketplace stats key.
+- **Parallel runs**: Tests use isolated Session and user identifiers and support parallel execution.
 - **Opt-in serial**: If database connection limits or another shared dependency makes the lane flaky, run with `ASTRA_TEST_DB_IT_TEST_THREADS=1`. The Makefile passes `-j 1` to the online `nextest` invocations.
 
 ## API groups vs coverage (P0 / P1)
@@ -103,10 +103,9 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
 | Memory proxy | P1 | `/memory/*` | Memoria stub calls | `product_matrix_*` |
 | Edge §5.5 | P0 | `/agents/edge`, `/tools/result`, `/approval/respond` | `edge_agent_registry`, durable run events | `product_matrix_*`, `e2e_matrix_approval_respond_invalid_session_id`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order server-stream callback journeys, `e2e_matrix_duplicate_approval_response_idempotency`; legacy Task Lease claim/renew/release routes are not registered by runtime, so no live E2E is claimed |
-| Sandbox | P1 | `/sandbox` | `infra_sandbox_metadata` | `product_matrix_*` |
 | Skills / introspection | P1 | `/skills`, `/introspection/*` | mixed | `product_matrix_*` |
 | Evaluation (writes) | P1 | `POST` gate/validate, drift/run, loop | — | — (no system E2E; add when implementations return success) |
-| Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
+| Marketplace | P1 | installed skills; retired statistics routes return 404 | skill installations | `product_matrix_*` |
 | Chat (server-owned SSE) | P0 | `POST /chat/stream` | `agent_events`, `session_transcript_items`, audit/session projections | `product_matrix_*`, `e2e_matrix_chat_stream_session_info`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order callback journeys |
 | Chat / runs | P0 | `POST /chat`, `/chat/stream`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http`, `e2e_matrix_chat_stream_session_info` |
 | Platform | P1 | `GET /platform/snapshot` | — | `product_matrix_*` |
@@ -134,8 +133,7 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | events | `/events` | Yes | |
 | skills | `/skills` | Partial | List/status; not publish/config/resources E2E |
 | introspection | `/introspection/` | Yes | |
-| marketplace | `/marketplace/` | Partial | Quality report / stats / search; not full install/upgrade/rollback/credentials |
-| sandbox | `/sandbox` | Yes | |
+| marketplace | `/marketplace/` | Partial | Installed skills; retired report/stats/search return 404; not full install/upgrade/rollback/credentials |
 | platform | `/platform/` | Partial | `GET /platform/snapshot` in `product_matrix_*` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
 

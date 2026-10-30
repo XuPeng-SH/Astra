@@ -1,6 +1,6 @@
 import { AstraClient, AstraApiError, chatRequestToWire } from "../client";
 import { PATH_SESSIONS } from "../paths";
-import type { SessionAuditSummary } from "../index";
+import type { RuntimeSessionResumeResponse, SessionAuditSummary } from "../index";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -770,12 +770,25 @@ describe("AstraClient — Session lifecycle and reflect", () => {
     ).toContain("/sessions/sx/close");
   });
 
-  test("resumeSession", async () => {
-    globalThis.fetch = mockFetch(200, sessWire);
-    await createClient().resumeSession("sx");
-    expect(
-      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
-    ).toContain("/sessions/sx/resume");
+  test("resumeSession preserves canonical hydration without inventing Session metadata", async () => {
+    const restored: RuntimeSessionResumeResponse = {
+      session_id: "sx", turn_count: 2, last_status: "active",
+      total_tokens_in: 10, total_tokens_out: 5,
+      recent_tools: [], checkpoint_count: 0, git_branch: null,
+      model: null, title: "restored", restored_from_cloud: true,
+      resume_bundle: { schema_version: 1, source: "canonical_journal",
+        cursor: { schema_version: 1, owner_id: "owner", session_id: "sx", branch_id: "main",
+          completed_turn: 2, journal_event_seq: 2, conversation_seq: 2,
+          canonical_root_hash: "root", projection_schema: 2, compaction_generation: 0 },
+        conversation_messages: [{ role: "assistant", content: "retained" }], projections: {} },
+    };
+    globalThis.fetch = mockFetch(200, restored);
+    const result = await createClient().resumeSession("sx");
+    expect(result).toEqual(restored);
+    expect(result.resume_bundle.conversation_messages).toEqual([{ role: "assistant", content: "retained" }]);
+    expect(result).not.toHaveProperty("createdAt");
+    expect(result).not.toHaveProperty("permission_mode");
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("/sessions/sx/resume");
   });
 
   test("cancelSession", async () => {

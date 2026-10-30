@@ -1475,7 +1475,7 @@ mod tests {
 
     async fn assert_unwitnessed_error_after_restore(detail: Option<bool>) {
         use astra_services::session_journal::{JournalDirGuard, JournalWriter};
-        use astra_services::session_restore::HybridRestoreService;
+        use astra_services::session_restore::SessionRestoreService;
 
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -1500,7 +1500,7 @@ mod tests {
         let error = JournalEvent::tool_call_error(Some(&sid), 1, "bash", "exit 1", failed);
         assert!(super::run_id_of(&error).is_none());
         writer.append(&error).unwrap();
-        let restored = HybridRestoreService::local_only()
+        let restored = SessionRestoreService::local_only()
             .restore_local_session(&sid)
             .await
             .unwrap()
@@ -1544,7 +1544,7 @@ mod tests {
                 ))
                 .unwrap();
             assert_eq!(
-                HybridRestoreService::local_only()
+                SessionRestoreService::local_only()
                     .restore_local_session(&sid)
                     .await
                     .unwrap()

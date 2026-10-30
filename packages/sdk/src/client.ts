@@ -54,6 +54,7 @@ import type {
   SessionActivityResponse,
   SessionAuditSummary,
   SessionInfo,
+  RuntimeSessionResumeResponse,
   SessionCancellationResult,
   SessionUpdateBody,
   SkillInfo,
@@ -2964,9 +2965,8 @@ export class AstraClient {
   }
 
   /** `POST /sessions/{id}/resume` */
-  async resumeSession(sessionId: string): Promise<SessionInfo> {
-    const raw = await this.post<SessionWire>(sessionResumePath(sessionId), {});
-    return normalizeSession(raw);
+  async resumeSession(sessionId: string): Promise<RuntimeSessionResumeResponse> {
+    return this.post<RuntimeSessionResumeResponse>(sessionResumePath(sessionId), {});
   }
 
   /** `POST /sessions/{id}/cancel`. Pending cancellation returns executionSettled=false. */

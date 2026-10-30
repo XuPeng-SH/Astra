@@ -1872,7 +1872,7 @@ async fn canonical_commit_verifies_existing_node_and_preserves_idempotency() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_lists_derive_activity_from_established_heads_with_stable_seek_pages() {
     use astra_services::auth::session::SessionCreateRequestData;
-    use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
+    use astra_services::session_restore::SessionRestoreService;
     use astra_services::{DatabaseSessionService, SessionListFilter};
 
     async fn commit(
@@ -1957,7 +1957,7 @@ async fn session_lists_derive_activity_from_established_heads_with_stable_seek_p
     .execute(pool.get())
     .await
     .unwrap();
-    let restore = HybridRestoreService::new(pool.get().clone());
+    let restore = SessionRestoreService::new(pool.get().clone());
     assert!(
         !restore
             .list_resumable_sessions(&owner)
@@ -2140,7 +2140,7 @@ async fn session_lists_derive_activity_from_established_heads_with_stable_seek_p
         .await
         .unwrap();
     assert_eq!(detail.updated_at.as_deref(), Some("2026-05-01T12:00:00"));
-    let restored = HybridRestoreService::new(pool.get().clone())
+    let restored = SessionRestoreService::new(pool.get().clone())
         .list_resumable_sessions(&owner)
         .await
         .unwrap();
@@ -2193,10 +2193,13 @@ async fn session_lists_derive_activity_from_established_heads_with_stable_seek_p
             && entry.conversation_messages.is_empty()
             && entry.resume_bundle.is_none()
     );
-    let error = restore.restore_session(&owner, target).await.unwrap_err();
+    let error = restore
+        .load_cloud_summary(&owner, target)
+        .await
+        .unwrap_err();
     assert!(
         error.contains("restore_cloud_workspace"),
-        "selected detail recovery still rejects corrupt workspace evidence: {error}"
+        "selected full summaries reject malformed workspace hints: {error}"
     );
     sqlx::query("DELETE FROM session_artifacts WHERE user_id=? AND session_id=? AND artifact_id=?")
         .bind(&owner)

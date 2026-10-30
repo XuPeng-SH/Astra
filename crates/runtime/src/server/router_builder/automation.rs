@@ -58,16 +58,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::service_handlers::decisions::audit_decision_handler),
         )
         .route(
-            "/sandbox",
-            post(crate::service_handlers::sandbox::create_sandbox_handler)
-                .get(crate::service_handlers::sandbox::list_sandboxes_handler),
-        )
-        .route(
-            "/sandbox/{name}",
-            get(crate::service_handlers::sandbox::get_sandbox_handler)
-                .delete(crate::service_handlers::sandbox::delete_sandbox_handler),
-        )
-        .route(
             "/data-versioning/checkpoints",
             post(data_layer::versioning::create_checkpoint_handler)
                 .get(data_layer::versioning::list_checkpoints_handler),
@@ -83,9 +73,5 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/data-versioning/lineage/{event_id}/upstream",
             get(data_layer::versioning::trace_upstream_handler),
-        )
-        .route(
-            "/data-versioning/sandbox/{name}/checkpoint",
-            post(data_layer::versioning::sandbox_checkpoint_handler),
         )
 }
