@@ -16,7 +16,7 @@ from ci_scope import classify, main, select_macos_runner
 
 class CiScopeTests(unittest.TestCase):
     def test_macos_allowlist_uses_author_id_including_bots_and_login_renames(self):
-        for author_id in (39627130, 52204121, 49699333):
+        for author_id in (39627130, 52204121, 49699333, 523063, 134036682):
             with self.subTest(author_id=author_id):
                 event = {"pull_request": {"user": {"id": author_id, "login": "renamed-login"}},
                          "sender": {"id": 999999999}}
@@ -37,7 +37,10 @@ class CiScopeTests(unittest.TestCase):
         for event_name in ("workflow_dispatch", "pull_request_target"):
             self.assertEqual(select_macos_runner(event_name,
                 {"ref": "refs/heads/main", "sender": {"id": 39627130}}), ["macos-15"])
-        for ref in ("refs/heads/main", "refs/heads/develop", "refs/heads/feature", "refs/tags/v1.0", "main", None):
+        self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/main"}), ["macos-15"])
+        self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/main"}, main_enabled=True),
+                         ["self-hosted", "macOS", "ARM64", "mac-arm64-main"])
+        for ref in ("refs/heads/develop", "refs/heads/feature", "refs/tags/v1.0", "main", None):
             self.assertEqual(select_macos_runner("push", {"ref": ref}), ["macos-15"])
 
     def test_macos_missing_event_routes_to_hosted_without_omitting_scope_checks(self):

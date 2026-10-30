@@ -45,6 +45,8 @@ jobs:
           persist-credentials: false
       - name: Classify changed paths
         id: scope
+        env:
+          ASTRA_MACOS_MAIN_ENABLED: ${{ vars.ASTRA_MACOS_MAIN_ENABLED == '1' && '1' || '0' }}
         run: python3 scripts/ci/ci_scope.py
 
   macos-plan:

@@ -16,7 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 
 from cancel_stale_pr_runs import GitHubApi, MAX_PAGES
-from ci_scope import MACOS_SELF_HOSTED_LABELS, select_macos_runner
+from ci_scope import MACOS_MAIN_LABELS, MACOS_SELF_HOSTED_LABELS, select_macos_runner
 
 
 WORKFLOW = "macos-mini.yml"
@@ -252,9 +252,16 @@ def source(api, repo, run_id, attempt):
         if actual_base != event_base:
             print("::notice::Validated actual merge parents despite an outdated event base SHA")
         labels = select_macos_runner("pull_request", {"pull_request": {"user": pr["user"]}})
+    elif (run.get("event") == "push" and int(pr_number) == 0
+          and run.get("head_branch") == "main" and merge == head
+          and run.get("head_repository", {}).get("id") == run.get("repository", {}).get("id")
+          and run.get("repository", {}).get("id") is not None):
+        src = Source(run_id, attempt, head, run.get("created_at"))
+        check_current(api, repo, src, run)
+        labels = MACOS_MAIN_LABELS
     else:
         raise Unavailable("unsupported source event")
-    if labels != MACOS_SELF_HOSTED_LABELS:
+    if labels not in (MACOS_SELF_HOSTED_LABELS, MACOS_MAIN_LABELS):
         raise Unavailable("source does not prefer mini")
     return src
 
@@ -399,7 +406,8 @@ def schedule(api, repo, src, *, clock=time.monotonic, sleep=time.sleep, queued_a
     if not workers(api, repo, src):
         api.post(f"repos/{repo}/actions/workflows/{WORKFLOW}/dispatches", {
             "ref": "main", "inputs": {"source_run_id": str(src.run_id),
-                "source_attempt": str(src.attempt), "source_sha": src.sha}})
+                "source_attempt": str(src.attempt), "source_sha": src.sha,
+                "source_pool": "pr" if src.pr_number else "main"}})
     while True:
         deadline = (assigned_at + EXECUTION_SECONDS if assigned_at is not None else queued_at + QUEUE_SECONDS)
         api.set_deadline(deadline, observe=True)
@@ -450,7 +458,8 @@ def main():
         elif args.mode == "admit":
             if os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
                 raise Unavailable("worker reruns must use ordinary hosted recovery")
-            if src.sha != args.sha or not gate_active(api, repo, src):
+            if (src.sha != args.sha or os.environ.get("SOURCE_POOL") != ("pr" if src.pr_number else "main")
+                    or not gate_active(api, repo, src)):
                 raise Unavailable("dispatch expired before execution")
             return 0
         else:

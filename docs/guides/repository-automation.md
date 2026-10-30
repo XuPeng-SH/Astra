@@ -122,12 +122,20 @@ and keeps external-fork behavior part of the repository's delivery contract.
 
 ## Self-hosted macOS tests
 
-The static author-ID allowlist in `scripts/ci/ci_scope.py` makes the eleven
-selected contributors (including Dependabot) eligible for a mini attempt.
-Main/develop pushes and releases remain hosted. The mini runs unmerged PR code
-in a persistent account, HOME, toolchain and local caches. Read-only tokens and
-disabled cache uploads do not isolate that local state. Keep main hosted until
-an independently validated execution boundary is available (see issue #1106).
+The static author-ID allowlist in `scripts/ci/ci_scope.py` makes selected
+contributors eligible for the PR mini. A `main` push may use a separate,
+dedicated `mac-arm64-main` runner; `develop` pushes and releases stay hosted.
+The main runner must be on a physically separate host or a separately isolated,
+disposable machine with its own account, HOME, toolchain, runner installation,
+workspace and caches. Never attach both `mac-arm64-main` and `mac-arm64-mini`
+to the same host or share their writable storage. Restrict the main runner group
+to this trusted default-branch worker workflow; do not allow PR-controlled
+workflows to use it. Labels alone do not provide isolation. Until operators
+provision and validate this boundary, leave the repository variable
+`ASTRA_MACOS_MAIN_ENABLED` unset: main runs GitHub-hosted tests immediately.
+After provisioning, set it to `1`; an unavailable runner then uses the existing
+bounded queue and hosted fallback. PR and main
+admission verifies the source event and selected pool before candidate checkout.
 Other or unknown PR authors run on hosted macOS immediately; GitHub's existing fork approval remains in effect. Every Mac
 job re-executed on attempts greater than one runs hosted, even when its planner's
 old output is reused. GitHub may retain successful Mac jobs on a failed-only
@@ -137,7 +145,7 @@ rerun; those checks still refer to the original tested merge. Required-check nam
 The ordinary Test Suite owns all required checks. Linux jobs depend only on
 scope and start without waiting for the mini. `Resolve macOS execution` has
 Actions/Pull requests read access and waits for a worker bound to its exact run
-ID, attempt and tested SHA (the PR merge). Missing
+ID, attempt and tested SHA (the PR merge or main push commit). Missing
 controller, API errors or missing routing output select real hosted tests,
 never a successful skip. GETs use authenticated ETag revalidation when the
 server supplies an ETag. A 304 reuses only the exact previously fetched body
@@ -191,7 +199,7 @@ assumed obsolete PR. Initial source validation and worker admission also apply
 these rules, covering PR updates before a worker starts.
 
 `macos-scheduler.yml` runs on the default branch on Test Suite's `workflow_run`
-start/completion events for PRs. It uses the built-in token's Actions write permission
+start/completion events for PRs and main pushes. It uses the built-in token's Actions write permission
 to dispatch/cancel `macos-mini.yml`; it never checks out PR code. No App,
 organization membership query, additional secret, custom required context or
 admission hook is needed. These workflows must exist on main before dispatch
@@ -219,7 +227,8 @@ low-disk/toolchain setup,
 agent cancellation/loss or the execution budget select hosted fallback. The
 worker gets a read-only token and cache-mode read; it does not save default-branch Actions/sccache cache entries.
 
-The runner must match `[self-hosted, macOS, ARM64, mac-arm64-mini]`, be available
+The PR runner must match `[self-hosted, macOS, ARM64, mac-arm64-mini]`; the
+isolated main runner uses `mac-arm64-main` instead. Each must be available
 to Astra (including public repository access), and support the pinned Actions,
 Rust and Node versions. Rustup is bootstrapped if absent, Cargo bin is added to PATH, and the selected
 repository toolchain is exported through GITHUB_ENV for later sccache compiler

@@ -377,8 +377,29 @@ class SourceTests(unittest.TestCase):
         with self.assertRaises(dispatch.Unavailable):
             dispatch.source(api, REPO, 1, 1)
 
-    def test_pushes_cannot_enter_the_pr_runner(self):
-        for branch in ("main", "develop", "feature"):
+    def test_main_push_is_admitted_to_its_own_pool(self):
+        api = ApiFixture()
+        api.run.update(event="push", head_branch="main", head_repository={"id": 7},
+            display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
+        self.assertEqual(dispatch.source(api, REPO, 1, 1), dispatch.Source(1, 1, HEAD))
+
+    def test_main_push_requires_exact_sha_and_repository(self):
+        for mutation in (
+            lambda a: a.run.update(head_repository={"id": 8}),
+            lambda a: a.run.update(head_repository={}),
+            lambda a: a.run.update(display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={MERGE}"),
+            lambda a: a.run.update(head_sha=MERGE),
+            lambda a: a.run.update(status="completed"),
+        ):
+            api = ApiFixture()
+            api.run.update(event="push", head_branch="main", head_repository={"id": 7},
+                display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
+            mutation(api)
+            with self.assertRaises(dispatch.Unavailable):
+                dispatch.source(api, REPO, 1, 1)
+
+    def test_other_pushes_cannot_enter_the_runner(self):
+        for branch in ("develop", "feature"):
             api = ApiFixture()
             api.run.update(event="push", head_branch=branch, head_repository={"id": 7},
                 display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
@@ -636,7 +657,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(api.cancelled, [10])
         self.assertEqual(api.clock(), dispatch.QUEUE_SECONDS)
         self.assertEqual(api.posts[0][1], {"ref": "main", "inputs": {
-            "source_run_id": "1", "source_attempt": "1", "source_sha": MERGE}})
+            "source_run_id": "1", "source_attempt": "1", "source_sha": MERGE, "source_pool": "pr"}})
+
+    def test_main_push_dispatches_only_the_dedicated_pool(self):
+        api = ApiFixture()
+        api.run.update(event="push", head_branch="main", head_repository={"id": 7},
+            display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
+        api.src = dispatch.Source(1, 1, HEAD)
+        api.enabled = False
+        api.assign_at = api.finish_at = 100000
+        self.run_scheduler(api)
+        self.assertEqual(api.posts[0][1]["inputs"], {
+            "source_run_id": "1", "source_attempt": "1", "source_sha": HEAD, "source_pool": "main"})
+        self.assertEqual(api.clock(), dispatch.QUEUE_SECONDS)
+        self.assertEqual(api.cancelled, [10])
 
     def test_completed_gate_cannot_dispatch_a_late_worker(self):
         api = ApiFixture()
@@ -697,19 +731,30 @@ class SchedulerTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
-    def invoke(self, api, mode, *, worker_attempt="1"):
+    def invoke(self, api, mode, *, worker_attempt="1", pool="pr", sha=MERGE):
         schedule = dispatch.schedule
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(dispatch.time, "monotonic", side_effect=api.clock), \
              patch.object(dispatch, "schedule", side_effect=lambda a, r, s, **kw:
                  schedule(a, r, s, clock=api.clock, sleep=api.clock.sleep, **kw)):
             output = Path(directory) / "output"
-            args = ["macos_dispatch.py", mode, "--run-id", "1", "--attempt", "1", "--sha", MERGE]
+            args = ["macos_dispatch.py", mode, "--run-id", "1", "--attempt", "1", "--sha", sha]
             with patch.object(dispatch, "Api", return_value=api), patch.object(sys, "argv", args), \
                  patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "fixture",
-                     "GITHUB_OUTPUT": str(output), "GITHUB_RUN_ATTEMPT": worker_attempt}, clear=True):
+                     "GITHUB_OUTPUT": str(output), "GITHUB_RUN_ATTEMPT": worker_attempt, "SOURCE_POOL": pool}, clear=True):
                 status = dispatch.main()
             return status, output.read_text() if output.exists() else ""
+
+    def test_pool_admission_binds_the_verified_source(self):
+        pr = ApiFixture()
+        self.assertEqual(self.invoke(pr, "admit", pool="pr")[0], 0)
+        self.assertEqual(self.invoke(pr, "admit", pool="main")[0], 1)
+        main = ApiFixture()
+        main.run.update(event="push", head_branch="main", head_repository={"id": 7},
+            display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
+        self.assertEqual(self.invoke(main, "admit", pool="main", sha=HEAD)[0], 0)
+        self.assertEqual(self.invoke(main, "admit", pool="pr", sha=HEAD)[0], 1)
+        self.assertEqual(self.invoke(main, "admit", pool="main", sha=MERGE)[0], 1)
 
     def test_unavailable_api_and_missing_controller_fail_open_to_actual_hosted_tests(self):
         api = ApiFixture()
@@ -783,7 +828,7 @@ class EntrypointTests(unittest.TestCase):
                            dispatch.QUEUE_SECONDS + dispatch.EXECUTION_SECONDS)
         self.assertGreater(int(re.search(r"timeout-minutes: (\d+)", scheduler)[1]) * 60,
                            2 * dispatch.QUEUE_SECONDS + dispatch.EXECUTION_SECONDS)
-        self.assertIn("github.event.workflow_run.event == 'pull_request'", scheduler)
+        self.assertIn("[\"pull_request\",\"push\"]", scheduler)
 
     def test_completion_cancels_orphan_even_after_pr_close_or_attempt_change(self):
         api = ApiFixture()
