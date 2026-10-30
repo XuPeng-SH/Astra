@@ -27,28 +27,50 @@ runs:
   using: "composite"
   steps:
     # Avoid paying for cleanup when the filesystem containing the workspace has
-    # enough room. Only hosted images use the cleanup fallback; persistent
-    # self-hosted runners report low/unreadable disk without privileged cleanup.
+    # enough room. Persistent runners reclaim only their disposable Cargo
+    # artifacts; only hosted images use the privileged cleanup fallback.
     - name: Guard workspace disk space
       shell: bash
       env:
         ASTRA_CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        ASTRA_CI_TARGET_DIR: ${{ runner.workspace }}/.astra-ci-target
       run: |
         set -euxo pipefail
         disk_guard_workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set}"
         disk_guard_threshold_kib=$((30 * 1024 * 1024))
-        disk_guard_available_kib=""
-        disk_guard_measurement="invalid"
-
-        if disk_guard_available_kib="$(
-          df -Pk "${disk_guard_workspace}" |
-            awk 'NR == 2 { print $4; exit }'
-        )"; then
-          if [[ "${disk_guard_available_kib}" =~ ^[0-9]+$ ]]; then
-            disk_guard_measurement="valid"
+        measure_workspace_disk() {
+          disk_guard_available_kib=""
+          disk_guard_measurement="invalid"
+          if disk_guard_available_kib="$(
+            df -Pk "${disk_guard_workspace}" |
+              awk 'NR == 2 { print $4; exit }'
+          )"; then
+            if [[ "${disk_guard_available_kib}" =~ ^[0-9]+$ ]]; then
+              disk_guard_measurement="valid"
+            fi
+          else
+            disk_guard_measurement="failed"
           fi
-        else
-          disk_guard_measurement="failed"
+        }
+        measure_workspace_disk
+
+        if [[ "${ASTRA_CI_RUNNER_ENVIRONMENT:-}" == self-hosted &&
+              "${disk_guard_measurement}" == valid ]]; then
+          disk_guard_target="${ASTRA_CI_TARGET_DIR:?ASTRA_CI_TARGET_DIR must be set}"
+          disk_guard_target_limit_kib=$((64 * 1024 * 1024))
+          if [[ -e "${disk_guard_target}" || -L "${disk_guard_target}" ]]; then
+            if ! disk_guard_target_kib="$(du -sk "${disk_guard_target}" | awk 'NR == 1 { print $1; exit }')" ||
+               [[ ! "${disk_guard_target_kib}" =~ ^[0-9]+$ ]]; then
+              echo "::error::Cannot measure retained Cargo artifacts; refusing cleanup."
+              exit 1
+            fi
+            if (( disk_guard_target_kib > disk_guard_target_limit_kib ||
+                  disk_guard_available_kib < disk_guard_threshold_kib )); then
+              echo "Reclaiming disposable Cargo artifacts: size=${disk_guard_target_kib} KiB; limit=${disk_guard_target_limit_kib} KiB (64 GiB); free=${disk_guard_available_kib} KiB."
+              rm -rf -- "${disk_guard_target}"
+              measure_workspace_disk
+            fi
+          fi
         fi
 
         if [[ "${disk_guard_measurement}" == "valid" ]] &&
@@ -67,15 +89,10 @@ runs:
         fi
 
         df -h "${disk_guard_workspace}"
-
-    # Checkout cleans the repository, including its default target directory.
-    # Each self-hosted trust pool has its own host/account/workspace.
-    - name: Reuse self-hosted build artifacts
-      if: ${{ runner.environment == 'self-hosted' }}
-      shell: bash
-      env:
-        ASTRA_CI_TARGET_DIR: ${{ runner.workspace }}/.astra-ci-target
-      run: echo "CARGO_TARGET_DIR=${ASTRA_CI_TARGET_DIR}" >> "$GITHUB_ENV"
+        if [[ "${ASTRA_CI_RUNNER_ENVIRONMENT:-}" == self-hosted ]]; then
+          # Survive checkout cleanup within this runner's isolated account.
+          echo "CARGO_TARGET_DIR=${ASTRA_CI_TARGET_DIR}" >> "$GITHUB_ENV"
+        fi
 
     - name: Install pinned Rust toolchain
       uses: ./.github/actions/rust-toolchain

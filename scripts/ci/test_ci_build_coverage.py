@@ -20,12 +20,16 @@ from test_release_build_shells import workflow_run_script
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def rust_setup_disk_guard():
+    action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
+    section = action.split("    - name: Guard workspace disk space\n", 1)[1].split("\n    - name:", 1)[0]
+    return textwrap.dedent(section.split("      run: |\n", 1)[1])
+
+
 class BuildCoverageTests(unittest.TestCase):
     def test_self_hosted_build_survives_checkout_cleanup_and_rechecks_source(self):
         action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
-        section = action.split("    - name: Reuse self-hosted build artifacts\n", 1)[1].split("\n    - name:", 1)[0]
-        self.assertIn("runner.environment == 'self-hosted'", section)
-        self.assertIn("${{ runner.workspace }}/.astra-ci-target", section)
+        self.assertIn("${{ runner.workspace }}/.astra-ci-target", action)
         cache = action.split("    - uses: Swatinem/rust-cache@", 1)[1]
         self.assertIn("runner.environment != 'self-hosted'", cache)
         with tempfile.TemporaryDirectory() as directory:
@@ -33,37 +37,42 @@ class BuildCoverageTests(unittest.TestCase):
             repo = workspace / "checkout"
             source = repo / "dep/src/lib.rs"
             source.parent.mkdir(parents=True)
-            (repo / "Cargo.toml").write_text('[package]\nname="cache-fixture"\nversion="0.1.0"\nedition="2021"\n[dependencies]\ncache-dep={path="dep"}\n')
-            (repo / "dep/Cargo.toml").write_text('[package]\nname="cache-dep"\nversion="0.1.0"\nedition="2021"\n')
+            (repo / "Cargo.toml").write_text('[package]\nname="cache-fixture"\nversion="0.1.0"\nedition="2021"\n[dependencies]\ncache-dep={path="dep"}\n[features]\nalternate=["cache-dep/alternate"]\n')
+            (repo / "dep/Cargo.toml").write_text('[package]\nname="cache-dep"\nversion="0.1.0"\nedition="2021"\n[features]\nalternate=[]\n')
             (repo / "src").mkdir()
             (repo / "src/main.rs").write_text('fn main() { println!("{}", cache_dep::value()); }')
-            source.write_text("pub fn value() -> u8 { 1 }")
+            source.write_text('pub fn value() -> u8 { if cfg!(feature="alternate") { 9 } else { 1 } }')
             for args in (("init", "-q"), ("add", "."), ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")):
                 subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
             github_env = workspace / "env"
             environment = {**os.environ, "GITHUB_ENV": str(github_env),
+                           "GITHUB_WORKSPACE": str(repo), "ASTRA_CI_RUNNER_ENVIRONMENT": "self-hosted",
                            "ASTRA_CI_TARGET_DIR": str(workspace / ".astra-ci-target"),
                            "RUSTC_WRAPPER": "", "CARGO_INCREMENTAL": "0"}
-            script = section.split("      run: ", 1)[1].strip()
-            subprocess.run(["bash", "-eu", "-c", script], env=environment, check=True)
+            script = "df() { printf 'Filesystem Blocks Used Available Capacity Mount\\nfixture 100000000 0 100000000 0%% /\\n'; }\n" + rust_setup_disk_guard()
+            subprocess.run(["bash", "-eu", "-c", script], env=environment, check=True, capture_output=True)
             environment.update(line.split("=", 1) for line in github_env.read_text().splitlines())
-            for attempt in range(3):
+            for attempt in range(6):
                 if attempt == 1:
                     stale = repo / "stale-untracked"
                     stale.touch()
                     subprocess.run(["git", "clean", "-ffdx"], cwd=repo, check=True, capture_output=True)
                     self.assertFalse(stale.exists())
-                elif attempt == 2:
+                elif attempt == 4:
                     source.write_text("pub fn value() -> u8 { 2 }")
-                build = subprocess.run(["cargo", "build", "--offline", "--message-format=json"],
-                                       cwd=repo, env=environment, capture_output=True, text=True)
+                elif attempt == 5:
+                    subprocess.run(["git", "checkout", "--", "dep/src/lib.rs"], cwd=repo, check=True)
+                args = ["cargo", "build", "--offline", "--message-format=json"]
+                if attempt == 2:
+                    args += ["--features", "alternate"]
+                build = subprocess.run(args, cwd=repo, env=environment, capture_output=True, text=True)
                 self.assertEqual(build.returncode, 0, build.stderr)
                 artifacts = [json.loads(line) for line in build.stdout.splitlines()]
                 dependency = next(a for a in artifacts if a.get("reason") == "compiler-artifact" and a["target"]["name"] == "cache_dep")
-                self.assertEqual(dependency["fresh"], attempt == 1)
+                self.assertEqual(dependency["fresh"], attempt in (1, 3))
                 binary = Path(environment["CARGO_TARGET_DIR"]) / "debug/cache-fixture"
                 result = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
-                self.assertEqual(result.stdout.strip(), "2" if attempt == 2 else "1")
+                self.assertEqual(result.stdout.strip(), "9" if attempt == 2 else "2" if attempt == 4 else "1")
 
     def test_rust_toolchain_bootstraps_missing_rust_and_reuses_cargo_bin(self):
         action = (ROOT / ".github/actions/rust-toolchain/action.yml").read_text()
@@ -146,10 +155,7 @@ cp "$MOCK_BIN/rustc-source" "$CARGO_HOME/bin/rustc"
             self.assertIn("uses: ./.github/actions/rust-toolchain", (ROOT / path).read_text())
 
     def test_rust_setup_disk_guard_uses_workspace_free_space_without_real_cleanup(self):
-        action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
-        section = action.split("\n    - name: Guard workspace disk space\n", 1)[1]
-        run_block = section.split("\n    - name:", 1)[0]
-        script = textwrap.dedent(run_block.split("\n      run: |\n", 1)[1])
+        script = rust_setup_disk_guard()
         threshold_kib = 30 * 1024 * 1024
         cleanup = [
             "rm -rf /usr/share/dotnet",
@@ -206,6 +212,8 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
                 environment = {
                     **os.environ,
                     "GITHUB_WORKSPACE": str(workspace),
+                    "GITHUB_ENV": str(root / "github-env"),
+                    "ASTRA_CI_TARGET_DIR": str(root / ".astra-ci-target"),
                     "ASTRA_CI_RUNNER_ENVIRONMENT": runner_environment,
                     "MOCK_DF_MODE": mode,
                     "MOCK_DF_AVAILABLE_KIB": str(available_kib or ""),
@@ -231,6 +239,66 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
 
                 invocations = sudo_log.read_text().splitlines() if sudo_log.exists() else []
                 self.assertEqual(invocations, [] if should_skip or self_hosted_failure else cleanup)
+
+    def test_self_hosted_target_reclamation_preserves_neighbors_and_rechecks_disk(self):
+        limit_kib = 64 * 1024 * 1024
+        scenarios = (
+            ("warm", limit_kib - 1, False, False, 0),
+            ("at-limit", limit_kib, False, False, 0),
+            ("oversized", limit_kib + 1, False, True, 0),
+            ("low-disk", 1024, True, True, 0),
+            ("still-low", 1024, True, True, 1),
+            ("failed-recheck", 1024, True, True, 1),
+            ("failed-cleanup", 1024, True, False, 7),
+            ("bad-size", "invalid", False, False, 1),
+            ("symlink", 0, True, True, 0),
+        )
+        for name, size_kib, low_disk, reclaimed, status in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / ".astra-ci-target"
+                target.mkdir()
+                (target / "old-artifact").touch()
+                neighbor = root / "unrelated"
+                neighbor.mkdir()
+                (neighbor / "keep").touch()
+                if name == "symlink":
+                    (target / "old-artifact").unlink()
+                    target.rmdir()
+                    target.symlink_to(neighbor, target_is_directory=True)
+                github_env = root / "github-env"
+                environment = {**os.environ, "GITHUB_WORKSPACE": str(root),
+                               "ASTRA_CI_RUNNER_ENVIRONMENT": "self-hosted",
+                               "ASTRA_CI_TARGET_DIR": str(target), "GITHUB_ENV": str(github_env),
+                               "MOCK_TARGET_SIZE": str(size_kib), "MOCK_LOW_DISK": str(int(low_disk)),
+                               "MOCK_SCENARIO": name}
+                # Real rm acts only on the disposable fixture. Disk and size
+                # readings simulate thresholds without filling the test host.
+                stubs = '''
+df() {
+  if [[ "${MOCK_SCENARIO}" == failed-recheck && ! -e "${ASTRA_CI_TARGET_DIR}" ]]; then return 2; fi
+  local available=100000000
+  if [[ "${MOCK_SCENARIO}" == still-low ]] ||
+     [[ "${MOCK_LOW_DISK}" == 1 && ( -e "${ASTRA_CI_TARGET_DIR}" || -L "${ASTRA_CI_TARGET_DIR}" ) ]]; then
+    available=10000000
+  fi
+  printf 'Filesystem Blocks Used Available Capacity Mount\\nfixture 100000000 0 %s 0%% /\\n' "$available"
+}
+du() { printf '%s\\t%s\\n' "$MOCK_TARGET_SIZE" "$ASTRA_CI_TARGET_DIR"; }
+rm() {
+  if [[ "${MOCK_SCENARIO}" == failed-cleanup ]]; then return 7; fi
+  command rm "$@"
+}
+'''
+                result = subprocess.run(["bash", "-c", stubs + rust_setup_disk_guard()],
+                                        env=environment, capture_output=True, text=True)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(not target.exists() and not target.is_symlink(), reclaimed)
+                self.assertTrue((neighbor / "keep").exists())
+                if status == 0:
+                    self.assertEqual(github_env.read_text().strip(), f"CARGO_TARGET_DIR={target}")
+                else:
+                    self.assertFalse(github_env.exists(), "Failed setup must not select retained artifacts")
 
     def test_make_lint_preserves_restored_artifacts_and_checks_all_targets(self):
         result = subprocess.run(

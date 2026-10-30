@@ -234,8 +234,14 @@ It uses a runner-local sccache capped at 5 GiB, with C/C++ direct mode disabled,
 and skips Actions build-cache restore/upload. Cargo still checks source,
 dependency and compiler fingerprints on every invocation. These local artifacts
 and the Cargo registry belong to the runner's isolated account; PR and main
-pools must never share them. The existing 30 GiB free-space guard applies before
-each run; operators reclaim old local artifacts when it reports low disk.
+pools must never share them. Before each run, the disk guard discards the whole
+dedicated Cargo directory if it exceeds 64 GiB or free space is below 30 GiB,
+then measures free space again. These are job-start thresholds, not a live disk
+quota during compilation. Smaller healthy caches remain warm. Cleanup runs
+before Cargo on the runner's single worker, touches only that disposable
+directory, and does not sweep individual dependency files. If free space is
+still insufficient or cannot be measured, setup fails and hosted recovery
+remains available. The separate 5 GiB sccache survives Cargo-directory cleanup.
 Hosted runners retain their existing Actions cache path. Compare actual
 compile timings and sccache hit rates after warm runs, separately from queue
 time; a cold first run still builds the dependencies.
