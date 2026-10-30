@@ -95,8 +95,9 @@ CLI tests build and run all library/binary unit tests plus the offline
 `cli_pipe`, `process_supervisor`, `shell_execution_boundaries`, and
 `cli_mcp_setup` integration
 targets once, after building the standalone mock MCP server. Five protected
-check labels require that same completed job; they do not repeat setup, builds,
-archive downloads, or tests.
+check labels require both the complete inventory and the parallel native-delivery
+and historical-client job. The latter builds one candidate CLI for both journeys;
+the labels do not repeat builds, downloads, or tests.
 Failed, cancelled, or unexpectedly skipped required execution fails closed.
 Caches retain existing trust boundaries, and ordinary fork PR tests run without
 privileged access. The separate optional live-model regression grants provider
@@ -104,8 +105,8 @@ credentials only to explicitly trusted fork name/ID pairs from its base-owned
 workflow. Trusting a fork also trusts its code writers; see the
 [harness guide](crates/astra-test-harness/README.md#small-automatic-live-regression).
 JUnit timings are retained on success and failure to assess total CI
-cost. Rerunning a failed CLI execution repeats the combined build/test job;
-there is no archived-test fallback or artifact-expiry dependency.
+cost. A failed-only rerun can reuse a successful sibling job; it reruns the
+failed inventory or delivery job, with no archived-test fallback.
 The three ignored production-supervisor smokes use one additional nextest
 invocation, with exact names and separate serial test processes. They use the
 strict profile without retries, preserving the complete inventory's CI JUnit

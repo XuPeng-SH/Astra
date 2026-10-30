@@ -372,7 +372,7 @@ unversioned/v2 responses. CLI tests distinguish malformed JSON from unsupported
 schema using stable `model_catalog_json_invalid` / `model_catalog_schema_mismatch`
 reason metadata without echoing received bodies.
 
-The shared CLI CI execution runs `client_compatibility` with the dedicated
+The parallel CLI native-delivery CI job runs `client_compatibility` with the dedicated
 `moi-compat-tests` feature and isolated MatrixOne/Memoria. It starts the real
 production router with fresh storage, then invokes
 `scripts/ci/client_compatibility.py` using downloaded historical executables

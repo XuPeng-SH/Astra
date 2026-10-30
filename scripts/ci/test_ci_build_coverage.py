@@ -339,8 +339,9 @@ rm() {
 
     def test_complete_cli_run_prebuilds_required_standalone_mcp_fixture(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
-        producer = workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
-        self.assertIn("cargo build --locked -p astra-cli --bin mock_mcp_server", producer)
+        producer = workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  cli-native-delivery:\n", 1)[0]
+        prebuild = producer.split("      - name: Prebuild mock MCP server\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("run: cargo build --locked -p astra-cli --bin mock_mcp_server", prebuild)
         test_command = re.search(r"run: (cargo nextest run[^\n]+)", producer).group(1)
         args = shlex.split(test_command)
         self.assertEqual(

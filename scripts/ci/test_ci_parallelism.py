@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Exercise CI gates and the real Makefile's online shard dispatch offline."""
 
+import ast
+import hashlib
 import json
+from itertools import product
 import os
 import re
 import shlex
@@ -26,7 +29,8 @@ SHARDS = {
 class CliSharedTests(unittest.TestCase):
     def setUp(self):
         self.workflow = (ROOT / ".github/workflows/test.yml").read_text()
-        self.producer = self.workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
+        self.producer = self.workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  cli-native-delivery:\n", 1)[0]
+        self.delivery = self.workflow.split("\n  cli-native-delivery:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
         self.consumer = self.workflow.split("\n  shard-a:\n", 1)[1].split("\n  shard-b:\n", 1)[0]
 
     def test_native_smokes_build_once_and_propagate_failures(self):
@@ -87,20 +91,152 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
         self.assertIn("if: env.RUN_TESTS == 'true'", gate)
         self.assertIn("TEST_RESULT: ${{ needs.cli-test-build.result }}", gate)
         script = gate.split("        run: ", 1)[1].strip()
-        for status in ("success", "failure", "cancelled", "skipped", ""):
-            with self.subTest(status=status):
+        self.assertIn("DELIVERY_RESULT: ${{ needs.cli-native-delivery.result }}", gate)
+        for status, delivery in product(("success", "failure", "cancelled", "skipped", ""), repeat=2):
+            with self.subTest(status=status, delivery=delivery):
                 result = subprocess.run(["bash", "-c", script],
-                    env={**os.environ, "TEST_RESULT": status}, capture_output=True)
-                self.assertEqual(result.returncode == 0, status == "success")
-        self.assertIn("needs: [scope, cli-test-build]", self.consumer)
+                    env={**os.environ, "TEST_RESULT": status, "DELIVERY_RESULT": delivery}, capture_output=True)
+                self.assertEqual(result.returncode == 0, status == delivery == "success")
+        self.assertIn("needs: [scope, cli-test-build, cli-native-delivery]", self.consumer)
         self.assertIn("if: ${{ !cancelled() }}", self.consumer)
-        for section in (self.producer, self.consumer):
+        for section in (self.producer, self.delivery, self.consumer):
             self.assertIn("needs.scope.result != 'success'", section)
             self.assertIn("needs.scope.outputs.test_cli == 'true'", section)
         for job in ("shard-b", "shard-c", "shard-d"):
             header = self.workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
             self.assertIn("needs: scope", header)
             self.assertNotIn("cli-test-build", header)
+            self.assertNotIn("cli-native-delivery", header)
+
+    def test_native_delivery_keeps_current_and_historical_client_contract(self):
+        self.assertIn("needs: scope", self.delivery)
+        self.assertIn("timeout-minutes: 35", self.delivery)
+        self.assertEqual(self.delivery.count("cargo build --locked -p astra-cli --bin astra"), 1)
+        self.assertLess(self.delivery.index("Verify native delivery through the production supervisor"),
+                        self.delivery.index("Test historical and already-built current CLI against the fresh Server"))
+        self.assertLess(self.delivery.index("Verify native delivery through the production supervisor"),
+                        self.delivery.index("Record supervised CLI digest"))
+        self.assertLess(self.delivery.index("Record supervised CLI digest"),
+                        self.delivery.index("Test historical and already-built current CLI"))
+        for required in (
+            "ASTRA_COMPAT_CURRENT_CLI_BIN: ${{ github.workspace }}/target/debug/astra",
+            "ASTRA_COMPAT_SERVER_SOURCE: ${{ github.sha }}",
+            "scripts/ci/historical-clients.json",
+            "--test client_compatibility -- --include-ignored --nocapture",
+            "if: always()",
+            "persist-credentials: false",
+            'save-cache: "false"',
+        ):
+            self.assertIn(required, self.delivery)
+        self.assertNotIn("Test historical and already-built current CLI", self.producer)
+        self.assertNotIn("Verify native delivery through the production supervisor", self.producer)
+
+    def test_candidate_report_must_match_the_built_binary(self):
+        script = workflow_run_script(
+            ".github/workflows/test.yml",
+            "Test historical and already-built current CLI against the fresh Server",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            candidate = fixture / "astra"
+            candidate.write_bytes(b"candidate binary")
+            cargo = fixture / "cargo"
+            cargo.write_text("""#!/usr/bin/env python3
+import hashlib, json, os, sys
+if os.environ['OUTCOME'] == 'cargo_failure':
+    sys.exit(17)
+if os.environ['OUTCOME'] == 'mutated':
+    with open(os.environ['ASTRA_COMPAT_CURRENT_CLI_BIN'], 'ab') as binary:
+        binary.write(b' changed')
+digest = hashlib.file_digest(open(os.environ['ASTRA_COMPAT_CURRENT_CLI_BIN'], 'rb'), 'sha256').hexdigest()
+if os.environ['OUTCOME'] == 'mismatch':
+    digest = 'incorrect'
+report = {} if os.environ['OUTCOME'] == 'missing' else {'current_cli': {'sha256': digest}}
+open(os.environ['ASTRA_COMPAT_REPORT'], 'w').write(json.dumps(report))
+""")
+            cargo.chmod(0o755)
+            for outcome in ("success", "mismatch", "missing", "mutated", "cargo_failure"):
+                with self.subTest(outcome=outcome):
+                    candidate.write_bytes(b"candidate binary")
+                    supervised = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", script], cwd=fixture,
+                        env={**os.environ, "PATH": f"{fixture}{os.pathsep}{os.environ['PATH']}",
+                             "OUTCOME": outcome, "ASTRA_COMPAT_CURRENT_CLI_BIN": str(candidate),
+                             "ASTRA_COMPAT_EXPECTED_CLI_SHA256": supervised,
+                             "ASTRA_COMPAT_REPORT": str(fixture / "report.json")},
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode == 0, outcome == "success", result.stderr)
+                    if outcome == "cargo_failure":
+                        self.assertEqual(result.returncode, 17)
+
+    def test_scope_conditions_route_selected_unaffected_and_failed_scope(self):
+        def evaluate(expression, scope_result, cli, cancelled):
+            expression = expression.replace("!cancelled()", str(not cancelled))
+            expression = expression.replace("needs.scope.result", repr(scope_result))
+            expression = expression.replace("needs.scope.outputs.test_cli", repr(cli))
+            expression = expression.replace("&&", " and ").replace("||", " or ")
+            tree = ast.parse(expression.strip(), mode="eval")
+            allowed = (ast.Expression, ast.BoolOp, ast.Compare, ast.And, ast.Or,
+                       ast.Eq, ast.NotEq, ast.Constant, ast.Load)
+            self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)))
+            return eval(compile(tree, "<workflow condition>", "eval"), {"__builtins__": {}})
+
+        job_conditions = [re.search(r"if: \$\{\{ (.*?) \}\}", job).group(1)
+                          for job in (self.producer, self.delivery)]
+        consumer_condition = re.search(r"if: \$\{\{ (.*?) \}\}", self.consumer).group(1)
+        required = re.search(r"RUN_TESTS: \$\{\{ (.*?) \}\}", self.consumer).group(1)
+        for result, cli, cancelled, selected in (
+            ("success", "true", False, True), ("success", "false", False, False),
+            ("failure", "", False, True), ("skipped", "", False, True),
+            ("cancelled", "", False, True), ("", "", False, True),
+            ("success", "true", True, False),
+        ):
+            with self.subTest(result=result, cli=cli, cancelled=cancelled):
+                for condition in job_conditions:
+                    self.assertEqual(evaluate(condition, result, cli, cancelled), selected)
+                self.assertEqual(evaluate(consumer_condition, result, cli, cancelled), not cancelled)
+                if not cancelled:
+                    self.assertEqual(evaluate(required, result, cli, cancelled), selected)
+
+    def test_supervised_digest_step_records_exact_file_and_rejects_missing_binary(self):
+        script = workflow_run_script(".github/workflows/test.yml", "Record supervised CLI digest")
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            output = fixture / "env"
+            env = {**os.environ, "GITHUB_ENV": str(output)}
+            missing = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=fixture, env=env, capture_output=True)
+            self.assertNotEqual(missing.returncode, 0)
+            candidate = fixture / "target/debug/astra"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"candidate binary")
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=fixture, env=env, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_text().strip(), "ASTRA_COMPAT_EXPECTED_CLI_SHA256=" + hashlib.sha256(candidate.read_bytes()).hexdigest())
+
+    def test_dependency_start_and_cleanup_failures_propagate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            docker = fixture / "docker"
+            docker.write_text('#!/bin/sh\nexit "$DOCKER_RESULT"\n')
+            docker.chmod(0o755)
+            for name in ("Start isolated historical-client dependencies",
+                         "Stop isolated historical-client dependencies"):
+                block = self.delivery.split(f"      - name: {name}\n", 1)[1].split("      - name:", 1)[0]
+                self.assertNotIn("continue-on-error", block)
+                if name.startswith("Stop"):
+                    self.assertIn("if: always()", block)
+                lines = block.split("        run: >-\n", 1)[1].splitlines()
+                script = " ".join(line.strip() for line in lines if line.strip())
+                for code in (0, 17):
+                    with self.subTest(step=name, code=code):
+                        result = subprocess.run(
+                            ["bash", "-euo", "pipefail", "-c", script], cwd=fixture,
+                            env={**os.environ, "PATH": f"{fixture}{os.pathsep}{os.environ['PATH']}",
+                                 "DOCKER_RESULT": str(code)}, capture_output=True,
+                        )
+                        self.assertEqual(result.returncode, code)
 
     def test_status_labels_do_not_repeat_setup_builds_or_artifact_transfers(self):
         self.assertNotIn("uses:", self.consumer)

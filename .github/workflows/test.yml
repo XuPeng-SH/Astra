@@ -79,8 +79,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/macos_dispatch.py wait --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
-  # Package groups remain parallel. CLI builds and executes its full inventory
-  # once; stable protected labels require that same completed test result.
+  # CLI inventory and native delivery run independently in parallel. Stable
+  # protected labels require both complete results.
   # Short CLI partitions are not the workflow critical path, so separate
   # artifact consumers only repeat setup, download and extraction work.
   #
@@ -110,6 +110,29 @@ jobs:
         run: cargo build --locked -p astra-cli --bin mock_mcp_server
       - name: Test complete CLI inventory
         run: cargo nextest run --locked -p astra-cli --lib --bins --test cli_pipe --test process_supervisor --test shell_execution_boundaries --test cli_mcp_setup --profile ci
+      - name: Retain CLI test timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-timings-${{ github.run_attempt }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 3
+
+  cli-native-delivery:
+    name: "Test: CLI native delivery and historical clients"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-test
+          save-cache: "false"
       - name: Verify native delivery through the production supervisor
         run: |
           cargo build --locked -p astra-cli --bin astra
@@ -121,6 +144,10 @@ jobs:
             cli::edge_lifecycle::native_delivery::tests::authenticated_shared_ws_executes_native_provider_through_cli_entrypoint \
             edge_tools::native_codex::tests::discovery_preserves_the_whole_budget_across_protocol_phases \
             cli::edge_lifecycle::native_delivery::tests::discovery_publishes_only_the_first_verified_path_client
+      - name: Record supervised CLI digest
+        run: |
+          digest="$(sha256sum "$PWD/target/debug/astra")"
+          printf 'ASTRA_COMPAT_EXPECTED_CLI_SHA256=%s\n' "${digest%% *}" >> "$GITHUB_ENV"
       - name: Start isolated historical-client dependencies
         env:
           MEMORIA_MASTER_KEY: ci-test-master-key
@@ -152,24 +179,27 @@ jobs:
           ASTRA_COMPAT_CURRENT_CLI_BIN: ${{ github.workspace }}/target/debug/astra
           ASTRA_COMPAT_SERVER_SOURCE: ${{ github.sha }}
           RUST_MIN_STACK: "16777216"
-        run: cargo test --locked -p astra-runtime --features moi-compat-tests --test client_compatibility -- --include-ignored --nocapture
+        run: |
+          cargo test --locked -p astra-runtime --features moi-compat-tests --test client_compatibility -- --include-ignored --nocapture
+          python3 -c '
+          import hashlib, json, os
+          with open(os.environ["ASTRA_COMPAT_CURRENT_CLI_BIN"], "rb") as binary:
+              actual = hashlib.file_digest(binary, "sha256").hexdigest()
+          with open(os.environ["ASTRA_COMPAT_REPORT"], encoding="utf-8") as report:
+              expected = json.load(report)["current_cli"]["sha256"]
+          if actual != expected or actual != os.environ["ASTRA_COMPAT_EXPECTED_CLI_SHA256"]:
+              raise SystemExit("candidate CLI digest changed or does not match compatibility report")
+          '
+
       - name: Stop isolated historical-client dependencies
         if: always()
         run: >-
           docker compose --env-file .env.example
           -f deployment/all-in-one/docker-compose.deps.yml down -v
-      - name: Retain CLI test timings
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: cli-timings-${{ github.run_attempt }}
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: warn
-          retention-days: 3
 
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
-    needs: [scope, cli-test-build]
+    needs: [scope, cli-test-build, cli-native-delivery]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -188,7 +218,8 @@ jobs:
         if: env.RUN_TESTS == 'true'
         env:
           TEST_RESULT: ${{ needs.cli-test-build.result }}
-        run: test "$TEST_RESULT" = success
+          DELIVERY_RESULT: ${{ needs.cli-native-delivery.result }}
+        run: test "$TEST_RESULT" = success && test "$DELIVERY_RESULT" = success
 
   shard-b:
     name: "Test: astra-runtime"
