@@ -303,16 +303,8 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM harness_snapshots WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "skill_selection_events",
-        sql: "DELETE FROM skill_selection_events WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "plans",
         sql: "DELETE FROM plans WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "session_checkpoints",
-        sql: "DELETE FROM session_checkpoints WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "tool_invocation_ledger",
@@ -380,13 +372,6 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
         sql: "DELETE FROM inference_routes
              WHERE session_id = ? AND user_id = ?
              ORDER BY created_at ASC, route_id ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "conversation_log",
-        sql: "DELETE FROM conversation_log
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY seq ASC
              LIMIT ?",
     },
     SessionBatchDeleteStatement {
@@ -1479,7 +1464,6 @@ mod tests {
                 "agent_event_edges",
                 "agent_events",
                 "agent_run_events",
-                "conversation_log",
                 "inference_invocation_settlement_debts",
                 "inference_invocations",
                 "inference_provider_attempts",

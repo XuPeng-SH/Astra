@@ -129,16 +129,4 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(crate::service_handlers::marketplace::save_credential_handler)
                 .delete(crate::service_handlers::marketplace::delete_credential_handler),
         )
-        .route(
-            "/marketplace/quality-report",
-            post(crate::service_handlers::marketplace::submit_quality_report_handler),
-        )
-        .route(
-            "/marketplace/stats/{skill_name}",
-            get(crate::service_handlers::marketplace::get_skill_stats_handler),
-        )
-        .route(
-            "/marketplace/search",
-            get(crate::service_handlers::marketplace::search_marketplace_handler),
-        )
 }

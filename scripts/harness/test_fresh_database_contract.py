@@ -642,7 +642,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
         self.assertNotIn("raw_ref_scheme_registry", canonical)
         self.assertIn("plans", canonical)
         self.assertIn("workspace_records", canonical)
-        self.assertIn("session_checkpoints", canonical)
+        self.assertNotIn("session_checkpoints", canonical)
         self.assertIn("work_runtime_event_outbox", canonical)
         boot = contract.BOOT_METADATA_TABLES
         counts = {table: (1 if table in boot else 0) for table in canonical}
@@ -659,7 +659,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
         for dirty in (
             "plans",
             "workspace_records",
-            "session_checkpoints",
             "work_runtime_event_outbox",
         ):
             with self.subTest(table=dirty):

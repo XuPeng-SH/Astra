@@ -366,7 +366,6 @@ fn char_literal() { let slash = '/'; }
             "agent_sessions",
             "agent_runs",
             "run_checkpoints",
-            "conversation_log",
             "session_transcript_items",
             "tool_invocation_ledger",
             "semantic_read_observations",
@@ -580,8 +579,6 @@ fn char_literal() { let slash = '/'; }
     def test_skill_and_agent_tables_have_semantic_metadata(self) -> None:
         skill_agent_tables = {
             "skills_registry",
-            "skill_metrics",
-            "skill_selection_events",
             "skill_installations",
             "skill_settings",
             "skill_resource_bindings",
@@ -615,14 +612,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "shared runtime catalog",
             self.tables["skills_registry"]["merge_guidance"],
-        )
-        self.assertIn(
-            "high-churn projections",
-            self.tables["skill_metrics"]["merge_guidance"],
-        )
-        self.assertIn(
-            "readers stop querying this table directly",
-            self.tables["skill_selection_events"]["merge_guidance"],
         )
         self.assertIn(
             "user's installed/activated state",
@@ -668,11 +657,9 @@ fn char_literal() { let slash = '/'; }
             "session_artifact_content_refs",
             "session_artifact_content_reservations",
             "session_artifact_content_upload_leases",
-            "session_checkpoints",
             "user_preferences",
             "edge_agent_registry",
             "plans",
-            "infra_sandbox_metadata",
         }
         for table in session_workflow_tables:
             with self.subTest(table=table):
@@ -703,10 +690,6 @@ fn char_literal() { let slash = '/'; }
             self.tables["session_artifacts"]["merge_guidance"],
         )
         self.assertIn(
-            "session-level restore snapshots",
-            self.tables["session_checkpoints"]["merge_guidance"],
-        )
-        self.assertIn(
             "per-user sync state",
             self.tables["user_preferences"]["merge_guidance"],
         )
@@ -718,10 +701,6 @@ fn char_literal() { let slash = '/'; }
             "current mutable plan state",
             self.tables["plans"]["merge_guidance"],
         )
-        self.assertIn(
-            "workspace_records track reusable workspaces",
-            self.tables["infra_sandbox_metadata"]["merge_guidance"],
-        )
 
 
     def test_high_growth_tables_have_retention_metadata(self) -> None:
@@ -729,7 +708,6 @@ fn char_literal() { let slash = '/'; }
             "agent_events",
             "agent_run_events",
             "run_checkpoints",
-            "conversation_log",
             "prompt_request_records",
             "prompt_deltas",
             "agent_message_queue",
@@ -905,12 +883,9 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("ordered bounded batches", delivery["retention_policy"])
         self.assertIn("consumer-scoped delivery state", delivery["merge_guidance"])
 
-    def test_conversation_log_retention_has_runtime_compaction_boundary(self) -> None:
-        row = self.tables["conversation_log"]
-        self.assertIn("model context reconstruction", row["retention_policy"])
-        self.assertIn("runtime compaction", row["retention_policy"])
-        self.assertIn("ordered bounded batches", row["retention_policy"])
-        self.assertIn("session hard delete", row["retention_policy"])
+    def test_retired_projection_tables_are_absent(self) -> None:
+        for table in ("conversation_log", "skill_selection_events", "infra_sandbox_metadata", "skill_metrics", "session_checkpoints"):
+            self.assertNotIn(table, self.tables)
 
     def test_session_high_growth_retention_mentions_bounded_hard_delete(self) -> None:
         for table in [

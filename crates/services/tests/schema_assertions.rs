@@ -76,6 +76,11 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         );
     }
     for retired in [
+        "infra_sandbox_metadata",
+        "skill_metrics",
+        "session_checkpoints",
+        "skill_selection_events",
+        "conversation_log",
         "run_display_projections",
         "session_delegations",
         "tool_result_projection_decisions",
@@ -768,17 +773,6 @@ async fn schema_rationalization_runtime_contract() {
             "prompt_deltas must not keep ownerless index {removed_index}"
         );
     }
-
-    let skill_metrics = column_names(&pool, &schema, "skill_metrics").await;
-    assert!(
-        skill_metrics.iter().any(|column| column == "metric_slot"),
-        "skill_metrics must carry metric_slot to scope aggregate uniqueness"
-    );
-    assert_eq!(
-        unique_key_columns(&pool, &schema, "skill_metrics", "uq_skill_metrics_slot").await,
-        ["skill_name", "metric_type", "metric_slot"],
-        "skill_metrics must enforce one aggregate slot per skill without collapsing report rows"
-    );
 
     assert!(
         !table_exists(&pool, &schema, "session_artifact_grants").await,
@@ -2208,42 +2202,6 @@ async fn phase2_web_hydration_schema_contract() {
             "ctx_decision_audits must not keep ownerless decision index {removed_index}"
         );
     }
-    let skill_selection_columns = column_names(&pool, &schema, "skill_selection_events").await;
-    for expected in ["event_id", "session_id", "user_id", "skill_name"] {
-        assert!(
-            skill_selection_columns
-                .iter()
-                .any(|column| column == expected),
-            "skill_selection_events missing {expected}"
-        );
-    }
-    assert_eq!(
-        column_nullable(&pool, &schema, "skill_selection_events", "user_id").await,
-        Some(false),
-        "skill_selection_events.user_id must be required because all writes are owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "skill_selection_events",
-            "idx_skill_selection_owner_session_created"
-        )
-        .await,
-        ["user_id", "session_id", "created_at"],
-        "skill selection session scans must stay owner-bound"
-    );
-    assert!(
-        index_columns(
-            &pool,
-            &schema,
-            "skill_selection_events",
-            "idx_skill_selection_session_created"
-        )
-        .await
-        .is_empty(),
-        "skill_selection_events must not keep ownerless session index idx_skill_selection_session_created"
-    );
     assert_eq!(
         index_columns(
             &pool,
@@ -2702,103 +2660,6 @@ async fn phase3_context_manifest_schema_contract() {
 async fn phase4_state_projection_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
-
-    let conversation_log_columns = column_names(&pool, &schema, "conversation_log").await;
-    for expected in ["user_id", "session_id", "seq", "turn", "entry_type"] {
-        assert!(
-            conversation_log_columns
-                .iter()
-                .any(|column| column == expected),
-            "conversation_log missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "conversation_log").await,
-        ["user_id", "session_id", "seq"],
-        "conversation_log identity must be owner/session/seq"
-    );
-    assert!(
-        column_default(&pool, &schema, "conversation_log", "user_id")
-            .await
-            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
-        "conversation_log.user_id must not use an empty-string owner sentinel"
-    );
-    assert_eq!(
-        index_columns(&pool, &schema, "conversation_log", "idx_csl_owner_snapshot").await,
-        ["user_id", "session_id", "entry_type", "seq"],
-        "CSL latest-snapshot lookup must use owner/session index"
-    );
-    assert_eq!(
-        index_columns(&pool, &schema, "conversation_log", "idx_csl_owner_turn").await,
-        ["user_id", "session_id", "turn"],
-        "CSL fork/read-by-turn lookup must use owner/session index"
-    );
-    assert!(
-        index_columns(&pool, &schema, "conversation_log", "idx_csl_snapshot")
-            .await
-            .is_empty(),
-        "conversation_log must not keep obsolete session-only snapshot index"
-    );
-    assert!(
-        index_columns(&pool, &schema, "conversation_log", "idx_csl_turn")
-            .await
-            .is_empty(),
-        "conversation_log must not keep obsolete session-only turn index"
-    );
-
-    let session_checkpoints = column_names(&pool, &schema, "session_checkpoints").await;
-    for expected in ["user_id", "session_id", "number", "turn", "state_json"] {
-        assert!(
-            session_checkpoints.iter().any(|column| column == expected),
-            "session_checkpoints missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_checkpoints").await,
-        ["user_id", "session_id", "checkpoint_id"],
-        "session checkpoint physical identity must stay inside owner/session boundary"
-    );
-    assert_eq!(
-        unique_key_columns(
-            &pool,
-            &schema,
-            "session_checkpoints",
-            "uq_session_checkpoints_owner_number"
-        )
-        .await,
-        ["user_id", "session_id", "number"],
-        "session checkpoint numbers must be unique inside the owner/session boundary"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_checkpoints",
-            "idx_ckpt_owner_session_turn"
-        )
-        .await,
-        ["user_id", "session_id", "turn"],
-        "session checkpoint turn lookups must be owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_checkpoints",
-            "idx_ckpt_user_created"
-        )
-        .await,
-        ["user_id", "created_at"],
-        "user checkpoint recency scans must stay owner-bound"
-    );
-    for removed_index in ["idx_ckpt_session_number", "idx_ckpt_session_turn"] {
-        assert!(
-            index_columns(&pool, &schema, "session_checkpoints", removed_index)
-                .await
-                .is_empty(),
-            "session_checkpoints must not keep ownerless checkpoint index {removed_index}"
-        );
-    }
 
     let plans = column_names(&pool, &schema, "plans").await;
     for expected in ["plan_id", "user_id", "session_id", "updated_at"] {

@@ -1,8 +1,6 @@
 use super::server::tool_transport::ToolExecutionService;
 use super::*;
-use crate::turn::services::{
-    NoopTurnAuxiliaryEventWriter, NoopTurnHookDbWriter, NoopTurnObserverWorker,
-};
+use crate::turn::services::{NoopTurnAuxiliaryEventWriter, NoopTurnObserverWorker};
 use astra_services::auth;
 
 const DEFAULT_NAME: &str = "Agent Engine API";
@@ -98,7 +96,6 @@ impl MemoriaHealth {
 
 #[derive(Clone)]
 pub(crate) struct TurnPersistenceState {
-    pub(crate) hook_db_writer: Arc<dyn TurnHookDbWriter>,
     pub(crate) observer_worker: Arc<dyn TurnObserverWorker>,
     pub(crate) auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
 }
@@ -106,7 +103,6 @@ pub(crate) struct TurnPersistenceState {
 impl Default for TurnPersistenceState {
     fn default() -> Self {
         Self {
-            hook_db_writer: Arc::new(NoopTurnHookDbWriter),
             observer_worker: Arc::new(NoopTurnObserverWorker),
             auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
         }
@@ -169,10 +165,8 @@ pub struct AppState {
     pub(crate) decision_service: Arc<dyn DecisionService>,
     pub(crate) model_service: Arc<dyn ModelService>,
     pub(crate) model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
-    pub(crate) sandbox_service: Arc<dyn SandboxService>,
     pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
-    pub(crate) marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
@@ -275,10 +269,8 @@ impl AppState {
             decision_service: Arc::new(UnconfiguredDecisionService),
             model_service: Arc::new(UnconfiguredModelService),
             model_catalog_cache: Default::default(),
-            sandbox_service: Arc::new(UnconfiguredSandboxService),
             data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
-            marketplace_stats_service: Arc::new(NoopMarketplaceStatsService),
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
@@ -509,11 +501,6 @@ impl AppState {
         self
     }
 
-    pub fn with_sandbox_service(mut self, sandbox_service: Arc<dyn SandboxService>) -> Self {
-        self.sandbox_service = sandbox_service;
-        self
-    }
-
     pub fn with_data_versioning_service(
         mut self,
         data_versioning_service: Arc<dyn DataVersioningService>,
@@ -527,14 +514,6 @@ impl AppState {
         marketplace_service: Arc<dyn MarketplaceService>,
     ) -> Self {
         self.marketplace_service = marketplace_service;
-        self
-    }
-
-    pub fn with_marketplace_stats_service(
-        mut self,
-        marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
-    ) -> Self {
-        self.marketplace_stats_service = marketplace_stats_service;
         self
     }
 
@@ -609,13 +588,6 @@ impl AppState {
         self
     }
 
-    pub fn with_turn_hook_db_writer(
-        mut self,
-        turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
-    ) -> Self {
-        self.turn_persistence.hook_db_writer = turn_hook_db_writer;
-        self
-    }
     pub fn with_turn_observer_worker(
         mut self,
         turn_observer_worker: Arc<dyn TurnObserverWorker>,

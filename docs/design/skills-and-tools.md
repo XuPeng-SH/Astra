@@ -76,6 +76,16 @@ or the `SkillHooks` phase wrapper, change accepted event names or action support
 introduce additional configuration scopes, or change admission,
 enforcement/circuit-breaker, or ServerSandbox/ServerLocal selection rules.
 
+The runtime keeps selected-skill names in turn telemetry for CLI self-model
+inputs. It does not write a separate skill-selection SQL projection or label
+selection as successful execution. Tool execution traces retain their actual
+outcomes; they are not a substitute for an audit of selection judgment.
+
+Skill registry listing, owner visibility, installation and personal evaluation
+remain supported. The separate Marketplace quality-report, global statistics
+and ranked-search facade is retired. Runtime skill-quality feedback does not
+depend on that facade.
+
 ## Tools
 
 A tool is a callable schema. Tool visibility and execution are decided by the capability system.

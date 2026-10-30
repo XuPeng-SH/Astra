@@ -754,7 +754,7 @@ mod tests {
         std::fs::write(ws_dir.join("workspace.yaml"), "invalid: yaml: content: [").unwrap();
 
         // Malformed workspace now falls back to journal-only local restore.
-        let svc = astra_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::SessionRestoreService::local_only();
         let result = svc
             .restore_local_session(&sid)
             .await
@@ -783,7 +783,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let svc = astra_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::SessionRestoreService::local_only();
         let result = svc
             .restore_local_session(&sid)
             .await

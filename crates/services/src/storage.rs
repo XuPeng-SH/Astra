@@ -4237,31 +4237,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "skill_selection_events",
-        "CREATE TABLE IF NOT EXISTS skill_selection_events (
-            event_id VARCHAR(64) PRIMARY KEY,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            agent_id VARCHAR(255) NULL,
-            user_query LONGTEXT NULL,
-            selected_skills JSON NULL,
-            skill_name VARCHAR(255) NULL,
-            skill_version VARCHAR(64) NULL,
-            selection_method VARCHAR(64) NULL,
-            execution_success BIGINT NULL,
-            execution_time_ms BIGINT NULL,
-            user_feedback_score BIGINT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_skill_selection_owner_session_created (user_id, session_id, created_at),
-            INDEX idx_skill_selection_user_created (user_id, created_at),
-            INDEX idx_skill_selection_skill_created (skill_name, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
         "infra_llm_models",
         "CREATE TABLE IF NOT EXISTS infra_llm_models (
             model_id VARCHAR(64) PRIMARY KEY,
@@ -4664,37 +4639,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "skill_metrics",
-        "CREATE TABLE IF NOT EXISTS skill_metrics (
-            metric_id            VARCHAR(255) PRIMARY KEY,
-            skill_name           VARCHAR(255) NOT NULL,
-            metric_type          VARCHAR(32) NOT NULL,
-            metric_slot          VARCHAR(255) NOT NULL,
-            skill_version        VARCHAR(50) NULL,
-            runtime_version      VARCHAR(50) NULL,
-            publisher_id         VARCHAR(255) NULL,
-            total_installs       BIGINT NOT NULL DEFAULT 0,
-            active_users_7d      INT NOT NULL DEFAULT 0,
-            avg_quality          FLOAT NOT NULL DEFAULT 0.0,
-            avg_rating           FLOAT NOT NULL DEFAULT 0.0,
-            report_count         INT NOT NULL DEFAULT 0,
-            compatibility_score  FLOAT NOT NULL DEFAULT 0.0,
-            trust_tier           VARCHAR(32) NULL,
-            success_rate         FLOAT NULL,
-            avg_tokens           FLOAT NULL,
-            invocation_count     INT NULL,
-            created_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_skill_metrics_slot (skill_name, metric_type, metric_slot),
-            INDEX idx_skill_metrics_lookup (skill_name, metric_type, created_at),
-            INDEX idx_skill_metrics_ranking (metric_type, avg_quality, active_users_7d),
-            INDEX idx_skill_metrics_tier (metric_type, trust_tier, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    core_schema_create!(
-        pool,
         "edge_agent_registry",
         "CREATE TABLE IF NOT EXISTS edge_agent_registry (
             user_id VARCHAR(128) NOT NULL,
@@ -4905,32 +4849,6 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_plans_user_updated (user_id, updated_at DESC),
             INDEX idx_plans_owner_session_updated (user_id, session_id, updated_at DESC),
             INDEX idx_plans_user_phase (user_id, phase)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "session_checkpoints",
-        "CREATE TABLE IF NOT EXISTS session_checkpoints (
-            checkpoint_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            number INT NOT NULL,
-            turn INT NOT NULL,
-            title VARCHAR(500) NULL,
-            summary LONGTEXT NULL,
-            tools_json JSON NULL,
-            state_json LONGTEXT NULL,
-            total_tokens BIGINT NOT NULL DEFAULT 0,
-            had_stalls SMALLINT NOT NULL DEFAULT 0,
-            error_count INT NOT NULL DEFAULT 0,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, checkpoint_id),
-            UNIQUE KEY uq_session_checkpoints_owner_number (user_id, session_id, number),
-            INDEX idx_ckpt_owner_session_turn (user_id, session_id, turn),
-            INDEX idx_ckpt_user_created (user_id, created_at)
         )",
     )
     .execute(&pool)
@@ -5259,24 +5177,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // ─── Infrastructure tables ───────────────────────────────────────────────────
-
-    core_schema_create!(pool, "infra_sandbox_metadata",
-        "CREATE TABLE IF NOT EXISTS infra_sandbox_metadata (
-            sandbox_name VARCHAR(128) PRIMARY KEY,
-            user_id      VARCHAR(128) NOT NULL,
-            description  TEXT NOT NULL,
-            created_by   VARCHAR(128) NOT NULL,
-            status       VARCHAR(32) NOT NULL DEFAULT 'active',
-            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_ism_user (user_id),
-            INDEX idx_ism_status (status)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ─── Data versioning tables ──────────────────────────────────────────────────
 
     core_schema_create!(
@@ -5294,28 +5194,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // ─── Conversation State Log (CSL) ──────────────────────────────────────────
-
-    core_schema_create!(
-        pool,
-        "conversation_log",
-        "CREATE TABLE IF NOT EXISTS conversation_log (
-            user_id       VARCHAR(128) NOT NULL,
-            session_id    VARCHAR(64) NOT NULL,
-            seq           BIGINT NOT NULL,
-            turn          INT NOT NULL,
-            entry_type    TINYINT NOT NULL,
-            trace_id      VARCHAR(64) DEFAULT NULL,
-            message_count INT DEFAULT NULL,
-            payload       MEDIUMTEXT NOT NULL,
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, seq),
-            INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC),
-            INDEX idx_csl_owner_turn (user_id, session_id, turn)
-        )",
-    )
-    .execute(&pool)
-    .await?;
     verify_core_schema_shape(&pool, &settings.database).await?;
     let declarations = pool.authority.declarations()?;
     publish_core_schema_table_contracts(&pool, &declarations).await?;
@@ -6317,19 +6195,6 @@ async fn verify_core_schema_shape(
     ] {
         ensure_index_shape(&indexes, "ctx_decision_audits", index, expected_columns)?;
     }
-    fail_if_required_columns_missing_or_nullable(
-        pool,
-        database,
-        "skill_selection_events",
-        &["user_id"],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "skill_selection_events",
-        "idx_skill_selection_owner_session_created",
-        &["user_id", "session_id", "created_at"],
-    )?;
     ensure_index_shape(
         &indexes,
         "inference_invocations",
@@ -6579,25 +6444,6 @@ async fn verify_core_schema_shape(
     )?;
     ensure_index_shape(
         &indexes,
-        "session_checkpoints",
-        "PRIMARY",
-        &["user_id", "session_id", "checkpoint_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "uq_session_checkpoints_owner_number",
-            &["user_id", "session_id", "number"][..],
-        ),
-        (
-            "idx_ckpt_owner_session_turn",
-            &["user_id", "session_id", "turn"][..],
-        ),
-        ("idx_ckpt_user_created", &["user_id", "created_at"][..]),
-    ] {
-        ensure_index_shape(&indexes, "session_checkpoints", index, expected_columns)?;
-    }
-    ensure_index_shape(
-        &indexes,
         "session_artifacts",
         "PRIMARY",
         &["user_id", "session_id", "artifact_id"],
@@ -6823,40 +6669,6 @@ pub fn database_user_from_row(
     decode_database_user_row(&row)
 }
 
-trait ActiveSkillVersionRow {
-    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error>;
-}
-
-impl ActiveSkillVersionRow for sqlx::mysql::MySqlRow {
-    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
-        self.try_get(column)
-    }
-}
-
-fn invalid_active_skill_version_value(column: &'static str, value: &str) -> sqlx::Error {
-    sqlx::Error::Decode(Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("skills_registry decode column `{column}`: empty value `{value}`"),
-    )))
-}
-
-fn decode_active_skill_version_row(
-    row: &impl ActiveSkillVersionRow,
-) -> Result<(String, String), sqlx::Error> {
-    let skill_name = row.string_column("skill_name")?;
-    if skill_name.trim().is_empty() {
-        return Err(invalid_active_skill_version_value(
-            "skill_name",
-            &skill_name,
-        ));
-    }
-    let version = row.string_column("version")?;
-    if version.trim().is_empty() {
-        return Err(invalid_active_skill_version_value("version", &version));
-    }
-    Ok((skill_name, version))
-}
-
 pub fn session_record_from_row(
     row: sqlx::mysql::MySqlRow,
 ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -6916,37 +6728,6 @@ pub async fn log_session_audit(
             "failed to write auth audit log"
         );
     }
-}
-
-pub async fn resolve_active_skill_versions(
-    pool: &sqlx::Pool<MySql>,
-    skill_names: BTreeSet<&str>,
-) -> Result<HashMap<String, String>, sqlx::Error> {
-    if skill_names.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut query_builder = QueryBuilder::<MySql>::new(
-        "SELECT skill_name, version FROM skills_registry WHERE is_active = 1 AND skill_name IN (",
-    );
-    {
-        let mut separated = query_builder.separated(", ");
-        for skill_name in &skill_names {
-            separated.push_bind(skill_name);
-        }
-    }
-    query_builder.push(") ORDER BY skill_name ASC, version DESC");
-
-    let rows = query_builder.build().fetch_all(pool).await?;
-    let mut versions = HashMap::new();
-    for row in rows {
-        let (skill_name, version) = decode_active_skill_version_row(&row)?;
-        if versions.contains_key(&skill_name) {
-            continue;
-        }
-        versions.insert(skill_name, version);
-    }
-    Ok(versions)
 }
 
 // ─── Expired Data Cleanup ────────────────────────────────────────────────────
@@ -7550,97 +7331,6 @@ mod tests {
                 sqlx::Error::ColumnNotFound(name) => assert_eq!(name, column),
                 err => panic!("expected ColumnNotFound({column}), got {err:?}"),
             }
-        }
-    }
-
-    struct FakeActiveSkillVersionRow {
-        failed_column: Option<&'static str>,
-        skill_name: &'static str,
-        version: &'static str,
-    }
-
-    impl FakeActiveSkillVersionRow {
-        fn complete() -> Self {
-            Self {
-                failed_column: None,
-                skill_name: "skill-a",
-                version: "v2",
-            }
-        }
-
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-                ..Self::complete()
-            }
-        }
-
-        fn with_values(skill_name: &'static str, version: &'static str) -> Self {
-            Self {
-                failed_column: None,
-                skill_name,
-                version,
-            }
-        }
-    }
-
-    impl ActiveSkillVersionRow for FakeActiveSkillVersionRow {
-        fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-
-            Ok(match column {
-                "skill_name" => self.skill_name,
-                "version" => self.version,
-                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-            .to_string())
-        }
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_preserves_database_values() {
-        let (skill_name, version) =
-            decode_active_skill_version_row(&FakeActiveSkillVersionRow::complete()).unwrap();
-
-        assert_eq!(skill_name, "skill-a");
-        assert_eq!(version, "v2");
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_fails_loudly_on_missing_columns() {
-        for column in ["skill_name", "version"] {
-            match decode_active_skill_version_row(&FakeActiveSkillVersionRow::fail_on(column))
-                .unwrap_err()
-            {
-                sqlx::Error::ColumnNotFound(name) => assert_eq!(name, column),
-                err => panic!("expected ColumnNotFound({column}), got {err:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_fails_loudly_on_empty_values() {
-        for (column, row) in [
-            (
-                "skill_name",
-                FakeActiveSkillVersionRow::with_values("   ", "v2"),
-            ),
-            (
-                "version",
-                FakeActiveSkillVersionRow::with_values("skill-a", ""),
-            ),
-        ] {
-            let error = decode_active_skill_version_row(&row).unwrap_err();
-            assert!(
-                matches!(error, sqlx::Error::Decode(_)),
-                "expected decode error for `{column}`, got {error:?}"
-            );
-            assert!(
-                error.to_string().contains(column),
-                "decode error should identify `{column}`: {error}"
-            );
         }
     }
 

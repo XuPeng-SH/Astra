@@ -47,11 +47,6 @@ pub struct LineageNode {
     pub created_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct SandboxCheckpointData {
-    pub checkpoint_name: String,
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 pub fn validate_checkpoint_name(name: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -206,13 +201,6 @@ pub trait DataVersioningService: Send + Sync {
         user_id: String,
         event_id: String,
     ) -> Result<Vec<LineageNode>, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn sandbox_checkpoint(
-        &self,
-        user_id: String,
-        sandbox_name: String,
-        request: SandboxCheckpointData,
-    ) -> Result<CheckpointResponse, (StatusCode, Json<ErrorResponse>)>;
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -496,51 +484,6 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
         Ok(chain)
     }
-
-    async fn sandbox_checkpoint(
-        &self,
-        user_id: String,
-        sandbox_name: String,
-        request: SandboxCheckpointData,
-    ) -> Result<CheckpointResponse, (StatusCode, Json<ErrorResponse>)> {
-        validate_checkpoint_name(&request.checkpoint_name)?;
-
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let full_name = format!("{}__{}", sandbox_name, request.checkpoint_name);
-        let sql =
-            crate::snapshot_sql::create_snapshot_for_db_sql(&full_name, &self.matrixone.database);
-        query(sqlx::AssertSqlSafe(sql))
-            .execute(&pool)
-            .await
-            .map_err(internal_error)?;
-
-        let checkpoint_id = uuid::Uuid::new_v4().to_string();
-
-        query(
-            "INSERT INTO data_versioning_checkpoints \
-             (checkpoint_id, checkpoint_name, user_id, description, created_at) \
-             VALUES (?, ?, ?, ?, NOW())",
-        )
-        .bind(&checkpoint_id)
-        .bind(&full_name)
-        .bind(&user_id)
-        .bind(format!("Sandbox checkpoint for {}", sandbox_name))
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let row = query(
-            "SELECT checkpoint_name, description, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM data_versioning_checkpoints WHERE checkpoint_id = ?",
-        )
-        .bind(&checkpoint_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
-        checkpoint_response_from_row(row)
-    }
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────
@@ -583,14 +526,6 @@ impl DataVersioningService for UnconfiguredDataVersioningService {
     ) -> Result<Vec<LineageNode>, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("data versioning service not configured"))
     }
-    async fn sandbox_checkpoint(
-        &self,
-        _: String,
-        _: String,
-        _: SandboxCheckpointData,
-    ) -> Result<CheckpointResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("data versioning service not configured"))
-    }
 }
 
 // ── HTTP types ───────────────────────────────────────────────────────────────
@@ -599,11 +534,6 @@ impl DataVersioningService for UnconfiguredDataVersioningService {
 pub struct CreateCheckpointRequest {
     pub name: String,
     pub description: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct SandboxCheckpointRequest {
-    pub checkpoint_name: String,
 }
 
 #[cfg(test)]
@@ -735,13 +665,6 @@ mod tests {
         assert!(r.description.is_none());
     }
 
-    #[test]
-    fn sandbox_checkpoint_request_deserialize() {
-        let json = r#"{"checkpoint_name":"snap1"}"#;
-        let r: SandboxCheckpointRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(r.checkpoint_name, "snap1");
-    }
-
     // ── UnconfiguredDataVersioningService ──
 
     #[tokio::test]
@@ -770,17 +693,6 @@ mod tests {
                 .is_err()
         );
         assert!(svc.trace_upstream("u1".into(), "e1".into()).await.is_err());
-        assert!(
-            svc.sandbox_checkpoint(
-                "u1".into(),
-                "sb".into(),
-                SandboxCheckpointData {
-                    checkpoint_name: "cp".into()
-                }
-            )
-            .await
-            .is_err()
-        );
     }
 
     // ── Data type equality (2→1) ──
@@ -796,11 +708,5 @@ mod tests {
             description: Some("d".into()),
         };
         assert_eq!(a, b);
-
-        let sandbox_a = SandboxCheckpointData {
-            checkpoint_name: "snap1".into(),
-        };
-        let sandbox_b = sandbox_a.clone();
-        assert_eq!(sandbox_a, sandbox_b);
     }
 }

@@ -1063,9 +1063,24 @@ impl SessionService for DatabaseSessionService {
             .begin()
             .await
             .map_err(internal_error)?;
-        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+        match crate::storage::lock_agent_session_write_fence_state(&mut tx, &session_id, &user_id)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+        {
+            crate::storage::AgentSessionWriteFenceState::Writable => {}
+            crate::storage::AgentSessionWriteFenceState::PendingDelete
+            | crate::storage::AgentSessionWriteFenceState::CompletedDelete => {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                ));
+            }
+            crate::storage::AgentSessionWriteFenceState::Missing => {
+                return Err(internal_error(
+                    "session lifecycle fence disappeared before it could be locked",
+                ));
+            }
+        }
         let locked = query(
             "SELECT IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
              FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE",
@@ -1154,7 +1169,12 @@ impl SessionService for DatabaseSessionService {
         let updated = self
             .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
-            .ok_or_else(|| internal_error("failed to read updated session"))?;
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                )
+            })?;
         let details = serde_json::json!({
             "title": title,
             "status": status,
@@ -1196,9 +1216,24 @@ impl SessionService for DatabaseSessionService {
             .begin()
             .await
             .map_err(internal_error)?;
-        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+        match crate::storage::lock_agent_session_write_fence_state(&mut tx, &session_id, &user_id)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+        {
+            crate::storage::AgentSessionWriteFenceState::Writable => {}
+            crate::storage::AgentSessionWriteFenceState::PendingDelete
+            | crate::storage::AgentSessionWriteFenceState::CompletedDelete => {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                ));
+            }
+            crate::storage::AgentSessionWriteFenceState::Missing => {
+                return Err(internal_error(
+                    "session lifecycle fence disappeared before it could be locked",
+                ));
+            }
+        }
         let status: Option<String> = sqlx::query_scalar(
             "SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ? \
              AND delete_requested_at IS NULL FOR UPDATE",

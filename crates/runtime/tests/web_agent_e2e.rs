@@ -23,8 +23,8 @@ use astra_runtime::{
     AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse,
     HealthChecker, ServiceInfo, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
     SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
-    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
-    TurnObserverOutcome, TurnObserverRequest, TurnObserverWorker, build_app,
+    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnObserverOutcome, TurnObserverRequest,
+    TurnObserverWorker, build_app,
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord, SkillPublishRequestData,
@@ -290,20 +290,6 @@ impl SessionService for StubSession {
 }
 
 // ── Recording test doubles ───────────────────────────────────────────────────
-
-/// Records all hook DB persist calls for test verification.
-#[derive(Default)]
-struct RecordingHookDbWriter {
-    plans: tokio::sync::Mutex<Vec<TurnHookDbPersistPlan>>,
-}
-
-#[async_trait]
-impl TurnHookDbWriter for RecordingHookDbWriter {
-    async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
-        self.plans.lock().await.push(plan);
-        Ok(())
-    }
-}
 
 /// Records all observer requests for test verification.
 #[derive(Default)]
@@ -635,13 +621,12 @@ fn primary_request_for(request: &ProviderRequest, message: &str) -> bool {
         })
 }
 
-/// Build a test app with recording hook DB + observer writers for verification.
-fn build_test_app_with_hooks(
+/// Build a test app with an observer and an Edge callback ledger.
+fn build_test_app_with_observer(
     models: Arc<TestModelService>,
     inference: Option<&ProviderObservationsFixture>,
 ) -> (
     Router,
-    Arc<RecordingHookDbWriter>,
     Arc<RecordingObserverWorker>,
     test_support::EdgeCallbackLedger,
 ) {
@@ -651,14 +636,12 @@ fn build_test_app_with_hooks(
         .with_session_service(Arc::new(StubSession));
 
     let ledger = base.edge_callback_ledger();
-    let hook_writer = Arc::new(RecordingHookDbWriter::default());
     let observer_worker = Arc::new(RecordingObserverWorker::default());
     let lifecycle = test_run_lifecycle(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger.clone(),
     )
     .with_model_service(models)
-    .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
@@ -668,24 +651,19 @@ fn build_test_app_with_hooks(
         lifecycle
     };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), hook_writer, observer_worker, ledger)
+    (build_app(state), observer_worker, ledger)
 }
 
-fn build_test_app_with_hooks_and_skills(
+fn build_test_app_with_observer_and_skills(
     models: Arc<TestModelService>,
     inference: Option<&ProviderObservationsFixture>,
-) -> (
-    Router,
-    Arc<RecordingHookDbWriter>,
-    Arc<RecordingObserverWorker>,
-) {
+) -> (Router, Arc<RecordingObserverWorker>) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_session_service(Arc::new(StubSession));
 
     let ledger = base.edge_callback_ledger();
-    let hook_writer = Arc::new(RecordingHookDbWriter::default());
     let observer_worker = Arc::new(RecordingObserverWorker::default());
     let lifecycle = test_run_lifecycle(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
@@ -693,7 +671,6 @@ fn build_test_app_with_hooks_and_skills(
     )
     .with_model_service(models)
     .with_skill_service(Arc::new(TestSkillService))
-    .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
@@ -703,7 +680,7 @@ fn build_test_app_with_hooks_and_skills(
         lifecycle
     };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), hook_writer, observer_worker)
+    (build_app(state), observer_worker)
 }
 
 fn build_test_app_with_agent_bindings(
@@ -3483,7 +3460,7 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
     )])
     .await;
     let inference = ProviderObservationsFixture::default();
-    let (app, hook, observer, ledger) = build_test_app_with_hooks(
+    let (app, observer, ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -3614,7 +3591,6 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
                 .and_then(Value::as_array)
                 .is_some_and(|calls| !calls.is_empty())
     }));
-    assert!(hook.plans.lock().await.is_empty());
     poll_until(
         || {
             let ledger = ledger.clone();
@@ -3660,7 +3636,7 @@ async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"I used the skill instructions.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+    let (app, observer_worker) = build_test_app_with_observer_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -3668,6 +3644,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     );
 
     let payload = json!({
+        "allow_skills": ["test-skill"],
         "message": "Use the test skill",
     "model_selection":{"offering_id":"model-MiniMax-M2.7"},
     "context":{"edge_profile":{"active_skills":["concise","markdown"],"cwd":"/workspace/astra","git_branch":"main"}},
@@ -3735,28 +3712,6 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         "final LLM round should continue after skill interception"
     );
 
-    poll_until(
-        || {
-            let hook_writer = hook_writer.clone();
-            async move { !hook_writer.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-    let plans = hook_writer.plans.lock().await;
-    assert_eq!(
-        plans.len(),
-        1,
-        "an intercepted skill must persist exactly one selection"
-    );
-    let skill = plans
-        .first()
-        .and_then(|plan| plan.skill_selection.as_ref())
-        .expect("an intercepted skill must persist its explicit selection");
-    assert_eq!(skill.skill_name, "test-skill");
-    assert_eq!(skill.selected_skills, vec!["test-skill".to_string()]);
-    assert_eq!(skill.selection_method, "llm_skill_choice");
-
     gateway.assert_complete();
     inference.assert_quiescent();
     assert_eq!(inference.attempt_count(), 2);
@@ -3775,7 +3730,7 @@ async fn cli_thin_client_single_admission_completes_server_owned_multi_round_loo
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The server completed the skill round.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+    let (app, observer_worker) = build_test_app_with_observer_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -3796,6 +3751,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     });
 
     let payload = normalize_chat_stream_payload(json!({
+        "allow_skills": ["test-skill"],
         "message": "Use the test skill and report the result",
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
@@ -3883,7 +3839,7 @@ async fn unknown_skill_returns_error_without_edge_tool_request() {
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The skill was unavailable.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+    let (app, observer_worker) = build_test_app_with_observer_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -3891,6 +3847,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     );
 
     let payload = json!({
+        "allow_skills": ["test-skill"],
         "message": "Use a missing skill",
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
@@ -5229,10 +5186,10 @@ async fn client_disconnect_run_still_finalizes() {
 
 /// Ordinary answers reach the observer without writing a hook projection.
 #[tokio::test]
-async fn hook_db_text_only_skips_writer() {
-    let gateway = ProviderGateway::start(vec![ProviderScript::new("hook_db_text_only_skips_writer", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+async fn ordinary_answer_reaches_observer() {
+    let gateway = ProviderGateway::start(vec![ProviderScript::new("ordinary_answer_reaches_observer", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+    let (app, observer_worker, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5257,7 +5214,6 @@ async fn hook_db_text_only_skips_writer() {
         5,
     )
     .await;
-    assert!(hook_writer.plans.lock().await.is_empty());
 
     // Observer should have been called with messages.
     let requests = observer_worker.requests.lock().await;
@@ -5298,7 +5254,7 @@ async fn hook_db_text_only_skips_writer() {
 async fn observer_fired_with_correct_metadata() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("observer_fired_with_correct_metadata", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+    let (app, observer_worker, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5435,7 +5391,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r9", "read_file", json!({"path": "Cargo.toml"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5523,7 +5479,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r4", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done reviewing.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+    let (app, observer_worker, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5633,7 +5589,7 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Completed after exploratory extension.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5705,7 +5661,7 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Final answer after the hard limit.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5830,7 +5786,7 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-fail-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Edge operations returned partial failure and denial.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5905,7 +5861,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 async fn context_meta_exposes_memory_signal_context_flag() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_memory_signal_context_flag", |request| primary_request_for(request, "remember that I prefer dark mode"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Stored."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5958,7 +5914,7 @@ async fn context_meta_exposes_memory_signal_context_flag() {
 async fn context_meta_exposes_builder_supplied_context_signals() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_builder_supplied_context_signals", |request| primary_request_for(request, "remember that I prefer dark mode"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Stored."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),

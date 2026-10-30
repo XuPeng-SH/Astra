@@ -1,5 +1,5 @@
 use astra_services::session_restore::{
-    HybridRestoreService, RestoredSession, ResumableSessionsResponse,
+    RestoredSession, ResumableSessionsResponse, SessionRestoreService,
 };
 
 use crate::cli::cli_config::cli_utils;
@@ -156,7 +156,7 @@ pub(crate) async fn restore_session_snapshot_with_client(
     if has_server_auth(profile) {
         return fetch_cloud_session_snapshot_with_client(profile, api, session_id).await;
     }
-    HybridRestoreService::local_only()
+    SessionRestoreService::local_only()
         .restore_local_session(session_id)
         .await
 }

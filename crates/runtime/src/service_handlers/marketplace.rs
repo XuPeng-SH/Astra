@@ -4,7 +4,7 @@ use crate::AppState;
 use astra_core::ErrorResponse;
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
 };
 
@@ -126,43 +126,4 @@ pub async fn delete_credential_handler(
         .delete_credential(user.user_id, params.skill_name, params.credential_name)
         .await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-// ── Marketplace stats handlers (Phase 3) ─────────────────────────────────────
-
-pub use astra_services::marketplace_stats::{
-    QualityReportData, SkillMarketplaceStats, SkillSearchQuery, SkillSearchResponse,
-};
-
-pub async fn submit_quality_report_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(report): Json<QualityReportData>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // Require authentication to prevent anonymous quality report spam
-    let _user = state.auth_service.current_user(&headers).await?;
-    state
-        .marketplace_stats_service
-        .submit_quality_report(report)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-pub async fn get_skill_stats_handler(
-    State(state): State<AppState>,
-    Path(skill_name): Path<String>,
-) -> Result<Json<SkillMarketplaceStats>, (StatusCode, Json<ErrorResponse>)> {
-    let stats = state
-        .marketplace_stats_service
-        .get_skill_stats(skill_name)
-        .await?;
-    Ok(Json(stats))
-}
-
-pub async fn search_marketplace_handler(
-    State(state): State<AppState>,
-    Query(query): Query<SkillSearchQuery>,
-) -> Result<Json<SkillSearchResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let results = state.marketplace_stats_service.search_ranked(query).await?;
-    Ok(Json(results))
 }

@@ -19,7 +19,6 @@ from test_release_build_shells import workflow_run_script
 ROOT = Path(__file__).resolve().parents[2]
 SHARDS = {
     "core-runtime": "astra-runtime",
-    "core-turn-core": "astra-turn-core",
     "core-services": "astra-services",
 }
 
@@ -199,7 +198,7 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("needs: [scope, macos-plan]", contracts)
         self.assertNotIn("terminal-pty-shards", contracts, "Tools contracts must not wait for the CLI build")
         online = workflow.split("\n  test-online:\n", 1)[1]
-        self.assertIn("lane: [core-runtime, core-turn-core, core-services, integration]", online)
+        self.assertIn("lane: [core-runtime, core-services, integration]", online)
         self.assertIn("matrix.lane != 'integration' && needs.scope.outputs.online_core == 'true'", online)
         self.assertIn("matrix.lane == 'integration' && needs.scope.outputs.online_integration == 'true'", online)
         self.assertIn('ASTRA_ONLINE_LANE: ${{ matrix.lane }}', online)
@@ -276,7 +275,7 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
 
     def test_shards_cover_combined_core_with_identical_test_selections(self):
         combined = self.cargo_calls("core")
-        self.assertEqual(len(combined), 3)
+        self.assertEqual(len(combined), len(SHARDS))
         split = []
         for lane, package in SHARDS.items():
             with self.subTest(lane=lane):
@@ -292,7 +291,7 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
                     self.assertEqual(call["test_database"], call["database"])
                 split.append(call)
         self.assertEqual([row["args"] for row in split], [row["args"] for row in combined])
-        self.assertEqual(len({row["database"] for row in split}), 3)
+        self.assertEqual(len({row["database"] for row in split}), len(SHARDS))
 
     def test_default_all_still_includes_core_and_integration(self):
         expected = self.cargo_calls("core") + self.cargo_calls("integration")
@@ -311,7 +310,7 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
     def test_combined_core_keeps_running_remaining_suites_after_failure(self):
         result, records = self.run_lane("core", fail_package="astra-runtime")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len([row for row in records if row["kind"] == "cargo"]), 3)
+        self.assertEqual(len([row for row in records if row["kind"] == "cargo"]), len(SHARDS))
 
     def test_each_shard_resets_only_its_own_database(self):
         for lane in (*SHARDS, "integration"):

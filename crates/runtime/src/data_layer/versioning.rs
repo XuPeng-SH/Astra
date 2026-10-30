@@ -77,23 +77,3 @@ pub async fn trace_upstream_handler(
         .await?;
     Ok(Json(chain))
 }
-
-pub async fn sandbox_checkpoint_handler(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<SandboxCheckpointRequest>,
-) -> Result<(StatusCode, Json<CheckpointResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let checkpoint = state
-        .data_versioning_service
-        .sandbox_checkpoint(
-            user.user_id,
-            name,
-            SandboxCheckpointData {
-                checkpoint_name: request.checkpoint_name,
-            },
-        )
-        .await?;
-    Ok((StatusCode::CREATED, Json(checkpoint)))
-}

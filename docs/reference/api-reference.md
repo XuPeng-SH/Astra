@@ -338,29 +338,6 @@ All events in a causal chain.
 
 ---
 
-## Sandbox
-
-### POST /sandbox
-
-```json
-// Request
-{"name": "experiment_1", "description": "Test new prompt", "created_by": "alice"}
-
-// Response 201
-{"sandbox_name": "experiment_1", "status": "active"}
-```
-
-### GET /sandbox
-
-List the current user's sandboxes. Query param: optional `pattern` name
-filter.
-
-### GET /sandbox/{name}
-
-### DELETE /sandbox/{name} → 204
-
----
-
 ## Skills
 
 ### GET /skills
@@ -490,3 +467,16 @@ field `conversation_authority` is unsupported and rejected as
 Run admission. A caller must finish or release an outstanding standalone
 Controller writer before starting Server chat. Session/Work Controller APIs
 and their signed execution grants remain separate supported contracts.
+
+## Retired persistence APIs
+
+`/sandbox` and `/sandbox/{name}` metadata CRUD,
+`/data-versioning/sandbox/{name}/checkpoint`, `/marketplace/quality-report`,
+`/marketplace/stats/{skill_name}` and `/marketplace/search` are no longer routed.
+Ordinary data-versioning checkpoints and skill registry/install APIs remain.
+
+`POST /sessions/{id}/resume` returns canonical hydration (`session_id`,
+`last_status`, diagnostic totals and `resume_bundle`), rather than a Session
+header with `created_at`. Both full and `?continuation_only=true` restore
+require valid owner-scoped canonical Context; missing state returns 404 without
+activating the Session. Corrupt canonical state fails without activation.

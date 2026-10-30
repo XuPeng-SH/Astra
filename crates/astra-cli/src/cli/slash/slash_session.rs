@@ -2525,7 +2525,7 @@ mod resume_tests {
     #[tokio::test]
     async fn restore_from_csl_populates_history_and_state() {
         use astra_turn_core::conversation_log::{
-            AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
+            CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
         };
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("csl-resume-{}", uuid::Uuid::new_v4());
@@ -2548,10 +2548,7 @@ mod resume_tests {
                 ..Default::default()
             },
         };
-        store
-            .append(&session_id, &snapshot, &AppendMeta::default())
-            .await
-            .unwrap();
+        store.append(&session_id, &snapshot).await.unwrap();
 
         let delta = CslEntry::TurnDelta {
             seq: 1,
@@ -2562,10 +2559,7 @@ mod resume_tests {
             ],
             state_patch: None,
         };
-        store
-            .append(&session_id, &delta, &AppendMeta::default())
-            .await
-            .unwrap();
+        store.append(&session_id, &delta).await.unwrap();
 
         let state = prepare_session_history(&session_id).await.unwrap();
 

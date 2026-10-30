@@ -24,9 +24,7 @@ use astra_services::session_audit::{
     RuntimePromotionController, RuntimePromotionOutcome, RuntimePromotionRecommendation,
     SessionAuditService,
 };
-use astra_services::session_restore::{
-    HybridRestoreService, SessionRestoreService, pull_step_checkpoint_from_cloud,
-};
+use astra_services::session_restore::SessionRestoreService;
 use astra_services::session_workspace::{
     ContextTraceSignal, ContextTraceToolSurface, WORKSPACE_METADATA_ARTIFACT_KIND,
     WORKSPACE_METADATA_PROJECTION_ID, WorkspaceMetadata, persist_remote_workspace,
@@ -36,15 +34,14 @@ use astra_services::{
     AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, ContextService,
     DatabaseAdminAuditReader, DatabaseContextManifestStore, DatabaseContextService,
     DatabaseDecisionService, DatabaseEventService, DatabaseIntrospectionService,
-    DatabaseMarketplaceService, DatabaseMarketplaceStatsService, DatabasePersonalSkillStore,
-    DatabaseReflectService, DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator,
-    DatabaseSessionService, DatabaseSkillService, DatabaseStateProjectionStore,
-    DecisionCreateRequestData, DecisionListFilter, DecisionService, EventCreateRequestData,
-    EventListFilter, EventService, IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService,
-    MarketplaceStatsService, ReflectService, ReserveTurnOutcome, RetrievalStage,
-    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
-    SessionArtifactStore, SessionArtifactStoreError, SessionContextCoordinator,
-    SessionContextCoordinatorError, SessionListFilter, SessionService, SkillSearchQuery,
+    DatabaseMarketplaceService, DatabasePersonalSkillStore, DatabaseReflectService,
+    DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator, DatabaseSessionService,
+    DatabaseSkillService, DatabaseStateProjectionStore, DecisionCreateRequestData,
+    DecisionListFilter, DecisionService, EventCreateRequestData, EventListFilter, EventService,
+    IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, ReflectService,
+    ReserveTurnOutcome, RetrievalStage, SessionArtifactJsonStore, SessionArtifactReference,
+    SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
+    SessionContextCoordinator, SessionContextCoordinatorError, SessionListFilter, SessionService,
     SkillService, SnapshotCreateRequestData, SnapshotListFilter, SubmitUserSkillVersion,
 };
 use astra_turn_types::{
@@ -68,21 +65,6 @@ async fn seed_restore_session_fixture(
     sqlx::query("INSERT INTO agent_sessions (session_id, user_id, title, status, event_count, metadata) VALUES (?, ?, 'restore fixture', 'active', 0, CAST(? AS JSON))")
         .bind(session_id).bind(user_id).bind(metadata.to_string())
         .execute(pool).await.expect("seed historical session");
-}
-
-async fn seed_restore_checkpoint_fixture(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    checkpoint: &astra_services::session_checkpoint::Checkpoint,
-    state_json: Option<&str>,
-) {
-    sqlx::query("INSERT INTO session_checkpoints (checkpoint_id, session_id, user_id, number, turn, title, summary, tools_json, total_tokens, had_stalls, error_count, state_json) VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, CAST(? AS JSON))")
-        .bind(Uuid::new_v4().to_string()).bind(session_id).bind(user_id)
-        .bind(checkpoint.number).bind(checkpoint.turn).bind(&checkpoint.title)
-        .bind(&checkpoint.summary).bind(serde_json::to_string(&checkpoint.tools_used).unwrap())
-        .bind(checkpoint.total_tokens).bind(checkpoint.had_stalls).bind(checkpoint.error_count)
-        .bind(state_json).execute(pool).await.expect("seed historical checkpoint");
 }
 
 fn context_trace_request_fixture(
@@ -1154,7 +1136,7 @@ async fn unpublish_skill_is_owner_bound_for_same_name_versions() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
+async fn events_sessions_decisions_admin_and_marketplace_installed_pagination() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -1708,22 +1690,6 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     );
     assert!(second_installed_page.next_cursor.is_none());
 
-    let mstats = DatabaseMarketplaceStatsService::new(settings).with_pool(shared);
-    let sr = mstats
-        .search_ranked(SkillSearchQuery {
-            query: None,
-            category: None,
-            trust_tier: None,
-            limit: Some(5),
-            after_ranking_score: None,
-            after_skill_name: None,
-            after_version: None,
-        })
-        .await
-        .expect("search_ranked");
-    assert_eq!(sr.limit, 5);
-    assert!(sr.total.is_none());
-
     cleanup_session_bundle(
         &pool,
         &session_id,
@@ -1982,7 +1948,6 @@ async fn cleanup_session_delete_fixture_for_owner(
         "ctx_decision_audits",
         "ctx_snapshots",
         "session_artifacts",
-        "conversation_log",
         "agent_event_edges",
         "agent_events",
         "agent_runs",
@@ -2045,7 +2010,6 @@ async fn cleanup_restore_fixture_for_owner(
             "agent_event_edges",
             "session_artifact_references",
             "session_artifacts",
-            "session_checkpoints",
             "agent_events",
             "prompt_deltas",
             "prompt_request_records",
@@ -4737,7 +4701,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     let user_id = Uuid::new_v4().to_string();
     let session_a = Uuid::new_v4().to_string();
     let session_b = Uuid::new_v4().to_string();
-    let checkpoint_id = Uuid::new_v4().to_string();
     let existing_metadata_a =
         serde_json::json!({"agent_id":"astra-server","note":"keep me","git_branch":"feature/cloud-sync","model":"gpt-5.4"}).to_string();
 
@@ -4869,19 +4832,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         .expect("seed session event_count");
     }
 
-    sqlx::query(
-        "INSERT INTO session_checkpoints \
-         (checkpoint_id, session_id, user_id, number, turn, title, summary, tools_json, total_tokens, created_at) \
-         VALUES (?, ?, ?, 1, 2, 'checkpoint-a', 'cloud checkpoint', CAST(? AS JSON), 250, '2026-09-01 10:02:00.000000')",
-    )
-    .bind(&checkpoint_id)
-    .bind(&session_a)
-    .bind(&user_id)
-    .bind(serde_json::json!(["bash", "rg"]).to_string())
-    .execute(&pool)
-    .await
-    .expect("insert session checkpoint");
-
     let trace_a = ContextTraceSignal {
         turn_id: "turn-a".into(),
         captured_at: Some("2026-09-01T10:02:30Z".into()),
@@ -4953,9 +4903,9 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         "context-trace push should add its inserted event delta to session B"
     );
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored_a = restore
-        .restore_session(&user_id, &session_a)
+        .load_cloud_summary(&user_id, &session_a)
         .await
         .expect("restore session A")
         .expect("session A restored");
@@ -4963,7 +4913,7 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     assert_eq!(restored_a.turn_count, 2);
     assert_eq!(restored_a.total_tokens_in, 200);
     assert_eq!(restored_a.total_tokens_out, 50);
-    assert_eq!(restored_a.checkpoint_count, 1);
+    assert_eq!(restored_a.checkpoint_count, 0);
     assert!(
         restored_a.resume_bundle.is_none(),
         "isolated user_query rows do not prove a complete causal conversation"
@@ -4987,7 +4937,7 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     );
 
     let restored_b = restore
-        .restore_session(&user_id, &session_b)
+        .load_cloud_summary(&user_id, &session_b)
         .await
         .expect("restore session B")
         .expect("session B restored");
@@ -5145,27 +5095,10 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
     .execute(&pool)
     .await
     .expect("insert foreign owner event");
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &other_user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 1,
-            turn: 99,
-            title: "foreign".into(),
-            summary: "foreign".into(),
-            tools_used: Vec::new(),
-            total_tokens: 0,
-            had_stalls: false,
-            error_count: 0,
-        },
-        None,
-    )
-    .await;
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&user_id, &session_id)
+        .load_cloud_summary(&user_id, &session_id)
         .await
         .expect("restore sparse-turn session")
         .expect("sparse-turn session restored");
@@ -5378,15 +5311,18 @@ async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_
         .expect("remote workspace projection exists");
     assert_eq!(projection.content, newer_artifact.content);
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&user_id, &session_id)
+        .load_cloud_summary(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored from remote workspace artifact");
 
     assert!(restored.restored_from_cloud);
-    assert_eq!(restored.turn_count, newer_workspace.turn_count);
+    assert_eq!(
+        restored.turn_count, 0,
+        "workspace hints do not supply the canonical turn clock"
+    );
     assert_eq!(restored.total_tokens_in, newer_workspace.total_tokens_in);
     assert_eq!(restored.total_tokens_out, newer_workspace.total_tokens_out);
     assert!(
@@ -5494,9 +5430,9 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
         .expect("insert non-authoritative turn_complete");
     }
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&user_id, &session_id)
+        .load_cloud_summary(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored");
@@ -5506,7 +5442,7 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
     assert!(
         restored.recent_tools.is_empty(),
         "agent_events turn_complete metadata is not authoritative recent-tool state; \
-         session_checkpoints must be the single restore source"
+         diagnostic event traces must not supply resumable tool state"
     );
     assert!(restored.last_context_trace.is_none());
 
@@ -5620,9 +5556,9 @@ async fn client_context_trace_requires_owned_session_on_live_matrixone() {
         "the diagnostic event must retain its exact tool-surface evidence"
     );
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&user_id, &session_id)
+        .load_cloud_summary(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored");
@@ -5639,384 +5575,6 @@ async fn client_context_trace_requires_owned_session_on_live_matrixone() {
     );
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn historical_checkpoint_readers_keep_session_and_step_rows_separate_on_live_matrixone() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let heavy_only_session = Uuid::new_v4().to_string();
-
-    let heavy_state_json = |owner_id: &str,
-                            session_id: &str,
-                            sequence: u64,
-                            messages: serde_json::Value,
-                            blocked_tools: serde_json::Value,
-                            recent_tools: serde_json::Value,
-                            approval_overrides: serde_json::Value,
-                            interruption: serde_json::Value,
-                            compaction_state: serde_json::Value| {
-        let conversation_cursor = astra_turn_types::SessionCursorV1 {
-            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
-            owner_id: owner_id.to_string(),
-            session_id: session_id.to_string(),
-            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
-            completed_turn: 1,
-            journal_event_seq: sequence,
-            conversation_seq: sequence,
-            canonical_root_hash: astra_turn_types::canonical_conversation_root(
-                messages
-                    .as_array()
-                    .expect("checkpoint messages must be an array"),
-            ),
-            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
-            compaction_generation: 0,
-            config_version_id: None,
-        };
-        serde_json::json!({
-            "Heavy": {
-                "light": {},
-                "conversation_cursor": conversation_cursor,
-                "messages": messages,
-                "blocked_tools": blocked_tools,
-                "recent_tools": recent_tools,
-                "approval_overrides": approval_overrides,
-                "interruption": interruption,
-                "compaction_state": compaction_state
-            }
-        })
-        .to_string()
-    };
-
-    cleanup_restore_fixture_for_owner(
-        &pool,
-        &user_id,
-        &[session_id.clone(), heavy_only_session.clone()],
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'checkpoint-it', 'active', 1)",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("insert checkpoint session");
-
-    let checkpoint_event_id = Uuid::new_v4().to_string();
-    let checkpoint_token_usage = serde_json::json!({
-        "input_tokens": 10,
-        "cached_input_tokens": 0,
-        "cache_creation_tokens": 0,
-        "output_tokens": 5,
-        "total_tokens": 15,
-    });
-    sqlx::query(
-        "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, \
-          token_output, token_total, turn_seq, payload_hash, ingestion_write_id, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'checkpoint turn', CAST(? AS JSON), 10, 5, 15, 1, \
-                 ?, ?, '2026-09-04 09:00:00.000000')",
-    )
-    .bind(&checkpoint_event_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(checkpoint_token_usage.to_string())
-    .bind(agent_event_fixture_payload_hash(serde_json::json!({
-        "event_id": &checkpoint_event_id,
-        "session_id": &session_id,
-        "user_id": &user_id,
-        "event_type": "user_query",
-        "content": "checkpoint turn",
-        "token_usage": &checkpoint_token_usage,
-        "token_input": 10,
-        "token_output": 5,
-        "token_total": 15,
-        "turn_seq": 1,
-        "created_at": "2026-09-04 09:00:00.000000",
-    })))
-    .bind(Uuid::new_v4().to_string())
-    .execute(&pool)
-    .await
-    .expect("insert checkpoint user_query");
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'checkpoint-heavy-only', 'active', 1)",
-    )
-    .bind(&heavy_only_session)
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("insert heavy-only session");
-
-    let heavy_event_id = Uuid::new_v4().to_string();
-    let heavy_token_usage = serde_json::json!({
-        "input_tokens": 11,
-        "cached_input_tokens": 0,
-        "cache_creation_tokens": 0,
-        "output_tokens": 4,
-        "total_tokens": 15,
-    });
-    sqlx::query(
-        "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, \
-          token_output, token_total, turn_seq, payload_hash, ingestion_write_id, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'heavy-only turn', CAST(? AS JSON), 11, 4, 15, 1, \
-                 ?, ?, '2026-09-04 09:10:00.000000')",
-    )
-    .bind(&heavy_event_id)
-    .bind(&heavy_only_session)
-    .bind(&user_id)
-    .bind(heavy_token_usage.to_string())
-    .bind(agent_event_fixture_payload_hash(serde_json::json!({
-        "event_id": &heavy_event_id,
-        "session_id": &heavy_only_session,
-        "user_id": &user_id,
-        "event_type": "user_query",
-        "content": "heavy-only turn",
-        "token_usage": &heavy_token_usage,
-        "token_input": 11,
-        "token_output": 4,
-        "token_total": 15,
-        "turn_seq": 1,
-        "created_at": "2026-09-04 09:10:00.000000",
-    })))
-    .bind(Uuid::new_v4().to_string())
-    .execute(&pool)
-    .await
-    .expect("insert heavy-only user_query");
-
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 1,
-            turn: 1,
-            title: "session-ckpt".into(),
-            summary: "ordinary checkpoint".into(),
-            tools_used: vec!["bash".into(), "rg".into()],
-            total_tokens: 150,
-            had_stalls: false,
-            error_count: 0,
-        },
-        None,
-    )
-    .await;
-
-    let approval_overrides = serde_json::json!({
-        "rules": [[{
-            "tool_name": "bash",
-            "command_prefix": "git commit",
-            "path_pattern": null,
-            "side_effect": "execute"
-        }, true]]
-    });
-    seed_restore_checkpoint_fixture(&pool, &user_id, &session_id, &astra_services::session_checkpoint::Checkpoint {number: 1_000_000_001, turn: 3, title: "step-heavy-v2".into(), summary: "heavy".into(), tools_used: vec!["step-two".into()], total_tokens: 0, had_stalls: false, error_count: 0}, Some(&heavy_state_json(
-            &user_id,
-            &session_id,
-            3,
-            serde_json::json!([
-                {"role":"user","content":"first"},
-                {"role":"assistant","content":"reply"},
-                {"role":"user","content":"follow-up"},
-                {"role":"assistant","content":"done"}
-            ]),
-            serde_json::json!(["dangerous_tool","web_fetch"]),
-            serde_json::json!(["step-two"]),
-            approval_overrides.clone(),
-            serde_json::json!({"kind":"rate_limited","resumable":true}),
-            serde_json::json!({"attempt_count":2,"cumulative_tokens_freed":120,"last_was_insufficient":false}),
-        ))).await;
-    seed_restore_checkpoint_fixture(&pool, &user_id, &heavy_only_session, &astra_services::session_checkpoint::Checkpoint {number: 1_000_000_001, turn: 1, title: "heavy-only-v1".into(), summary: "heavy".into(), tools_used: vec!["heavy-only-tool".into()], total_tokens: 0, had_stalls: false, error_count: 0}, Some(&heavy_state_json(
-            &user_id,
-            &heavy_only_session,
-            1,
-            serde_json::json!([
-                {"role":"user","content":"heavy-only user"},
-                {"role":"assistant","content":"heavy-only answer"}
-            ]),
-            serde_json::json!(["grep"]),
-            serde_json::json!(["heavy-only-tool"]),
-            serde_json::json!(null),
-            serde_json::json!({"kind":"context_window","resumable":true}),
-            serde_json::json!({"attempt_count":1,"cumulative_tokens_freed":80,"last_was_insufficient":true}),
-        ))).await;
-
-    let rows = sqlx::query(
-        "SELECT number, title, summary, CAST(tools_json AS CHAR) AS tools_json, state_json \
-         FROM session_checkpoints WHERE user_id = ? AND session_id = ? ORDER BY number",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_all(&pool)
-    .await
-    .expect("load checkpoint rows");
-    assert_eq!(
-        rows.len(),
-        2,
-        "ordinary and step checkpoints should coexist"
-    );
-
-    let ordinary = &rows[0];
-    assert_eq!(
-        ordinary
-            .try_get::<i32, _>("number")
-            .expect("ordinary number"),
-        1
-    );
-    assert_eq!(
-        ordinary
-            .try_get::<String, _>("title")
-            .expect("ordinary title"),
-        "session-ckpt"
-    );
-    assert_eq!(
-        ordinary
-            .try_get::<String, _>("summary")
-            .expect("ordinary summary"),
-        "ordinary checkpoint"
-    );
-    assert_eq!(
-        ordinary
-            .try_get::<Option<String>, _>("state_json")
-            .expect("ordinary state"),
-        None
-    );
-    assert_eq!(
-        serde_json::from_str::<Vec<String>>(
-            ordinary
-                .try_get::<Option<String>, _>("tools_json")
-                .expect("ordinary tools")
-                .as_deref()
-                .expect("ordinary tools JSON"),
-        )
-        .expect("parse ordinary tools"),
-        vec!["bash".to_string(), "rg".to_string()],
-        "ordinary checkpoint tools must remain physically separate from the namespaced step row"
-    );
-
-    let step = &rows[1];
-    assert_eq!(
-        step.try_get::<i32, _>("number").expect("step number"),
-        1_000_000_001,
-        "step checkpoints should use the cloud namespace offset and avoid colliding with ordinary checkpoints"
-    );
-    assert_eq!(
-        step.try_get::<String, _>("title").expect("step title"),
-        "step-heavy-v2"
-    );
-    assert_eq!(
-        step.try_get::<String, _>("summary").expect("step summary"),
-        "heavy"
-    );
-    assert_eq!(
-        step.try_get::<Option<String>, _>("tools_json")
-            .expect("step tools")
-            .as_deref(),
-        Some(r#"["step-two"]"#)
-    );
-    let pulled_step = pull_step_checkpoint_from_cloud(&pool, &user_id, &session_id)
-        .await
-        .expect("pull heavy step checkpoint");
-    assert_eq!(
-        step.try_get::<Option<String>, _>("state_json")
-            .expect("step state")
-            .as_deref(),
-        pulled_step.as_deref()
-    );
-    assert!(
-        pulled_step
-            .as_deref()
-            .unwrap_or_default()
-            .contains(r#""follow-up""#),
-        "pulled heavy checkpoint should return the latest StepCheckpoint JSON"
-    );
-
-    let restore = HybridRestoreService::new(pool.clone());
-    let checkpoints = restore
-        .list_checkpoints(&user_id, &session_id)
-        .await
-        .expect("list checkpoints");
-    assert_eq!(
-        checkpoints.len(),
-        1,
-        "cloud checkpoint listing should exclude namespaced step checkpoint rows"
-    );
-    assert_eq!(checkpoints[0].number, 1);
-    assert_eq!(checkpoints[0].title, "session-ckpt");
-
-    let restored = restore
-        .restore_session(&user_id, &session_id)
-        .await
-        .expect("restore checkpoint session")
-        .expect("checkpoint session restored");
-    assert_eq!(restored.turn_count, 1);
-    assert_eq!(restored.checkpoint_count, 1);
-    assert_eq!(
-        restored.recent_tools,
-        vec!["step-two".to_string()],
-        "the exact-cursor heavy checkpoint projection must win prompt-facing state; \
-         ordinary checkpoint tools remain available only through checkpoint history"
-    );
-    assert_eq!(restored.resume_messages().len(), 4);
-    assert_eq!(restored.resume_messages()[0]["role"], "user");
-    assert_eq!(restored.resume_messages()[3]["content"], "done");
-    assert_eq!(
-        restored.blocked_tools,
-        vec!["dangerous_tool".to_string(), "web_fetch".to_string()]
-    );
-    assert_eq!(
-        restored.approval_overrides.as_ref(),
-        Some(&approval_overrides)
-    );
-    assert_eq!(
-        restored
-            .interruption
-            .as_ref()
-            .and_then(|json| json.get("kind"))
-            .and_then(serde_json::Value::as_str),
-        Some("rate_limited")
-    );
-    assert_eq!(
-        restored
-            .compaction_state
-            .as_ref()
-            .and_then(|json| json.get("attempt_count"))
-            .and_then(serde_json::Value::as_u64),
-        Some(2)
-    );
-
-    let restored_heavy_only = restore
-        .restore_session(&user_id, &heavy_only_session)
-        .await
-        .expect("restore heavy-only session")
-        .expect("heavy-only session restored");
-    assert_eq!(restored_heavy_only.checkpoint_count, 0);
-    assert_eq!(
-        restored_heavy_only.recent_tools,
-        vec!["heavy-only-tool".to_string()],
-        "cloud restore should fall back to heavy checkpoint recent_tools when no ordinary checkpoint exists"
-    );
-    assert_eq!(restored_heavy_only.blocked_tools, vec!["grep".to_string()]);
-    assert_eq!(restored_heavy_only.resume_messages().len(), 2);
-    assert_eq!(
-        restored_heavy_only
-            .interruption
-            .as_ref()
-            .and_then(|json| json.get("kind"))
-            .and_then(serde_json::Value::as_str),
-        Some("context_window")
-    );
-
-    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id, heavy_only_session]).await;
 }
 
 #[tokio::test]
@@ -6373,79 +5931,15 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
     )
     .await;
 
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &owner_user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 1,
-            turn: 1,
-            title: "owner-checkpoint".into(),
-            summary: "owner checkpoint must survive".into(),
-            tools_used: vec!["owner_tool".into()],
-            total_tokens: 10,
-            had_stalls: false,
-            error_count: 0,
-        },
-        None,
-    )
-    .await;
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     assert!(
         restore
-            .restore_session(&other_user_id, &session_id)
+            .load_cloud_summary(&other_user_id, &session_id)
             .await
             .expect("other owner restore should not error")
             .is_some(),
         "the other owner restores only its independently created session"
     );
-    assert!(
-        restore
-            .list_checkpoints(&other_user_id, &session_id)
-            .await
-            .expect("non-owner checkpoint list should not error")
-            .is_empty(),
-        "the other owner's new session has no checkpoints yet"
-    );
-    assert_eq!(
-        restore
-            .list_checkpoints(&owner_user_id, &session_id)
-            .await
-            .expect("owner checkpoint list")
-            .len(),
-        1
-    );
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &other_user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 1,
-            turn: 99,
-            title: "other-owner-checkpoint".into(),
-            summary: "must remain owner isolated".into(),
-            tools_used: vec!["other_tool".into()],
-            total_tokens: 999,
-            had_stalls: true,
-            error_count: 9,
-        },
-        None,
-    )
-    .await;
-    for (user_id, title, tokens) in [
-        (&owner_user_id, "owner-checkpoint", 10),
-        (&other_user_id, "other-owner-checkpoint", 999),
-    ] {
-        let checkpoints = restore
-            .list_checkpoints(user_id, &session_id)
-            .await
-            .expect("read owner-bound checkpoints");
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].number, 1);
-        assert_eq!(checkpoints[0].title, title);
-        assert_eq!(checkpoints[0].total_tokens, tokens);
-    }
-
     let snapshot_count =
         sqlx::query("SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id = ?")
             .bind(&session_id)
@@ -7625,27 +7119,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("insert event edge");
     }
 
-    for (user_id, seq, content) in [
-        (&owner_user_id, 1_i64, "owner"),
-        (&other_user_id, 2_i64, "foreign"),
-    ] {
-        let payload = format!(
-            "{{\"type\":\"snapshot\",\"seq\":{seq},\"turn\":1,\"messages\":[{{\"role\":\"user\",\"content\":\"{content}\"}}],\"session_state\":{{}}}}"
-        );
-        sqlx::query(
-            "INSERT INTO conversation_log \
-             (user_id, session_id, seq, turn, entry_type, payload) \
-             VALUES (?, ?, ?, 1, 0, ?)",
-        )
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(seq)
-        .bind(payload)
-        .execute(&pool)
-        .await
-        .expect("insert conversation log");
-    }
-
     for (user_id, run_id, evaluation_id, marker) in [
         (&owner_user_id, &owner_run_id, &owner_skill_eval_id, "owner"),
         (
@@ -7895,7 +7368,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     for (label, table) in [
         ("agent_sessions", "agent_sessions"),
         ("agent_events", "agent_events"),
-        ("conversation_log", "conversation_log"),
         ("session_artifacts", "session_artifacts"),
         ("ctx_snapshots", "ctx_snapshots"),
         ("ctx_decision_audits", "ctx_decision_audits"),
@@ -8077,16 +7549,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
     .await
     .expect("insert owner session");
     sqlx::query(
-        "INSERT INTO conversation_log \
-         (user_id, session_id, seq, turn, entry_type, payload) \
-         VALUES (?, ?, 1, 1, 0, '{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[],\"session_state\":{}}')",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner conversation log");
-    sqlx::query(
         "INSERT INTO ctx_snapshots \
          (context_capture_id, user_id, session_id, event_id, context_data) \
          VALUES (?, ?, ?, ?, CAST('{\"owner\":true}' AS JSON))",
@@ -8133,12 +7595,7 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
         "session service delete must remove owner checkpoint/artifact directory"
     );
 
-    for label in [
-        "agent_sessions",
-        "ctx_snapshots",
-        "ctx_decision_audits",
-        "conversation_log",
-    ] {
+    for label in ["agent_sessions", "ctx_snapshots", "ctx_decision_audits"] {
         let remaining = count_user_session_rows(&pool, label, &owner_user_id, &session_id).await;
         assert_eq!(remaining, 0, "{label} must be removed by hard delete");
     }

@@ -1427,6 +1427,44 @@ export type SessionInfo = {
   agentId?: string | null;
 };
 
+/** Canonical full hydration returned by POST /sessions/{id}/resume. */
+export type RuntimeSessionResumeResponse = {
+  session_id: string;
+  turn_count: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
+  total_cache_read_tokens?: number;
+  total_cache_creation_tokens?: number;
+  recent_tools: string[];
+  checkpoint_count: number;
+  last_status: string;
+  git_branch: string | null;
+  model: string | null;
+  permission_mode?: string | null;
+  title: string | null;
+  restored_from_cloud: boolean;
+  resume_bundle: {
+    schema_version: number;
+    cursor: {
+      schema_version: number;
+      owner_id: string;
+      session_id: string;
+      branch_id: string;
+      completed_turn: number;
+      journal_event_seq: number;
+      conversation_seq: number;
+      canonical_root_hash: string;
+      projection_schema: number;
+      compaction_generation: number;
+      config_version_id?: string;
+    };
+    source: "canonical_journal";
+    conversation_messages: unknown[];
+    materialized_conversation_root_hash?: string;
+    projections: Record<string, unknown>;
+  };
+};
+
 // ─── Runtime wire response DTOs ───────────────────────────────────
 
 /** A cancellation request is complete only when executionSettled is true. */

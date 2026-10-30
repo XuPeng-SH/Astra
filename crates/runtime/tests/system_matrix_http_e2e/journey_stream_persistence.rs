@@ -3334,6 +3334,12 @@ native_child_script(child_model.clone(),"Run three reviews and preserve every fa
 /// B2: Core events (user_query, llm_response) and context_trace_signal are persisted
 /// to agent_events after stream_chat completes.
 pub async fn run_stream_context_trace_persistence() {
+    for continuation in [false, true] {
+        stream_context_trace_and_restore(continuation).await;
+    }
+}
+
+async fn stream_context_trace_and_restore(continuation_race: bool) {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
@@ -3351,14 +3357,39 @@ pub async fn run_stream_context_trace_persistence() {
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
-    let (missing_status, _) = post_json(
-        app,
-        &format!("/sessions/{session_id}/resume?continuation_only=true"),
-        Some(auth.as_str()),
-        json!({}),
-    )
-    .await;
-    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    sqlx::query("UPDATE agent_sessions SET status = 'paused' WHERE user_id=? AND session_id=?")
+        .bind(user_id)
+        .bind(&session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    for suffix in ["", "?continuation_only=true"] {
+        let (status, _) = post_json(
+            app,
+            &format!("/sessions/{session_id}/resume{suffix}"),
+            Some(auth.as_str()),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM agent_sessions WHERE user_id=? AND session_id=?")
+            .bind(user_id)
+            .bind(&session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "paused",
+        "failed restore must not activate an empty Session"
+    );
+    sqlx::query("UPDATE agent_sessions SET status = 'active' WHERE user_id=? AND session_id=?")
+        .bind(user_id)
+        .bind(&session_id)
+        .execute(pool)
+        .await
+        .unwrap();
 
     let fixture_model = format!("mock-{}", ctx.suffix);
     ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_context_trace_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="context trace persistence test")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Context trace reply.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 100, "completion_tokens": 50,
@@ -3406,19 +3437,6 @@ pub async fn run_stream_context_trace_persistence() {
         message["role"] == "assistant"
             && message["content"].as_str() == Some("Context trace reply.")
     }));
-    // An unrelated legacy checkpoint must not be decoded during a canonical
-    // per-turn refresh. The full restore still detects the corruption.
-    sqlx::query(
-        "INSERT INTO session_checkpoints \
-         (checkpoint_id, user_id, session_id, number, turn, summary, state_json) \
-         VALUES (?, ?, ?, 2147483647, 0, 'heavy', 'not-json')",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(user_id)
-    .bind(&session_id)
-    .execute(pool)
-    .await
-    .expect("seed corrupt legacy checkpoint");
     let audits_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
         .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
     let (continuation_status, continuation) = post_json(
@@ -3470,12 +3488,11 @@ pub async fn run_stream_context_trace_persistence() {
         json!({}),
     )
     .await;
-    assert_eq!(full_status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(full_status, StatusCode::OK);
     for table in [
         "session_state_items",
         "session_state_item_events",
         "ctx_decision_audits",
-        "skill_selection_events",
     ] {
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
@@ -3487,6 +3504,75 @@ pub async fn run_stream_context_trace_persistence() {
         .expect("ordinary answer projection count");
         assert_eq!(count, 0, "ordinary answer must not create {table}");
     }
+    sqlx::query("UPDATE agent_sessions SET status='paused' WHERE user_id=? AND session_id=?")
+        .bind(user_id)
+        .bind(&session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let original_head: String = sqlx::query_scalar("SELECT head_json FROM session_context_heads WHERE isolation_domain='server' AND owner_user_id=? AND session_id=?")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    let mut foreign_head: Value = serde_json::from_str(&original_head).unwrap();
+    foreign_head["key"]["owner_user_id"] = json!("foreign-owner");
+    for invalid in ["not-json".to_string(), foreign_head.to_string()] {
+        sqlx::query("UPDATE session_context_heads SET head_json=? WHERE isolation_domain='server' AND owner_user_id=? AND session_id=?")
+            .bind(invalid).bind(user_id).bind(&session_id).execute(pool).await.unwrap();
+        for suffix in ["", "?continuation_only=true"] {
+            let (status, _) = post_json(
+                app,
+                &format!("/sessions/{session_id}/resume{suffix}"),
+                Some(auth.as_str()),
+                json!({}),
+            )
+            .await;
+            assert!(
+                !status.is_success(),
+                "invalid canonical state must fail closed"
+            );
+        }
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM agent_sessions WHERE user_id=? AND session_id=?",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            status, "paused",
+            "invalid canonical state must not activate the Session"
+        );
+    }
+    sqlx::query("UPDATE session_context_heads SET head_json=? WHERE isolation_domain='server' AND owner_user_id=? AND session_id=?")
+        .bind(original_head).bind(user_id).bind(&session_id).execute(pool).await.unwrap();
+    // Both requests use the production owners. Regardless of which wins
+    // admission, deletion must finish and a resume must never recreate state.
+    let suffix = if continuation_race {
+        "?continuation_only=true"
+    } else {
+        ""
+    };
+    let resume_path = format!("/sessions/{session_id}/resume{suffix}");
+    let delete_path = format!("/sessions/{session_id}");
+    let ((resume_status, resume_body), (delete_status, deleted)) = tokio::join!(
+        post_json(app, &resume_path, Some(auth.as_str()), json!({})),
+        delete_json(app, &delete_path, Some(auth.as_str())),
+    );
+    assert_eq!(delete_status, StatusCode::NO_CONTENT, "{deleted}");
+    assert!(
+        matches!(resume_status, StatusCode::OK | StatusCode::NOT_FOUND),
+        "{resume_status}: {resume_body}"
+    );
+    let (status, _) = post_json(app, &resume_path, Some(auth.as_str()), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE user_id=? AND session_id=?")
+            .bind(user_id)
+            .bind(&session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0, "resume cannot recreate a deleted Session");
     // ── Cleanup ──
     cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
     ctx.close().await;

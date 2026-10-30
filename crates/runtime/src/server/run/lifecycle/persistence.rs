@@ -33,10 +33,7 @@ use astra_services::{
     WorkspaceCleanupDebtEntry, WorkspaceRecordEntry as StoredWorkspaceRecordEntry,
     WorkspaceRecordStoreError, WorkspaceStateStore,
 };
-use astra_turn_core::contracts::{
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverOutcome, TurnObserverRequest,
-    TurnObserverWorker, TurnSkillSelectionRecord,
-};
+use astra_turn_core::contracts::{TurnObserverOutcome, TurnObserverRequest, TurnObserverWorker};
 use astra_turn_core::observer::filter_memory_operation_turns;
 use astra_turn_core::trace_event::TraceContext;
 use astra_turn_types::{SessionCursorV1, transcript_content_hash, transcript_payload_identity};
@@ -146,7 +143,6 @@ pub(crate) struct PostLoopPersistContext {
     pub(crate) terminal_authority: Option<RunOwnerLeaseTerminalAuthority>,
     pub(crate) owner_pod_id: Option<String>,
     pub(crate) user_message: String,
-    pub(crate) hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     pub(crate) observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     pub(crate) metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 }
@@ -186,7 +182,7 @@ impl PostLoopPersistContext {
     ) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Err(error) = canonical_result {
-            // Hook rows, memory extraction, session-end hooks, and promotion
+            // Memory extraction, session-end hooks, and promotion
             // events are derived from the canonical turn. Publishing any of
             // them after the canonical transaction
             // failed creates a second, contradictory source of truth. Retain
@@ -200,19 +196,6 @@ impl PostLoopPersistContext {
         // The remaining consumers all read the immutable completed loop state
         // and write independent sinks. The writes are awaited together;
         // their completion is not the streaming terminal-delivery boundary.
-        let hook_persist = async {
-            let Some(writer) = self.hook_db_writer.as_ref() else {
-                return Ok(());
-            };
-            persist_server_loop_hook_events(
-                writer.as_ref(),
-                &self.user_id,
-                &self.session_id,
-                &self.user_message,
-                state,
-            )
-            .await
-        };
         let observer_dispatch = async {
             let Some(worker) = self.observer_worker.clone() else {
                 return Ok(());
@@ -238,15 +221,8 @@ impl PostLoopPersistContext {
             &self.run_id,
             &state.telemetry.promotion_events,
         );
-        let (hook_result, observer_result, (), promotion_result) = tokio::join!(
-            hook_persist,
-            observer_dispatch,
-            session_end,
-            promotion_persist,
-        );
-        if let Err(error) = hook_result {
-            errors.push(format!("hook events persist failed: {error}"));
-        }
+        let (observer_result, (), promotion_result) =
+            tokio::join!(observer_dispatch, session_end, promotion_persist,);
         if let Err(error) = observer_result {
             errors.push(format!("observer fire failed: {error}"));
         }
@@ -2263,44 +2239,6 @@ async fn append_session_transcript_items_in_tx(
     Ok(())
 }
 
-/// Persist the existing skill-selection telemetry after the server loop.
-async fn persist_server_loop_hook_events(
-    hook_db_writer: &dyn TurnHookDbWriter,
-    user_id: &str,
-    session_id: &str,
-    user_message: &str,
-    state: &AgenticLoopState,
-) -> Result<(), String> {
-    // Skill selection is an explicit judgment, not an inference from ordinary
-    // tool execution. Tool lifecycle and result facts are already persisted by
-    // the canonical trace path; duplicating tool names as skill selections
-    // adds a write and corrupts skill metrics.
-    let selected_skills = state.telemetry.all_selected_skills.clone();
-    let Some(skill_name) = selected_skills.first().cloned() else {
-        return Ok(());
-    };
-    let plan = TurnHookDbPersistPlan {
-        skill_selection: Some(TurnSkillSelectionRecord {
-            event_id: Uuid::now_v7().to_string(),
-            session_id: session_id.to_string(),
-            user_id: user_id.to_string(),
-            agent_id: None,
-            user_query: truncate_for_audit(user_message, 2000),
-            selected_skills,
-            skill_name,
-            skill_version: None,
-            selection_method: "llm_skill_choice".to_string(),
-            execution_success: Some(1),
-            execution_time_ms: None,
-        }),
-    };
-
-    hook_db_writer
-        .persist(plan)
-        .await
-        .map_err(|e| format!("hook events persist failed: {}", e))
-}
-
 /// Fire the Memoria observer after the server-driven loop completes.
 /// This sends the conversation messages to the Memoria `/v1/observe` endpoint
 /// for cross-session knowledge extraction.
@@ -2414,16 +2352,6 @@ async fn run_server_loop_observer_request(
         }
     };
     record_turn_observer_run_metrics(metrics_registry, mode, outcome);
-}
-
-/// Truncate text for audit records, preserving UTF-8 boundaries.
-fn truncate_for_audit(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
-        text.to_string()
-    } else {
-        let truncated: String = text.chars().take(max_chars).collect();
-        format!("{truncated}…")
-    }
 }
 
 pub(crate) fn build_run_turn_complete_event_with_interruption(
@@ -2676,19 +2604,6 @@ mod tests {
         assert_eq!(roots, 0, "input must not recreate a deleted root");
     }
 
-    #[derive(Default)]
-    struct CaptureHookDbWriter {
-        plans: std::sync::Mutex<Vec<TurnHookDbPersistPlan>>,
-    }
-
-    #[async_trait::async_trait]
-    impl TurnHookDbWriter for CaptureHookDbWriter {
-        async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
-            self.plans.lock().expect("capture lock").push(plan);
-            Ok(())
-        }
-    }
-
     fn test_post_loop_persist_context(session_id: &str) -> PostLoopPersistContext {
         PostLoopPersistContext {
             matrixone: MatrixOneSettings::default(),
@@ -2702,7 +2617,6 @@ mod tests {
             owner_pod_id: None,
 
             user_message: "work".to_string(),
-            hook_db_writer: None,
             observer_worker: None,
             metrics_registry: None,
         }
@@ -2733,342 +2647,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn server_loop_empty_hook_skips_writer_and_selected_skill_is_retained() {
-        let database_writer =
-            crate::turn::services::DatabaseTurnHookDbWriter::new(MatrixOneSettings::default());
-        database_writer
-            .persist(TurnHookDbPersistPlan {
-                skill_selection: None,
-            })
-            .await
-            .unwrap();
-        assert!(
-            database_writer
-                .persist(TurnHookDbPersistPlan {
-                    skill_selection: Some(retained_skill_record("user-1", "session-1", "review")),
-                })
-                .await
-                .is_err()
-        );
-        let writer = CaptureHookDbWriter::default();
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.final_text = "Ordinary answer".into();
-        state.telemetry.all_tools_used.insert("read_file".into());
-        persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
-            .await
-            .expect("ordinary tools do not need a hook write");
-        assert!(
-            writer.plans.lock().expect("capture lock").is_empty(),
-            "ordinary tools must not be persisted as skill selection"
-        );
-
-        state.telemetry.all_selected_skills.push("review".into());
-        persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
-            .await
-            .expect("selected skill persists");
-        let plans = writer.plans.lock().expect("capture lock");
-        assert_eq!(plans.len(), 1);
-        let skill = plans[0].skill_selection.as_ref().expect("selected skill");
-        assert_eq!(skill.skill_name, "review");
-        assert_eq!(skill.selected_skills, vec!["review".to_string()]);
-        assert_eq!(skill.selection_method, "llm_skill_choice");
-        assert_eq!(skill.execution_success, Some(1));
-    }
-
-    fn retained_skill_record(user: &str, session: &str, skill: &str) -> TurnSkillSelectionRecord {
-        TurnSkillSelectionRecord {
-            event_id: Uuid::new_v4().to_string(),
-            user_id: user.into(),
-            session_id: session.into(),
-            agent_id: None,
-            user_query: "retained write".into(),
-            selected_skills: vec![skill.into()],
-            skill_name: skill.into(),
-            skill_version: Some("supplied".into()),
-            selection_method: "llm_skill_choice".into(),
-            execution_success: Some(1),
-            execution_time_ms: None,
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn ordinary_post_loop_needs_no_database_but_selected_skills_still_persist() {
-        let pool = setup_pool().await;
-        let user = format!("post-loop-user-{}", Uuid::new_v4());
-        let session = format!("post-loop-session-{}", Uuid::new_v4());
-        crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
-        let mut persist = test_post_loop_persist_context(&session);
-        persist.user_id = user.clone();
-        persist.shared_pool = Some(pool.clone());
-        persist.hook_db_writer = Some(Arc::new(
-            crate::turn::services::DatabaseTurnHookDbWriter::new(pool.settings().clone())
-                .with_pool(pool.clone()),
-        ));
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.final_text = "Ordinary answer".into();
-        state.telemetry.all_selected_skills.push("review".into());
-        persist.run_after_core(&state, true, Ok(())).await.unwrap();
-        let selected: Vec<String> = sqlx::query_scalar(
-            "SELECT skill_name FROM skill_selection_events WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user)
-        .bind(&session)
-        .fetch_all(pool.get())
-        .await
-        .unwrap();
-        assert_eq!(selected, ["review"]);
-        let skill = format!("retained-{}", Uuid::new_v4());
-        let skill_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO skills_registry (skill_id, skill_name, version, description, skill_definition, is_active, status, source, category, created_by) VALUES (?, ?, '2.0', 'retained test', '{}', 1, 'active', 'user', 'general', ?)")
-            .bind(&skill_id).bind(&skill).bind(&user).execute(pool.get()).await.unwrap();
-        let mut settings = pool.settings().clone();
-        settings.db_pool_max_connections = 1;
-        settings.db_pool_min_connections = 1;
-        let single = astra_core::SharedPool::new(&settings).await.unwrap();
-        let writer = crate::turn::services::DatabaseTurnHookDbWriter::new(settings.clone())
-            .with_pool(single.clone());
-        let other_user = Uuid::new_v4().to_string();
-        let other_session = Uuid::new_v4().to_string();
-        for (owner, sid) in [(&other_user, &session), (&user, &other_session)] {
-            crate::server::run::insert_active_run_session_fixture(&pool, owner, sid).await;
-        }
-        let original = retained_skill_record(&user, &session, &skill);
-        for (selected, expected) in [
-            (vec![skill.clone()], "2.0"),
-            (vec![format!("missing-{skill}"), skill.clone()], "supplied"),
-            (vec![], "supplied"),
-        ] {
-            let record = TurnSkillSelectionRecord {
-                event_id: Uuid::new_v4().to_string(),
-                selected_skills: selected,
-                ..original.clone()
-            };
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                writer.persist(TurnHookDbPersistPlan {
-                    skill_selection: Some(record.clone()),
-                }),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            let version: String = sqlx::query_scalar(
-                "SELECT skill_version FROM skill_selection_events WHERE event_id = ?",
-            )
-            .bind(&record.event_id)
-            .fetch_one(pool.get())
-            .await
-            .unwrap();
-            assert_eq!(version, expected);
-            for (owner, sid) in [
-                (&user, &session),
-                (&other_user, &session),
-                (&user, &other_session),
-            ] {
-                let replay = TurnSkillSelectionRecord {
-                    user_id: owner.clone(),
-                    session_id: sid.clone(),
-                    skill_version: Some("overwrite".into()),
-                    selected_skills: vec![],
-                    ..record.clone()
-                };
-                assert!(
-                    writer
-                        .persist(TurnHookDbPersistPlan {
-                            skill_selection: Some(replay)
-                        })
-                        .await
-                        .is_err()
-                );
-                assert_eq!(assert_session_event_count(pool.get(), owner, sid).await, 0);
-            }
-            let stored: (String, String, String) = sqlx::query_as("SELECT user_id, session_id, skill_version FROM skill_selection_events WHERE event_id = ?")
-                .bind(&record.event_id).fetch_one(pool.get()).await.unwrap();
-            assert_eq!(
-                stored,
-                (user.clone(), session.clone(), expected.to_string())
-            );
-        }
-        // The real receipt read shares the only checkout with admission/INSERT.
-        use astra_services::{ContextService, DecisionService, EventService};
-        let event = DatabaseEventService::new(settings.clone())
-            .with_pool(pool.clone())
-            .create_event(
-                user.clone(),
-                EventCreateRequestData {
-                    ingestion_source: astra_services::EventIngestionSource::Client,
-                    event_id: None,
-                    session_id: session.clone(),
-                    event_type: "retained_test".into(),
-                    content: "{}".into(),
-                    agent_id: None,
-                    agent_version: None,
-                    parent_event_id: None,
-                    parent_event_ids: None,
-                    causal_chain_id: None,
-                    metadata: None,
-                },
-            )
-            .await
-            .unwrap();
-        let snapshot = astra_services::DatabaseContextService::new(settings.clone())
-            .with_pool(pool.clone())
-            .create_snapshot(
-                user.clone(),
-                astra_services::SnapshotCreateRequestData {
-                    session_id: session.clone(),
-                    event_id: event.record.event_id.clone(),
-                    context_data: json!({"retained": true}),
-                },
-            )
-            .await
-            .unwrap();
-        let decision_service = astra_services::DatabaseDecisionService::new(settings.clone())
-            .with_pool(single.clone());
-        let request = astra_services::DecisionCreateRequestData {
-            session_id: session.clone(),
-            event_id: event.record.event_id.clone(),
-            context_capture_id: snapshot.context_capture_id,
-            decision_type: "retained_test".into(),
-            decision_output: json!({"ok": true}),
-            model_params: None,
-        };
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            decision_service.record_decision(user.clone(), request.clone()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            assert_session_event_count(pool.get(), &user, &session).await,
-            1
-        );
-        for (owner, sid) in [(&other_user, &session), (&user, &other_session)] {
-            crate::server::run::cleanup_run_session_fixture(&pool, owner, sid).await;
-        }
-        let missing = TurnSkillSelectionRecord {
-            session_id: Uuid::new_v4().to_string(),
-            ..original.clone()
-        };
-        assert!(
-            writer
-                .persist(TurnHookDbPersistPlan {
-                    skill_selection: Some(missing)
-                })
-                .await
-                .is_err()
-        );
-        sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
-            .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
-        assert!(
-            writer
-                .persist(TurnHookDbPersistPlan {
-                    skill_selection: Some(original.clone())
-                })
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            decision_service
-                .record_decision(user.clone(), request.clone())
-                .await
-                .unwrap_err()
-                .0,
-            axum::http::StatusCode::NOT_FOUND
-        );
-        use astra_services::SessionService;
-        astra_services::DatabaseSessionService::new(settings.clone())
-            .with_pool(pool.clone())
-            .delete_session(session.clone(), user.clone())
-            .await
-            .unwrap();
-        assert!(
-            writer
-                .persist(TurnHookDbPersistPlan {
-                    skill_selection: Some(original.clone())
-                })
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            decision_service
-                .record_decision(user.clone(), request.clone())
-                .await
-                .unwrap_err()
-                .0,
-            axum::http::StatusCode::NOT_FOUND
-        );
-        for table in [
-            "agent_sessions",
-            "skill_selection_events",
-            "ctx_decision_audits",
-        ] {
-            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-            )))
-            .bind(&user)
-            .bind(&session)
-            .fetch_one(pool.get())
-            .await
-            .unwrap();
-            assert_eq!(count, 0, "{table}");
-        }
-        sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
-            .bind(&skill_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
-        single.close().await;
-        assert_eq!(
-            decision_service
-                .record_decision(user.clone(), request)
-                .await
-                .unwrap_err()
-                .0,
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable storage is not a missing session"
-        );
-        writer
-            .persist(TurnHookDbPersistPlan {
-                skill_selection: None,
-            })
-            .await
-            .unwrap();
-        assert!(
-            writer
-                .persist(TurnHookDbPersistPlan {
-                    skill_selection: Some(original)
-                })
-                .await
-                .is_err()
-        );
-        sqlx::query("DELETE FROM skill_selection_events WHERE user_id = ? AND session_id = ?")
-            .bind(&user)
-            .bind(&session)
-            .execute(pool.get())
-            .await
-            .unwrap();
-        crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
-        pool.close().await;
-
-        // Await the entire post-loop boundary, not just terminal SSE. A closed
-        // pool makes an accidental COUNT/transaction deterministic, not a race
-        // between our assertions and background persistence.
-        state.telemetry.all_selected_skills.clear();
-        persist
-            .run_after_core(&state, true, Ok(()))
-            .await
-            .expect("ordinary post-loop must not access the closed database");
-        state.telemetry.all_selected_skills.push("review".into());
-        assert!(
-            persist.run_after_core(&state, true, Ok(())).await.is_err(),
-            "positive control: a real skill write must still require the database"
-        );
-    }
-
     #[cfg(feature = "e2e-hooks")]
     async fn wait_for_retained_fence_query(pool: &astra_core::SharedPool, connection_id: u64) {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -3089,60 +2667,32 @@ mod tests {
         pool: astra_core::SharedPool,
         user: String,
         request: astra_services::DecisionCreateRequestData,
-        skill: TurnSkillSelectionRecord,
-        decision: bool,
         hook: Option<Arc<astra_services::decisions::RetainedWriteTestHook>>,
     ) -> Result<(), String> {
-        if decision {
-            use astra_services::DecisionService;
-            let mut writer = astra_services::DatabaseDecisionService::new(pool.settings().clone())
-                .with_pool(pool);
-            if let Some(hook) = hook {
-                writer = writer.with_retained_write_test_hook(hook);
-            }
-            writer
-                .record_decision(user, request)
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    assert!(matches!(
-                        error.0,
-                        axum::http::StatusCode::NOT_FOUND
-                            | axum::http::StatusCode::INTERNAL_SERVER_ERROR
-                    ));
-                    error.1.0.detail
-                })
-        } else {
-            let mut writer =
-                crate::turn::services::DatabaseTurnHookDbWriter::new(pool.settings().clone())
-                    .with_pool(pool);
-            if let Some(hook) = hook {
-                writer = writer.with_retained_write_test_hook(hook);
-            }
-            writer
-                .persist(TurnHookDbPersistPlan {
-                    skill_selection: Some(skill),
-                })
-                .await
+        use astra_services::DecisionService;
+        let mut writer =
+            astra_services::DatabaseDecisionService::new(pool.settings().clone()).with_pool(pool);
+        if let Some(hook) = hook {
+            writer = writer.with_retained_write_test_hook(hook);
         }
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1 and e2e-hooks"]
-    async fn retained_skill_writer_orders_delete_rollback_and_cancellation_on_live_matrixone() {
-        assert_retained_writer_lifecycle(false).await;
+        writer
+            .record_decision(user, request)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                assert!(matches!(
+                    error.0,
+                    axum::http::StatusCode::NOT_FOUND
+                        | axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                ));
+                error.1.0.detail
+            })
     }
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1 and e2e-hooks"]
     async fn retained_decision_writer_orders_delete_rollback_and_cancellation_on_live_matrixone() {
-        assert_retained_writer_lifecycle(true).await;
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    async fn assert_retained_writer_lifecycle(decision: bool) {
         use astra_services::{ContextService, DecisionCreateRequestData, SessionService};
         use tokio_util::task::AbortOnDropHandle;
         // The strict-online profile owns the total live-DB test budget.
@@ -3153,10 +2703,6 @@ mod tests {
         settings.db_pool_min_connections = 1;
         let worker = astra_core::SharedPool::new(&settings).await.unwrap();
         let deleter = astra_core::SharedPool::new(&settings).await.unwrap();
-        let skill_name = format!("retained-race-{}", Uuid::new_v4());
-        let skill_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO skills_registry (skill_id, skill_name, version, is_active) VALUES (?, ?, '3.0', 1)")
-            .bind(&skill_id).bind(&skill_name).execute(observer.get()).await.unwrap();
         for outcome in [
             "error",
             "cancel",
@@ -3207,7 +2753,6 @@ mod tests {
                 decision_output: json!({"ok": true}),
                 model_params: None,
             };
-            let skill = retained_skill_record(&user, &session, &skill_name);
             if matches!(outcome, "delete_first" | "cancel_admission") {
                 let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
                     .fetch_one(worker.get())
@@ -3221,8 +2766,6 @@ mod tests {
                     worker.clone(),
                     user.clone(),
                     request.clone(),
-                    skill.clone(),
-                    decision,
                     None,
                 )));
                 wait_for_retained_fence_query(&observer, connection_id).await;
@@ -3269,12 +2812,6 @@ mod tests {
                             observer.clone(),
                             independent_user.clone(),
                             independent_request,
-                            retained_skill_record(
-                                &independent_user,
-                                &independent_session,
-                                &skill_name,
-                            ),
-                            decision,
                             None,
                         ),
                     )
@@ -3335,8 +2872,6 @@ mod tests {
                     worker.clone(),
                     user.clone(),
                     request.clone(),
-                    skill.clone(),
-                    decision,
                     Some(hook.clone()),
                 )));
                 tokio::time::timeout(Duration::from_secs(10), hook.inserted.notified())
@@ -3377,14 +2912,7 @@ mod tests {
                             .unwrap()
                             .unwrap()
                             .unwrap_err();
-                        assert!(
-                            error.contains(if decision {
-                                "model_params"
-                            } else {
-                                "injected retained write failure"
-                            }),
-                            "{error}"
-                        );
+                        assert!(error.contains("model_params"), "{error}");
                     }
                 }
             }
@@ -3398,31 +2926,22 @@ mod tests {
                         .unwrap();
                     tx.rollback().await.unwrap();
                 }
-                for table in ["skill_selection_events", "ctx_decision_audits"] {
-                    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                        "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-                    )))
-                    .bind(&user)
-                    .bind(&session)
-                    .fetch_one(worker.get())
-                    .await
-                    .unwrap();
-                    assert_eq!(count, 0, "{decision}/{outcome}/{table}");
-                }
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM ctx_decision_audits WHERE user_id = ? AND session_id = ?",
+                )
+                .bind(&user)
+                .bind(&session)
+                .fetch_one(worker.get())
+                .await
+                .unwrap();
+                assert_eq!(count, 0, "{outcome}/ctx_decision_audits");
                 assert_eq!(
                     assert_session_event_count(worker.get(), &user, &session).await,
                     1
                 );
                 tokio::time::timeout(
                     Duration::from_secs(10),
-                    write_retained_fixture(
-                        worker.clone(),
-                        user.clone(),
-                        request.clone(),
-                        skill.clone(),
-                        decision,
-                        None,
-                    ),
+                    write_retained_fixture(worker.clone(), user.clone(), request.clone(), None),
                 )
                 .await
                 .unwrap()
@@ -3440,22 +2959,11 @@ mod tests {
                     .unwrap();
             }
             assert!(
-                write_retained_fixture(
-                    worker.clone(),
-                    user.clone(),
-                    request,
-                    skill,
-                    decision,
-                    None
-                )
-                .await
-                .is_err()
+                write_retained_fixture(worker.clone(), user.clone(), request, None)
+                    .await
+                    .is_err()
             );
-            for table in [
-                "agent_sessions",
-                "skill_selection_events",
-                "ctx_decision_audits",
-            ] {
+            for table in ["agent_sessions", "ctx_decision_audits"] {
                 let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
                 )))
@@ -3464,24 +2972,19 @@ mod tests {
                 .fetch_one(observer.get())
                 .await
                 .unwrap();
-                assert_eq!(count, 0, "{decision}/{outcome}/{table}");
+                assert_eq!(count, 0, "{outcome}/{table}");
             }
         }
-        sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
-            .bind(&skill_id)
-            .execute(observer.get())
-            .await
-            .unwrap();
         worker.close().await;
         deleter.close().await;
         observer.close().await;
     }
 
     #[tokio::test]
-    async fn canonical_failure_does_not_publish_derived_hook_state() {
-        let writer = Arc::new(CaptureHookDbWriter::default());
+    async fn canonical_failure_does_not_dispatch_memory_observer() {
+        let writer = Arc::new(CaptureObserverWorker::new(false));
         let mut persist = test_post_loop_persist_context("canonical-failure-session");
-        persist.hook_db_writer = Some(writer.clone());
+        persist.observer_worker = Some(writer.clone());
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.telemetry.all_selected_skills.push("review".into());
 
@@ -3496,8 +2999,8 @@ mod tests {
 
         assert!(error.contains("canonical transaction unavailable"));
         assert!(
-            writer.plans.lock().expect("capture lock").is_empty(),
-            "a failed canonical transaction must not publish hook projections"
+            writer.requests.lock().expect("capture lock").is_empty(),
+            "a failed canonical transaction must not dispatch derived work"
         );
     }
 
@@ -4346,7 +3849,6 @@ mod tests {
             owner_pod_id: None,
 
             user_message: "initial one".to_string(),
-            hook_db_writer: None,
             observer_worker: None,
             metrics_registry: None,
         };

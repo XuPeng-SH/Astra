@@ -110,6 +110,7 @@ export type {
   RunProjectionResponse,
   RunListResponse,
   SessionInfo,
+  RuntimeSessionResumeResponse,
   SessionCancellationResult,
   RuntimeSessionCancellationResponse,
   RuntimeChatResponse,

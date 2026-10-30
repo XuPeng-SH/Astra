@@ -89,7 +89,7 @@ async fn resume_local_restore_rejects_unowned_session() {
     );
     std::fs::write(ws_dir.join("workspace.yaml"), ws_content).unwrap();
 
-    let svc = astra_services::session_restore::HybridRestoreService::local_only();
+    let svc = astra_services::session_restore::SessionRestoreService::local_only();
     let result = svc.restore_local_session(&sid).await.unwrap();
     assert!(
         result.is_some(),
@@ -217,7 +217,7 @@ async fn resume_handles_workspace_edge_cases() {
             std::fs::write(ws_dir.join("workspace.yaml"), yaml_content).unwrap();
         }
 
-        let svc = astra_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::SessionRestoreService::local_only();
         let result = svc
             .restore_local_session(&sid)
             .await
@@ -271,7 +271,7 @@ total_tokens_out: 500
     )
     .unwrap();
 
-    let svc = astra_services::session_restore::HybridRestoreService::local_only();
+    let svc = astra_services::session_restore::SessionRestoreService::local_only();
     let ckpts = svc.list_local_checkpoints(&sid).await.unwrap();
     assert!(ckpts.is_empty(), "no checkpoints created yet");
 }

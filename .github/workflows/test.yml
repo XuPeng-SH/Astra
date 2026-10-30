@@ -538,7 +538,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [core-runtime, core-turn-core, core-services, integration]
+        lane: [core-runtime, core-services, integration]
     env:
       RUN_TESTS: >-
         ${{ needs.scope.result != 'success' ||

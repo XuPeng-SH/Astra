@@ -120,11 +120,13 @@ async fn continuation_activation_avoids_active_writes_and_respects_lifecycle() {
 
     sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
         .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
-    assert!(
+    assert_eq!(
         sessions
             .ensure_session_active(session.clone(), user.clone())
             .await
-            .is_err()
+            .unwrap_err()
+            .0,
+        axum::http::StatusCode::NOT_FOUND
     );
     assert_eq!(audit_count().await, before + 1);
 }
@@ -974,5 +976,103 @@ fn canonical_delta(turn: u32) -> astra_turn_types::CanonicalTurnDeltaV1 {
             json!({"role":"user","content":format!("canonical-turn-{turn}")}),
             json!({"role":"assistant","content":"durable reply"}),
         ]],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn activation_rechecks_pending_and_completed_delete_after_owner_read() {
+    for continuation in [false, true] {
+        for completed in [false, true] {
+            let (pool, mut settings, user, session) = setup().await;
+            settings.db_pool_max_connections = 1;
+            settings.db_pool_min_connections = 1;
+            let worker = SharedPool::new(&settings).await.unwrap();
+            let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(worker.get())
+                .await
+                .unwrap();
+            let service = DatabaseSessionService::new(settings).with_pool(worker.clone());
+            sqlx::query(
+                "UPDATE agent_sessions SET status='paused' WHERE user_id=? AND session_id=?",
+            )
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+            let mut holder = pool.get().begin().await.unwrap();
+            astra_services::storage::lock_agent_session_write_fence(&mut holder, &session, &user)
+                .await
+                .unwrap();
+            let queued_user = user.clone();
+            let queued_session = session.clone();
+            let activation = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                if continuation {
+                    service
+                        .ensure_session_active(queued_session, queued_user)
+                        .await
+                } else {
+                    service
+                        .update_session(
+                            queued_session,
+                            queued_user,
+                            SessionUpdateRequestData {
+                                status: Some("active".into()),
+                                title: None,
+                                metadata: None,
+                                metadata_patch: None,
+                            },
+                        )
+                        .await
+                        .map(|_| ())
+                }
+            }));
+            // Observe this connection at the fence, proving the owner read
+            // finished. No timing sleep is used to establish the race ordering.
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let queries: Vec<String> = sqlx::query_scalar("SELECT info FROM information_schema.processlist WHERE db=? AND conn_id=? AND info IS NOT NULL")
+                        .bind(&pool.settings().database).bind(connection_id).fetch_all(pool.get()).await.unwrap();
+                    if queries.iter().any(|query| query.contains("agent_session_lifecycle_fences")) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.expect("activation reached the owned Session fence");
+            let delete_sql = if completed {
+                "UPDATE agent_session_lifecycle_fences SET delete_requested_at=NOW(6), database_deleted_at=NOW(6) WHERE user_id=? AND session_id=?"
+            } else {
+                "UPDATE agent_session_lifecycle_fences SET delete_requested_at=NOW(6) WHERE user_id=? AND session_id=?"
+            };
+            sqlx::query(delete_sql)
+                .bind(&user)
+                .bind(&session)
+                .execute(&mut *holder)
+                .await
+                .unwrap();
+            holder.commit().await.unwrap();
+            let error = activation.await.unwrap().unwrap_err();
+            assert_eq!(
+                error.0,
+                axum::http::StatusCode::NOT_FOUND,
+                "continuation={continuation}, completed={completed}"
+            );
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM agent_sessions WHERE user_id=? AND session_id=?",
+            )
+            .bind(&user)
+            .bind(&session)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(status, "paused");
+            let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id=? AND resource_id=? AND action='session_update'")
+                .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                audits, 0,
+                "rejected activation cannot publish a success audit"
+            );
+            worker.close().await;
+            pool.close().await;
+        }
     }
 }
