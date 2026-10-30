@@ -40,8 +40,11 @@ class CiScopeTests(unittest.TestCase):
         self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/main"}), ["macos-15"])
         self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/main"}, main_enabled=True),
                          ["self-hosted", "macOS", "ARM64", "mac-arm64-main"])
-        for ref in ("refs/heads/develop", "refs/heads/feature", "refs/tags/v1.0", "main", None):
-            self.assertEqual(select_macos_runner("push", {"ref": ref}), ["macos-15"])
+        for enabled in (False, True):
+            for ref in ("refs/heads/develop", "refs/heads/feature", "refs/tags/v1.0", "main", None):
+                with self.subTest(enabled=enabled, ref=ref):
+                    self.assertEqual(select_macos_runner("push", {"ref": ref}, main_enabled=enabled),
+                                     ["macos-15"])
 
     def test_macos_missing_event_routes_to_hosted_without_omitting_scope_checks(self):
         with tempfile.TemporaryDirectory() as directory:

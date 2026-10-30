@@ -113,8 +113,10 @@ file and avoiding three separate Cargo test builds.
 On macOS, the default terminal-reader lane runs the CLI Bash regression using
 its existing test executable. PR authors in a static contributor ID allowlist
 can attempt one self-hosted ARM bundle containing all five Mac lanes.
-Main/develop pushes and release builds remain hosted; the PR mini shares a
-persistent account and toolchain, so it cannot provide an isolated main build.
+Main pushes default to hosted; operators may enable a separate isolated main
+runner with `ASTRA_MACOS_MAIN_ENABLED=1`. Develop pushes and release builds
+remain hosted. The PR mini shares a persistent account and toolchain and must
+never serve as the main runner.
 A 15-minute queue/discovery or setup failure falls back to hosted jobs in parallel;
 real test failures remain failures. Updated/closed PRs
 request cancellation instead of starting hosted Mac tests. Other authors and reruns use hosted macOS. Linux

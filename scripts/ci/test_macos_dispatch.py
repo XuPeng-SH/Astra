@@ -672,6 +672,36 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(api.clock(), dispatch.QUEUE_SECONDS)
         self.assertEqual(api.cancelled, [10])
 
+    def test_main_gate_owns_dispatch_and_completion_cleanup(self):
+        for phase in ("skipped", "active", "completed"):
+            with self.subTest(phase=phase):
+                api = ApiFixture()
+                api.run.update(event="push", head_branch="main", head_repository={"id": 7},
+                    display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
+                api.src = dispatch.Source(1, 1, HEAD)
+                api.enabled = phase == "completed"
+                if phase == "skipped":
+                    api.gate_end_at = 0
+                    api.gate_conclusion = "skipped"
+                if phase == "completed":
+                    api.run["status"] = "completed"
+                    api.finish_at = 100000
+                    other = api.worker()
+                    other.update(id=20, display_title=dispatch.Source(2, 1, HEAD).title)
+                    api.other_runs = [other]
+                # The current repository switch is absent in this clean environment.
+                # The active source gate, not a second switch read, owns dispatch;
+                # completion must still clean up workers admitted before disablement.
+                mode = "cleanup" if phase == "completed" else "schedule"
+                self.assertEqual(EntrypointTests().invoke(api, mode, sha=HEAD)[0], 0)
+                if phase == "active":
+                    self.assertEqual(api.posts[0][1]["inputs"], {
+                        "source_run_id": "1", "source_attempt": "1",
+                        "source_sha": HEAD, "source_pool": "main"})
+                else:
+                    self.assertEqual(api.posts, [])
+                self.assertEqual(api.cancelled, [10] if phase == "completed" else [])
+
     def test_completed_gate_cannot_dispatch_a_late_worker(self):
         api = ApiFixture()
         api.enabled = False
@@ -828,7 +858,13 @@ class EntrypointTests(unittest.TestCase):
                            dispatch.QUEUE_SECONDS + dispatch.EXECUTION_SECONDS)
         self.assertGreater(int(re.search(r"timeout-minutes: (\d+)", scheduler)[1]) * 60,
                            2 * dispatch.QUEUE_SECONDS + dispatch.EXECUTION_SECONDS)
-        self.assertIn("[\"pull_request\",\"push\"]", scheduler)
+        # Assert the actual workflow contract without emulating Actions' evaluator.
+        condition = re.search(r"    if: >-\n(.*?)\n    runs-on:", scheduler, re.S)[1]
+        self.assertEqual(" ".join(condition.split()),
+            "github.event.workflow_run.run_attempt == 1 && "
+            "(github.event.workflow_run.event == 'pull_request' || "
+            "(github.event.workflow_run.event == 'push' && "
+            "github.event.workflow_run.head_branch == 'main'))")
 
     def test_completion_cancels_orphan_even_after_pr_close_or_attempt_change(self):
         api = ApiFixture()
