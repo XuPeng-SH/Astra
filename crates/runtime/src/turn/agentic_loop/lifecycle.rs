@@ -1499,16 +1499,6 @@ pub(crate) fn record_has_typed_workspace_observation_receipt(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
     let args = extract_tool_args(record.authoritative_args_full()).unwrap_or(Value::Null);
-    if record.name == "bash"
-        && astra_turn_core::tool_argument_hints::command_hint_from_args(&args)
-            .is_some_and(astra_turn_core::evaluation::bash_command_has_go_validation)
-        && (record.workspace_mutation_partial == Some(true)
-            || !astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
-            || astra_turn_core::evaluation::normalize_validation_prefix("bash", &args.to_string())
-                .is_none())
-    {
-        return false;
-    }
     let receipt = record
         .workspace_mutation_receipt
         .as_ref()
@@ -1520,9 +1510,12 @@ pub(crate) fn record_has_typed_workspace_observation_receipt(
         // metadata instead of letting the observation half settle a newer
         // mutation epoch.
         && record.workspace_mutation_observed != Some(true)
+        && record.workspace_mutation_partial != Some(true)
         && ((astra_tools::workspace_observation::is_typed_workspace_observer(&record.name)
             && astra_tools::workspace_observation::is_typed_workspace_observation_receipt(receipt))
             || (record.runtime_args_full.is_some()
+                && record.result_class.as_deref().is_none_or(|class| class == "success")
+                && record.exit_semantics.as_deref().is_none_or(|semantics| semantics == "success")
                 && astra_tools::workspace_observation::is_explicit_workspace_verification_request(
                     &record.name,
                     &args,
@@ -2485,13 +2478,6 @@ pub(crate) fn tool_call_can_observe_bound_workspace(
     args: Option<&Value>,
 ) -> bool {
     if name == "bash" {
-        if args
-            .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
-            .is_some_and(astra_turn_core::evaluation::bash_command_has_go_validation)
-        {
-            return args
-                .is_some_and(|args| bash_invocation_has_scoped_workspace_observation(root, args));
-        }
         // This only permits the bounded recovery action to run.  Settlement
         // still requires the executor-produced v2 receipt in the completed
         // record; see `record_can_observe_bound_workspace` below.
@@ -2562,17 +2548,6 @@ pub(crate) fn record_can_observe_bound_workspace(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
     let args = extract_tool_args(record.authoritative_args_full());
-    if record.name == "bash"
-        && args
-            .as_ref()
-            .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
-            .is_some_and(astra_turn_core::evaluation::bash_command_has_go_validation)
-        && !args
-            .as_ref()
-            .is_some_and(|args| bash_invocation_has_scoped_workspace_observation(root, args))
-    {
-        return false;
-    }
     // The observer ran on the owner side of the bound workspace.  This typed
     // receipt is the only portable way to carry that fact across Edge→server;
     // do not stat or canonicalize the server's unrelated local path.
@@ -5215,26 +5190,28 @@ mod tests {
     }
 
     #[test]
-    fn verify_receipt_does_not_replace_go_semantics_or_scope() {
+    fn explicit_verify_receipt_owns_freshness_independent_of_shell_shape() {
         for (command, accepted) in [
             ("GOWORK=off go test ./...", true),
             ("custom-check-command", true),
-            ("printf -v GOFLAGS %s -n && GOWORK=off go test ./...", false),
+            ("python3 - <<'PY'\nassert 1 == 1\nPY", true),
+            ("env GOFLAGS=-n go test ./...", true),
+            ("printf -v GOFLAGS %s -n && GOWORK=off go test ./...", true),
             (
                 "GOFLAGS=$(cat /tmp/flags) && GOWORK=off go test ./...",
-                false,
+                true,
             ),
-            ("GOFLAGS=-n go test ./...", false),
-            ("GOFLAGS=-n go test -run '<<' ./...", false),
-            ("GOFLAGS=-n go test -run '`' ./...", false),
-            ("GOWORK=off go test -n ./... && cargo test", false),
+            ("GOFLAGS=-n go test ./...", true),
+            ("GOFLAGS=-n go test -run '<<' ./...", true),
+            ("GOFLAGS=-n go test -run '`' ./...", true),
+            ("GOWORK=off go test -n ./... && cargo test", true),
             (
                 "export GOFLAGS=-n && GOWORK=off go test \"${PKGS:-./...}\"",
-                false,
+                true,
             ),
-            ("GOFLAGS=\"$FLAGS\" go test \"$PKGS\"", false),
-            ("result=$(go test ./...)", false),
-            ("cd /tmp && go test ./...", false),
+            ("GOFLAGS=\"$FLAGS\" go test \"$PKGS\"", true),
+            ("result=$(go test ./...)", true),
+            ("cd /tmp && go test ./...", true),
         ]
         .into_iter()
         .map(|(command, accepted)| (command.to_string(), accepted))
@@ -5243,7 +5220,7 @@ mod tests {
                 "GOFLAGS=-n go test -run '{}' \"$PKGS\"",
                 "x".repeat(16 * 1024)
             ),
-            false,
+            true,
         ))) {
             let args = json!({"command":command,"mode":"verify"});
             let record = ToolCallRecord {

@@ -6933,6 +6933,24 @@ impl WorkValidationEvidence {
             ) else {
                 continue;
             };
+            // An opaque declared verifier owns freshness, not an inferred Go
+            // attempt. It cannot erase named validation debts already collected.
+            if super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
+                record,
+            ) && super::lifecycle::extract_tool_args(Some(args))
+                .as_ref()
+                .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
+                .is_some_and(|command| {
+                    astra_turn_core::evaluation::bash_command_go_validation_presence(command)
+                        .is_none()
+                })
+                && !evidence
+                    .unresolved_operations
+                    .iter()
+                    .any(|(candidate, _)| candidate == &operation)
+            {
+                continue;
+            }
             saw_validation = true;
             let positive = astra_turn_core::evaluation::tool_outcome_is_positive_success(record);
             let proof_operation =

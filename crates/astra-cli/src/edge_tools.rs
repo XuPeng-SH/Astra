@@ -10597,7 +10597,10 @@ pub(crate) mod tests {
             ..Default::default()
         });
         let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
-        assert!(out.contains("session_turn=5"), "got: {out}");
+        assert!(
+            out.contains("current_turn=5 llm_rounds_completed=5"),
+            "got: {out}"
+        );
         assert!(out.contains("input_total=12345"), "got: {out}");
         assert!(out.contains("resume pending"), "got: {out}");
     }

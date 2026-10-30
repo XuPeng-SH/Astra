@@ -119,34 +119,38 @@ not invalidate each other's evidence. Opaque commands, failed or malformed
 receipts, and a concurrent writer retain the freshness barrier.
 
 Canonical Go observations include `go test`, `go build`, and `go vet`, with
-literal scope-preserving environment assignments such as `GOWORK=off`.
-They require a positively successful executed result within the bound workspace;
+literal scope-preserving environment assignments such as `GOWORK=off`. They
+require a positively successful executed result within the bound workspace;
 dry-run, redirected-scope and opaque wrapper forms are not positive proof.
 Environment configuration and ordered validation stages remain part of operation
 identity: a successful vet does not clear a failed test or a failed build/vet
-chain. A literal external scratch setup followed by `&&` may precede a Go
-check, using the existing scratch-scope contract and a concrete bound root.
-Its entire command remains the operation identity, so a bare check cannot clear
-a failure that may have occurred during setup. Shell configuration changes,
-opaque preparation and concurrent setup do not grant this proof. Scratch paths
-must not overlap the workspace in either direction; ancestor setup is rejected
-even for a benign mkdir. Shell configuration writes invalidate later validation
-proof with or without scratch preparation. Plain output and static printf
-formats using literal text, `%s` and `%%` remain neutral; variable-writing or
-dynamic formats do not. Go checks use the complete invocation as identity,
-including any fallible prefix reader or output stage. A recognizable unsafe
-check retains only attempt identity. Sensitive or unscannable invocations reuse
-the existing opaque exact-argument identity, so failures remain debts without
-copying credentials into recovery state. Only an exact retry can resolve that
-debt; an unproven success still needs a separate eligible validation. An
-inconclusive scan cannot grant generic verify authority. An explicit verify receipt proves
-workspace freshness, but does not override a recognizable Go check's semantics
-or scope. These are invocation receipts under the existing trusted executor
-environment, not a guarantee about inherited tool configuration or test counts.
-Executors enable pipefail for pipelines; commands that may disable that
-setting cannot use the final pipeline stage's success as validation evidence.
-An unchanged Bash fingerprint prevents a false mutation barrier but is not, by
-itself, evidence that any workspace observation or requested validation occurred.
+chain. A literal external scratch setup followed by `&&` may precede a Go check,
+using the existing scratch-scope contract and a concrete bound root. Its entire
+command remains the operation identity, so a bare check cannot clear a failure
+that may have occurred during setup. Shell configuration changes, opaque
+preparation and concurrent setup do not grant this proof. Scratch paths must not
+overlap the workspace in either direction; ancestor setup is rejected even for a
+benign mkdir. Shell configuration writes invalidate later validation proof with
+or without scratch preparation. Plain output and static printf formats using
+literal text, `%s` and `%%` remain neutral; variable-writing or dynamic formats
+do not. Go checks use the complete invocation as identity, including any
+fallible prefix reader or output stage. A recognizable unsafe check retains only
+attempt identity. Sensitive or unscannable invocations reuse the existing opaque
+exact-argument identity, so failures remain debts without copying credentials
+into recovery state. Only an exact retry can resolve that debt; an unproven
+success still needs a separate eligible validation. An explicit verify receipt
+proves workspace freshness under the executor-owned lease, successful exit and
+unchanged fingerprint contract. This declared custom verifier path is
+independent of shell syntax and language; it does not certify which tests ran or
+clear named Work validation debts. Go semantic inference owns inferred
+observations and named Work validation independently; a freshness receipt never
+overrides an existing named debt. These are invocation receipts under the
+existing trusted executor environment, not a guarantee about inherited tool
+configuration or test counts. Executors enable pipefail for pipelines; commands
+that may disable that setting cannot use the final pipeline stage's success as
+validation evidence. An unchanged Bash fingerprint prevents a false mutation
+barrier but is not, by itself, evidence that any workspace observation or
+requested validation occurred.
 
 An incomplete execution remains a terminal failed Run with preserved partial
 output. Its owner-stamped terminal carries the existing sanitized interruption

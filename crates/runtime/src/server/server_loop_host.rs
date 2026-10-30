@@ -30177,8 +30177,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn edge_profile_full_deferred_contract_reaches_search_admission_and_offer() {
+    async fn selected_weather_deferred_contract_fixture() -> (
+        tempfile::TempDir,
+        ServerAgenticLoopHost,
+        Arc<crate::server::runtime_tool_executor::RuntimeToolExecutor>,
+        AgenticLoopState,
+        Vec<u8>,
+        Value,
+    ) {
         let tool_name = "mcp__weather__forecast";
         let (schema, mut edge_profile) = weather_deferred_contract_fixture();
         edge_profile.insert(
@@ -30265,6 +30271,14 @@ mod tests {
                 )
             }
         });
+        (dir, host, executor, state, wire_bytes, carrier)
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_reaches_search_admission_and_offer() {
+        let (_dir, mut host, executor, mut state, wire_bytes, carrier) =
+            selected_weather_deferred_contract_fixture().await;
+        let tool_name = "mcp__weather__forecast";
         let admitted = host.resolve_deferred_tool_admission(
             &state,
             crate::turn::agentic::tool_interception::admit_tool_calls(
@@ -30394,7 +30408,13 @@ mod tests {
         assert_eq!(selected_offer.provider_id, "edge-2");
         assert_eq!(selected_offer.route, ToolExecutionRouteKind::EdgeBound);
         assert!(selected_offer.schema_digest.is_some());
+    }
 
+    async fn check_weather_descriptor_invalidations(identity_variants: bool) {
+        let (_dir, mut host, _executor, mut state, _wire_bytes, carrier) =
+            selected_weather_deferred_contract_fixture().await;
+        host.executor_binding.executor_id = "edge-2".to_string();
+        host.visible_turn_tools(&mut state);
         let current_selection = state.deferred_tool_activations[0].clone();
         let mut missing_descriptor = current_selection.clone();
         missing_descriptor.descriptor = None;
@@ -30414,12 +30434,12 @@ mod tests {
             .unwrap()
             .descriptor_version =
             astra_turn_types::DescriptorVersion::new("changed-contract-version").unwrap();
-        for invalid in [
-            missing_descriptor,
-            changed_selection,
-            changed_native,
-            changed_version,
-        ] {
+        let variants = if identity_variants {
+            vec![changed_native, changed_version]
+        } else {
+            vec![missing_descriptor, changed_selection]
+        };
+        for invalid in variants {
             state.deferred_tool_activations = vec![invalid.clone()];
             host.visible_turn_tools(&mut state);
             assert_eq!(state.deferred_tool_activations, vec![invalid]);
@@ -30433,6 +30453,26 @@ mod tests {
             assert!(denied.admitted.is_empty());
             assert_eq!(denied.rejected.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_rejects_missing_or_changed_digest() {
+        check_weather_descriptor_invalidations(false).await;
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_rejects_changed_native_or_version() {
+        check_weather_descriptor_invalidations(true).await;
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_cannot_rebind_when_restricted_or_offline() {
+        let (_dir, mut host, _executor, mut state, _wire_bytes, carrier) =
+            selected_weather_deferred_contract_fixture().await;
+        let tool_name = "mcp__weather__forecast";
+        host.executor_binding.executor_id = "edge-2".to_string();
+        host.visible_turn_tools(&mut state);
+        let current_selection = state.deferred_tool_activations[0].clone();
         for restricted in [true, false] {
             state.deferred_tool_activations = vec![current_selection.clone()];
             host.executor_binding.executor_id = "edge-3".to_string();

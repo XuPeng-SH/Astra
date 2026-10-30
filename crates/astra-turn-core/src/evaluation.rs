@@ -3017,7 +3017,12 @@ fn go_validation_candidate(segment: &str) -> Option<ValidationCandidate> {
 /// also requires the strict validation path; it must not grant a generic
 /// verify receipt authority by pretending that no validator was present.
 pub fn bash_command_has_go_validation(command: &str) -> bool {
-    has_go_validation(command, 0).unwrap_or(true)
+    bash_command_go_validation_presence(command).unwrap_or(true)
+}
+
+/// Preserve unknown syntax separately from a positively recognized Go stage.
+pub fn bash_command_go_validation_presence(command: &str) -> Option<bool> {
+    has_go_validation(command, 0)
 }
 
 fn has_go_validation(command: &str, depth: usize) -> Option<bool> {

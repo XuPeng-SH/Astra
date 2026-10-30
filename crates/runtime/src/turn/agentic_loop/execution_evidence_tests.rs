@@ -7,18 +7,33 @@ use astra_config::user_profile::{MutationCompletionScope, TurnIntent};
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use serde_json::json;
 
-async fn run_written_go_verification(
+#[derive(Clone, Copy, Debug)]
+enum ExplicitReceipt {
+    Valid,
+    Missing,
+    Forged,
+    Failed,
+    Partial,
+    Changed,
+}
+
+async fn run_written_verification(
     command: &str,
     result_class: &str,
     exit_semantics: &str,
+    receipt: Option<ExplicitReceipt>,
 ) -> (AgenticLoopState, MockHost) {
     let write = make_edge_tool_with_args(
         "write_file",
         json!({"path": "/workspace/main.go", "content": "package main\n"}),
         "written",
     );
-    let mut checked =
-        make_edge_tool_with_args("bash", json!({"command": command}), "observed result");
+    let args = if receipt.is_some() {
+        json!({"command": command, "mode": "verify"})
+    } else {
+        json!({"command": command})
+    };
+    let mut checked = make_edge_tool_with_args("bash", args, "observed result");
     checked.tool_result_fields.as_mut().unwrap().extend([
         (
             "exit_code".into(),
@@ -27,6 +42,34 @@ async fn run_written_go_verification(
         ("result_class".into(), json!(result_class)),
         ("exit_semantics".into(), json!(exit_semantics)),
     ]);
+    if let Some(receipt) = receipt {
+        let fields = checked.tool_result_fields.as_mut().unwrap();
+        fields.insert(
+            astra_tools::workspace_observation::SCOPE_FIELD.into(),
+            json!(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE),
+        );
+        fields.insert(
+            astra_tools::workspace_observation::OBSERVED_FIELD.into(),
+            json!(matches!(receipt, ExplicitReceipt::Changed)),
+        );
+        if !matches!(receipt, ExplicitReceipt::Missing) {
+            fields.extend(
+                astra_tools::workspace_observation::explicit_workspace_verification_receipt(),
+            );
+        }
+        if matches!(receipt, ExplicitReceipt::Forged) {
+            fields
+                .get_mut(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .unwrap()["source"] = json!("model_claim");
+        }
+        if matches!(receipt, ExplicitReceipt::Partial) {
+            fields.insert("workspace_mutation_partial".into(), json!(true));
+        }
+        if matches!(receipt, ExplicitReceipt::Failed) {
+            checked.status = "failed".into();
+            checked.output = "Error: verification failed".into();
+        }
+    }
     let mut host = MockHost::new(vec![
         edge_tool_result(vec![write], 10, 2, None),
         edge_tool_result(vec![checked], 10, 2, None),
@@ -58,7 +101,7 @@ async fn go_verification_after_write_finishes_without_redundant_observation() {
         "GOWORK=off go build ./... && GOWORK=off go vet ./... && echo BUILD_VET_OK",
         "cd /workspace && GOWORK=off go build -mod=readonly ./pkg/one/ ./pkg/two/ && GOWORK=off go vet -mod=readonly ./pkg/one/ ./pkg/two/ && echo BUILD_VET_OK",
     ] {
-        let (state, host) = run_written_go_verification(command, "success", "success").await;
+        let (state, host) = run_written_verification(command, "success", "success", None).await;
         assert!(
             state.interruption.is_none(),
             "{command}: {:?}",
@@ -173,7 +216,7 @@ async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_
             "success",
         ),
     ] {
-        let (state, host) = run_written_go_verification(command, class, semantics).await;
+        let (state, host) = run_written_verification(command, class, semantics, None).await;
         assert_eq!(
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete),
@@ -184,6 +227,133 @@ async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_
             state.stall.tool_call_records.len(),
             2,
             "no invented recovery tool"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_verification_accepts_equivalent_python_forms_after_write() {
+    for (command, expected_presence) in [
+        ("python3 -c 'assert 1 == 1'", Some(false)),
+        ("python3 - <<'PY'\nassert 1 == 1\nPY", None),
+    ] {
+        assert_eq!(
+            astra_turn_core::evaluation::bash_command_go_validation_presence(command),
+            expected_presence
+        );
+        let (state, host) =
+            run_written_verification(command, "success", "success", Some(ExplicitReceipt::Valid))
+                .await;
+        assert!(
+            state.interruption.is_none(),
+            "{command}: {:?}",
+            state.interruption
+        );
+        assert_eq!(
+            host.turn_count(),
+            3,
+            "{command}: no redundant recovery rounds"
+        );
+        assert_eq!(state.stall.tool_call_records.len(), 2);
+        assert!(successful_post_mutation_observation(&state).unwrap());
+        assert_eq!(
+            WorkValidationEvidence::collect(&state, true).state,
+            WorkValidationState::None
+        );
+
+        let failed_args = json!({"command": "GOWORK=off go test ./..."}).to_string();
+        let mut with_go_debt = state;
+        with_go_debt.stall.tool_call_records.insert(
+            1,
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                disposition: Some(ToolCallDisposition::Executed),
+                runtime_args_full: Some(failed_args),
+                result_class: Some("test_failure".into()),
+                exit_semantics: Some("domain_negative".into()),
+                ..Default::default()
+            },
+        );
+        let evidence = WorkValidationEvidence::collect(&with_go_debt, true);
+        assert_eq!(evidence.state, WorkValidationState::Failed, "{command}");
+        assert_eq!(
+            evidence.failed_operation(),
+            Some("GOWORK=off go test ./...")
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_unknown_verifier_retry_clears_only_matching_work_failure() {
+    let command = "python3 - <<'PY'\nassert 1 == 1\nPY";
+    let (state, _) =
+        run_written_verification(command, "success", "success", Some(ExplicitReceipt::Valid)).await;
+    let retry = state.stall.tool_call_records.last().unwrap().clone();
+    let mut failure = retry.clone();
+    failure.ok = false;
+    failure.workspace_mutation_receipt = None;
+    failure.result_class = Some("test_failure".into());
+    failure.exit_semantics = Some("domain_negative".into());
+    let operation = astra_turn_core::evaluation::normalize_validation_attempt_prefix(
+        "bash",
+        failure.authoritative_args_full().unwrap(),
+    )
+    .unwrap();
+
+    let mut work = make_state();
+    work.hooks.workspace_root_hint = Some("/workspace".into());
+    work.stall.tool_call_records.push(failure);
+    let failed = WorkValidationEvidence::collect(&work, true);
+    assert_eq!(failed.state, WorkValidationState::Failed);
+    assert_eq!(failed.failed_operation(), Some(operation.as_str()));
+
+    work.stall.tool_call_records.push(retry);
+    let retried = WorkValidationEvidence::collect(&work, true);
+    assert_eq!(retried.state, WorkValidationState::Stale);
+    assert_eq!(retried.failed_operation(), None);
+
+    work.stall.tool_call_records.push(ToolCallRecord {
+        name: "bash".into(),
+        ok: true,
+        disposition: Some(ToolCallDisposition::Executed),
+        runtime_args_full: Some(json!({"command": "GOWORK=off go test ./..."}).to_string()),
+        result_class: Some("success".into()),
+        exit_semantics: Some("success".into()),
+        ..Default::default()
+    });
+    assert_eq!(
+        WorkValidationEvidence::collect(&work, true).state,
+        WorkValidationState::Passed
+    );
+}
+
+#[tokio::test]
+async fn explicit_verification_requires_a_valid_successful_unchanged_receipt() {
+    let command = "python3 - <<'PY'\nassert 1 == 1\nPY";
+    for receipt in [
+        ExplicitReceipt::Missing,
+        ExplicitReceipt::Forged,
+        ExplicitReceipt::Failed,
+        ExplicitReceipt::Partial,
+        ExplicitReceipt::Changed,
+    ] {
+        let (class, semantics) = if matches!(receipt, ExplicitReceipt::Failed) {
+            ("test_failure", "domain_negative")
+        } else {
+            ("success", "success")
+        };
+        let (state, _) = run_written_verification(command, class, semantics, Some(receipt)).await;
+        let record = state.stall.tool_call_records.last().unwrap();
+        assert!(
+            !super::super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
+                record
+            ),
+            "{receipt:?}: {record:?}"
+        );
+        assert!(
+            !successful_post_mutation_observation(&state).unwrap(),
+            "{receipt:?}"
         );
     }
 }

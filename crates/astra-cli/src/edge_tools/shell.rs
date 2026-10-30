@@ -5899,9 +5899,15 @@ mod tests {
         }
         let executor = ToolExecutor::new(temp.path().to_path_buf());
         let late_marker = temp.path().join("late-marker");
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        // Confirm the child entered the owned group, but let it attempt the
+        // observed effect only after the executor reports cleanup complete.
         let command = format!(
-            "(sleep 0.5; printf late > {}) & exit 0",
-            super::shell_escape(late_marker.to_str().unwrap())
+            "(printf started > {started}; while [ ! -e {release} ]; do sleep 0.02; done; printf late > {late}) & while [ ! -e {started} ]; do sleep 0.02; done; exit 0",
+            started = super::shell_escape(started.to_str().unwrap()),
+            release = super::shell_escape(release.to_str().unwrap()),
+            late = super::shell_escape(late_marker.to_str().unwrap()),
         );
         let outcome = executor
             .bash_outcome_with_cancel_async(
@@ -5948,6 +5954,12 @@ mod tests {
             "contract failures must carry the shared non-retryable evidence"
         );
 
+        assert!(started.exists(), "the descendant must have started");
+        assert!(
+            !late_marker.exists(),
+            "the release gate must hold the effect"
+        );
+        std::fs::write(&release, "release").unwrap();
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert!(
             !late_marker.exists(),
