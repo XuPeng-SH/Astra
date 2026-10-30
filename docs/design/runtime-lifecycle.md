@@ -137,14 +137,22 @@ do not. Go checks use the complete invocation as identity, including any
 fallible prefix reader or output stage. A recognizable unsafe check retains only
 attempt identity. Sensitive or unscannable invocations reuse the existing opaque
 exact-argument identity, so failures remain debts without copying credentials
-into recovery state. Only an exact retry can resolve that debt; an unproven
-success still needs a separate eligible validation. An explicit verify receipt
-proves workspace freshness under the executor-owned lease, successful exit and
-unchanged fingerprint contract. This declared custom verifier path is
-independent of shell syntax and language; it does not certify which tests ran or
-clear named Work validation debts. Go semantic inference owns inferred
-observations and named Work validation independently; a freshness receipt never
-overrides an existing named debt. These are invocation receipts under the
+into recovery state. Only an exact retry can resolve a named validation debt;
+an unproven success still needs a separate eligible validation. An explicit
+verify receipt proves workspace freshness under the executor-owned lease,
+successful exit and unchanged fingerprint contract. This declared custom verifier path is
+independent of shell syntax and language. An unsuccessful or unverified custom
+invocation retains exact-argument failure debt until the same invocation produces
+a valid full-scope verify receipt; a changed command or a raw unchanged
+fingerprint cannot clear it. That receipt does not certify which tests ran or
+clear named Work validation debts. A failed custom invocation without an
+authoritative unchanged fingerprint also makes earlier named proof stale. Go
+semantic inference owns inferred observations and named Work validation
+independently; a freshness receipt never overrides an existing named debt. A
+completed custom-verifier failure at a bounded observation may receive one
+retry: active Work binds the exact verifier, while ordinary completion may use
+a different typed observation. Unsettled, partial or changed execution cannot
+authorize this retry. These are invocation receipts under the
 existing trusted executor environment, not a guarantee about inherited tool
 configuration or test counts. Executors enable pipefail for pipelines; commands
 that may disable that setting cannot use the final pipeline stage's success as
@@ -592,8 +600,10 @@ must not clear a failure, and changing a command does not prove equivalence.
 An executed validation-shaped command can retain exact-operation failure debt
 without proving a successful validation when its arguments have ambiguous
 execution semantics. An ambiguous success clears only its own failure debt;
-Work delivery still requires a proof-eligible validation, with one bounded
-direct revalidation opportunity or a truthful failed/blocked settlement.
+named Work validation still requires a proof-eligible validation, with one
+bounded direct revalidation opportunity or a truthful failed/blocked settlement.
+A declared custom verifier is separate: its exact successful verify receipt
+resolves its own failure without inventing a named validation obligation.
 At each completion boundary, the current Work attempt's validation projection
 collects operation debts, freshness and recovery targets together. It is
 short-lived evidence rather than another persisted state or global cache.

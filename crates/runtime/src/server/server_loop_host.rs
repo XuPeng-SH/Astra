@@ -46784,6 +46784,90 @@ mod tests {
     }
 
     #[test]
+    fn declared_verifier_recovery_gates_work_delivery_at_the_server_boundary() {
+        let mut host = test_host_builder("u-declared-check", "s-declared-check")
+            .with_edge_tools(sample_edge_tools())
+            .with_execution_binding_snapshot(edge_runtime_snapshot())
+            .with_work_item_attempt_bound(true)
+            .build();
+        let delivered = json!({"id":"settle", "type":"function", "function":{
+            "name":"settle_work_item", "arguments":r#"{"outcome":"delivered","summary":"checked"}"#
+        }});
+        for command in [
+            "python3 -c 'assert 1 == 1'",
+            "python3 - <<'PY'\nassert 1 == 1\nPY",
+        ] {
+            let args = json!({"command":command, "mode":"verify"});
+            let record = |ok| {
+                let mut record = validation_record(command, ok);
+                record.args_full = Some(args.to_string());
+                record.runtime_args_full = record.args_full.clone();
+                record.workspace_mutation_scope =
+                    Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+                if ok {
+                    record.workspace_mutation_receipt = astra_tools::workspace_observation::explicit_workspace_verification_receipt()
+                        .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+                }
+                record
+            };
+            let mut state = create_test_state();
+            state.stall.tool_call_records.push(record(false));
+            assert!(
+                host.admit_terminal_tool_calls_with_completion(
+                    &mut state,
+                    std::slice::from_ref(&delivered),
+                    Some("tool_calls")
+                )
+                .is_empty(),
+                "{command}: failed check must block delivery"
+            );
+            assert!(
+                host.pending_tool_call_admission
+                    .take()
+                    .unwrap()
+                    .rejected
+                    .iter()
+                    .any(|call| call.result.contains("unresolved_work_validation"))
+            );
+            state.stall.tool_call_records.push(record(true));
+            assert_eq!(
+                host.admit_terminal_tool_calls_with_completion(
+                    &mut state,
+                    std::slice::from_ref(&delivered),
+                    Some("tool_calls")
+                ),
+                vec![delivered.clone()],
+                "{command}: exact successful retry must allow delivery"
+            );
+            host.pending_tool_call_admission.take();
+
+            let mut state = create_test_state();
+            let pending = json!({"id":"check", "type":"function", "function":{
+                "name":"bash", "arguments":args.to_string()
+            }});
+            let admitted = host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                &[pending, delivered.clone()],
+                Some("tool_calls"),
+            );
+            assert!(
+                !admitted
+                    .iter()
+                    .any(|call| call["function"]["name"] == "settle_work_item"),
+                "{command}: same-batch check has no outcome yet"
+            );
+            assert!(
+                host.pending_tool_call_admission
+                    .take()
+                    .unwrap()
+                    .rejected
+                    .iter()
+                    .any(|call| call.result.contains("work_validation_pending"))
+            );
+        }
+    }
+
+    #[test]
     fn exact_validation_recovery_or_a_new_work_attempt_allows_delivery() {
         let mut host =
             test_host_builder("u-work-validation-recovery", "s-work-validation-recovery")

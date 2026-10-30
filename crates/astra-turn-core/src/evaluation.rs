@@ -2650,13 +2650,55 @@ pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
     normalize_validation_prefix_kind(name, args, true)
 }
 
-/// A failed validator-shaped invocation retains debt even when its arguments
-/// cannot prove that a successful invocation actually validated the project.
+/// Whether an attempted verification is a recognized project validator or
+/// an opaque operation that can only be matched by its complete arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationAttempt {
+    Recognized(String),
+    Opaque(String),
+}
+
+impl ValidationAttempt {
+    pub fn into_identity(self) -> String {
+        match self {
+            Self::Recognized(identity) | Self::Opaque(identity) => identity,
+        }
+    }
+}
+
+/// Classify a verification attempt without treating unsupported shell syntax
+/// as evidence that a particular project validator ran. An opaque attempt
+/// retains the existing bounded exact-argument identity for recovery.
+pub fn classify_validation_attempt(name: &str, args: &str) -> Option<ValidationAttempt> {
+    if let Some(identity) = normalize_validation_prefix_kind(name, args, false) {
+        return Some(ValidationAttempt::Recognized(identity));
+    }
+    if name != "bash" {
+        return None;
+    }
+    let command = bash_command_text(args);
+    match bash_command_go_validation_presence(&command) {
+        Some(true) => Some(ValidationAttempt::Recognized(operation_args_identity(
+            name, args,
+        ))),
+        None => Some(ValidationAttempt::Opaque(operation_args_identity(
+            name, args,
+        ))),
+        Some(false) => serde_json::from_str::<Value>(args)
+            .ok()
+            .filter(|args| {
+                astra_tools::workspace_observation::is_explicit_workspace_verification_request(
+                    name, args,
+                )
+            })
+            .map(|_| ValidationAttempt::Opaque(operation_args_identity(name, args))),
+    }
+}
+
+/// A failed verification retains debt even when its arguments cannot prove
+/// that a successful invocation actually validated the project.
 pub fn normalize_validation_attempt_prefix(name: &str, args: &str) -> Option<String> {
-    normalize_validation_prefix_kind(name, args, false).or_else(|| {
-        (name == "bash" && bash_command_has_go_validation(&bash_command_text(args)))
-            .then(|| operation_args_identity(name, args))
-    })
+    classify_validation_attempt(name, args).map(ValidationAttempt::into_identity)
 }
 
 fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool) -> Option<String> {
@@ -8250,6 +8292,55 @@ mod tests {
         assert!(split_static_shell_words("cp $DEST source").is_none());
         assert!(split_static_shell_words("cp src 'unterminated").is_none());
         assert!(split_static_shell_words("cp src | tee out").is_none());
+    }
+
+    #[test]
+    fn declared_custom_verifiers_keep_exact_opaque_attempt_identity() {
+        for command in [
+            "python3 -c 'assert 1 == 1'",
+            "python3 - <<'PY'\nassert 1 == 1\nPY",
+        ] {
+            let args = json!({"command": command, "mode": "verify"}).to_string();
+            let Some(ValidationAttempt::Opaque(identity)) =
+                classify_validation_attempt("bash", &args)
+            else {
+                panic!("declared custom verifier must retain opaque identity: {command}");
+            };
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &args).as_deref(),
+                Some(identity.as_str())
+            );
+            assert!(!identity.contains(command));
+            let different =
+                json!({"command": command, "mode": "verify", "workdir": "nested"}).to_string();
+            assert_ne!(
+                normalize_validation_attempt_prefix("bash", &different),
+                Some(identity)
+            );
+        }
+        for command in [
+            "cargo test --workspace",
+            "python3 -m pytest tests",
+            "GOFLAGS=-n go test ./...",
+            "GOWORK=off go test -run password=synthetic-secret-value-123456 ./...",
+        ] {
+            let args = json!({"command": command, "mode": "verify"}).to_string();
+            let Some(ValidationAttempt::Recognized(identity)) =
+                classify_validation_attempt("bash", &args)
+            else {
+                panic!("known validator must remain recognized: {command}");
+            };
+            assert!(!identity.contains("synthetic-secret-value"));
+        }
+        let opaque = json!({"command": "python3 - <<'PY'\npass\nPY"}).to_string();
+        assert!(matches!(
+            classify_validation_attempt("bash", &opaque),
+            Some(ValidationAttempt::Opaque(_))
+        ));
+        assert!(
+            normalize_validation_prefix("bash", &opaque).is_none(),
+            "an inferred opaque attempt must not grant validation proof"
+        );
     }
 
     #[test]
