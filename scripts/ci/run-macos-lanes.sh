@@ -33,7 +33,7 @@ case "$lane" in
   coordination)
     cargo clippy --locked --manifest-path Cargo.toml -p astra-tools --all-targets -- -D warnings
     observe_git
-    cargo test --locked --manifest-path Cargo.toml -p astra-tools \
+    cargo test --locked --manifest-path Cargo.toml -p astra-tools --lib \
       workspace_observation::tests:: -- --test-threads=1
     ;;
   dev-tty-reader)

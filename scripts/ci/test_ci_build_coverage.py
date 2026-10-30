@@ -3,6 +3,7 @@
 
 from pathlib import Path
 from itertools import product
+import json
 import os
 import re
 import shlex
@@ -20,6 +21,50 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class BuildCoverageTests(unittest.TestCase):
+    def test_self_hosted_build_survives_checkout_cleanup_and_rechecks_source(self):
+        action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
+        section = action.split("    - name: Reuse self-hosted build artifacts\n", 1)[1].split("\n    - name:", 1)[0]
+        self.assertIn("runner.environment == 'self-hosted'", section)
+        self.assertIn("${{ runner.workspace }}/.astra-ci-target", section)
+        cache = action.split("    - uses: Swatinem/rust-cache@", 1)[1]
+        self.assertIn("runner.environment != 'self-hosted'", cache)
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            repo = workspace / "checkout"
+            source = repo / "dep/src/lib.rs"
+            source.parent.mkdir(parents=True)
+            (repo / "Cargo.toml").write_text('[package]\nname="cache-fixture"\nversion="0.1.0"\nedition="2021"\n[dependencies]\ncache-dep={path="dep"}\n')
+            (repo / "dep/Cargo.toml").write_text('[package]\nname="cache-dep"\nversion="0.1.0"\nedition="2021"\n')
+            (repo / "src").mkdir()
+            (repo / "src/main.rs").write_text('fn main() { println!("{}", cache_dep::value()); }')
+            source.write_text("pub fn value() -> u8 { 1 }")
+            for args in (("init", "-q"), ("add", "."), ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")):
+                subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+            github_env = workspace / "env"
+            environment = {**os.environ, "GITHUB_ENV": str(github_env),
+                           "ASTRA_CI_TARGET_DIR": str(workspace / ".astra-ci-target"),
+                           "RUSTC_WRAPPER": "", "CARGO_INCREMENTAL": "0"}
+            script = section.split("      run: ", 1)[1].strip()
+            subprocess.run(["bash", "-eu", "-c", script], env=environment, check=True)
+            environment.update(line.split("=", 1) for line in github_env.read_text().splitlines())
+            for attempt in range(3):
+                if attempt == 1:
+                    stale = repo / "stale-untracked"
+                    stale.touch()
+                    subprocess.run(["git", "clean", "-ffdx"], cwd=repo, check=True, capture_output=True)
+                    self.assertFalse(stale.exists())
+                elif attempt == 2:
+                    source.write_text("pub fn value() -> u8 { 2 }")
+                build = subprocess.run(["cargo", "build", "--offline", "--message-format=json"],
+                                       cwd=repo, env=environment, capture_output=True, text=True)
+                self.assertEqual(build.returncode, 0, build.stderr)
+                artifacts = [json.loads(line) for line in build.stdout.splitlines()]
+                dependency = next(a for a in artifacts if a.get("reason") == "compiler-artifact" and a["target"]["name"] == "cache_dep")
+                self.assertEqual(dependency["fresh"], attempt == 1)
+                binary = Path(environment["CARGO_TARGET_DIR"]) / "debug/cache-fixture"
+                result = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.strip(), "2" if attempt == 2 else "1")
+
     def test_rust_toolchain_bootstraps_missing_rust_and_reuses_cargo_bin(self):
         action = (ROOT / ".github/actions/rust-toolchain/action.yml").read_text()
         script = textwrap.dedent(action.split("      run: |\n", 1)[1])

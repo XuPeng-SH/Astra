@@ -68,6 +68,15 @@ runs:
 
         df -h "${disk_guard_workspace}"
 
+    # Checkout cleans the repository, including its default target directory.
+    # Each self-hosted trust pool has its own host/account/workspace.
+    - name: Reuse self-hosted build artifacts
+      if: ${{ runner.environment == 'self-hosted' }}
+      shell: bash
+      env:
+        ASTRA_CI_TARGET_DIR: ${{ runner.workspace }}/.astra-ci-target
+      run: echo "CARGO_TARGET_DIR=${ASTRA_CI_TARGET_DIR}" >> "$GITHUB_ENV"
+
     - name: Install pinned Rust toolchain
       uses: ./.github/actions/rust-toolchain
 
@@ -113,6 +122,8 @@ runs:
     - name: Configure sccache
       if: ${{ inputs.use-sccache == 'true' && steps.install_sccache.outcome == 'success' }}
       shell: bash
+      env:
+        ASTRA_CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       run: scripts/ci/configure-sccache.sh
 
     - name: Report sccache fallback
@@ -123,6 +134,7 @@ runs:
         echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      if: ${{ runner.environment != 'self-hosted' }}
       # Restoring build artifacts is also an optimization. Every caller runs a
       # compiler/test gate afterwards, so cache-service failures remain visible
       # as slower builds rather than false CI failures.

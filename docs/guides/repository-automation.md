@@ -217,7 +217,7 @@ The parent gate has an 82-minute job timeout; the controller has 100 minutes
 to cover delayed gate startup plus queue/execution/cleanup. These are backstops,
 not an extension of the worker's 60-minute execution budget.
 
-The worker performs one candidate checkout, toolchain setup and cache restore,
+The worker performs one candidate checkout and toolchain setup,
 then runs default reader/Bash, reflow, coordination, vendored units and dev-tty
 through the same `scripts/ci/run-macos-lanes.sh` used by hosted/Linux jobs. Cargo
 invocations remain separate and dev-tty is last. A real compile/test failure is
@@ -226,6 +226,19 @@ metadata also stay failed rather than hiding a possible test failure. Checkout,
 low-disk/toolchain setup,
 agent cancellation/loss or the execution budget select hosted fallback. The
 worker gets a read-only token and cache-mode read; it does not save default-branch Actions/sccache cache entries.
+
+Self-hosted Rust setup retains Cargo artifacts in
+`$RUNNER_WORKSPACE/.astra-ci-target`, outside the checkout that `git clean`
+resets. Both terminal-reader feature variants remain available across jobs.
+It uses a runner-local sccache capped at 5 GiB, with C/C++ direct mode disabled,
+and skips Actions build-cache restore/upload. Cargo still checks source,
+dependency and compiler fingerprints on every invocation. These local artifacts
+and the Cargo registry belong to the runner's isolated account; PR and main
+pools must never share them. The existing 30 GiB free-space guard applies before
+each run; operators reclaim old local artifacts when it reports low disk.
+Hosted runners retain their existing Actions cache path. Compare actual
+compile timings and sccache hit rates after warm runs, separately from queue
+time; a cold first run still builds the dependencies.
 
 The PR runner must match `[self-hosted, macOS, ARM64, mac-arm64-mini]`; the
 isolated main runner uses `mac-arm64-main` instead. Each must be available
