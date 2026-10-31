@@ -87,10 +87,13 @@ pub(super) fn build_core_state(
         shared_pool.clone(),
         Arc::clone(&session_context_coordinator),
     ));
-    let session_fork_coordinator = Arc::new(astra_services::DatabaseSessionForkCoordinator::new(
-        shared_pool.clone(),
-        Arc::clone(&session_context_coordinator),
-    ));
+    let session_fork_coordinator = Arc::new(
+        astra_services::DatabaseSessionForkCoordinator::new(
+            shared_pool.clone(),
+            Arc::clone(&session_context_coordinator),
+        )
+        .with_scope_encryptor(Arc::clone(shared_encryptor)),
+    );
 
     AppState::new(
         ServiceInfo::default(),
@@ -109,7 +112,9 @@ pub(super) fn build_core_state(
     )))
     .with_auth_service(auth_service)
     .with_session_service(Arc::new(
-        DatabaseSessionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        DatabaseSessionService::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone())
+            .with_scope_encryptor(Arc::clone(shared_encryptor)),
     ))
     .with_agent_service(Arc::new(
         DatabaseAgentService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),

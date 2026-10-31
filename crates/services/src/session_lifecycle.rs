@@ -90,6 +90,11 @@ const SESSION_DELETE_CHILD_FORKS_SELECT_SQL: &str =
     "SELECT isolation_domain, fork_id, parent_session_id
        FROM session_forks
       WHERE child_session_id = ? AND owner_user_id = ?
+        AND (state <> 'aborted' OR JSON_EXTRACT(manifest_json, '$.provider_owner') IS NULL OR NOT EXISTS (
+            SELECT 1 FROM agent_sessions parent
+            WHERE parent.user_id = session_forks.owner_user_id
+              AND parent.session_id = session_forks.parent_session_id
+        ))
         AND NOT EXISTS (
             SELECT 1 FROM session_forks descendants
             WHERE descendants.isolation_domain = session_forks.isolation_domain
@@ -1025,12 +1030,26 @@ async fn mark_session_deleting(
     .await
     .map_err(|source| format!("delete_session.mark_deleting.lock_fence: {source}"))?;
 
-    ensure_no_live_work_recovery_points(&mut tx, session_id, user_id).await?;
+    mark_session_deleting_tx(&mut tx, session_id, user_id).await?;
+    tx.commit()
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
+    Ok(())
+}
+
+/// Persist a delete intent under the caller's already-held Session fence.
+/// Prepared fork cancellation uses this same owner; maintenance completes it.
+pub(crate) async fn mark_session_deleting_tx(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    ensure_no_live_work_recovery_points(tx, session_id, user_id).await?;
 
     let result = query(MARK_SESSION_DELETING_SQL)
         .bind(session_id)
         .bind(user_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|source| format!("delete_session.mark_deleting: {source}"))?;
 
@@ -1039,7 +1058,7 @@ async fn mark_session_deleting(
             query("SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1")
                 .bind(session_id)
                 .bind(user_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await
                 .map_err(|source| format!("delete_session.mark_deleting.confirm: {source}"))?
                 .is_some();
@@ -1053,13 +1072,9 @@ async fn mark_session_deleting(
     query(MARK_SESSION_DELETE_FENCE_SQL)
         .bind(session_id)
         .bind(user_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|source| format!("delete_session.mark_deleting.persist_fence: {source}"))?;
-
-    tx.commit()
-        .await
-        .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
 
     Ok(())
 }

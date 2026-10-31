@@ -8,9 +8,10 @@ pub(super) async fn build_runtime_wiring(
     state: &AppState,
     memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
 ) -> Result<RuntimeWiring, Box<dyn std::error::Error>> {
-    let run_store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
-        shared_pool.clone(),
-    ));
+    let run_store = Arc::new(
+        astra_services::runs::DatabaseRunStateStore::new(shared_pool.clone())
+            .with_scope_encryptor(Arc::clone(run_encryptor)),
+    );
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
         .with_metrics_registry(state.metrics_registry());
     let selected_workspace_provider = run_engine.execution_owner_pod_id().map(|owner| {

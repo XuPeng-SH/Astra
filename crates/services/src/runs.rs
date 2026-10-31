@@ -60,6 +60,21 @@ pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResp
 
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
+    /// Verify the provider's Session scope before exposing or controlling a Run.
+    /// Implementations without an authoritative scope store fail closed.
+    async fn authorize_provider_run_scope(
+        &self,
+        _user_id: String,
+        _run_id: String,
+        _owner: ProviderRunOwner,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Provider session scope cannot be verified",
+            "provider_session_scope_unavailable",
+        ))
+    }
+
     async fn request_permission_mode(
         &self,
         _user_id: String,
@@ -1147,11 +1162,7 @@ impl RunStartIdempotency {
 /// This value is runtime-injected and never accepted from an HTTP chat
 /// payload. Durable provider interactions carry it so callbacks enforce the
 /// same provider-owned scope.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderRunOwner {
-    pub provider_id: String,
-    pub provider_scope_id: String,
-}
+pub use astra_turn_types::ProviderRunOwner;
 
 /// Facts loaded while authenticating and resolving an existing Session.
 ///
@@ -11042,6 +11053,7 @@ enum CancellationMarkerAttempt {
 #[derive(Clone)]
 pub struct DatabaseRunStateStore {
     pool: SharedPool,
+    scope_encryptor: Option<std::sync::Arc<crate::auth::FernetTokenEncryptor>>,
     owner_pod_id: String,
     lease_ttl: Duration,
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -11675,6 +11687,7 @@ impl DatabaseRunStateStore {
     pub fn new(pool: SharedPool) -> Self {
         Self {
             pool,
+            scope_encryptor: None,
             owner_pod_id: default_owner_pod_id(),
             lease_ttl: Self::DEFAULT_LEASE_TTL,
             #[cfg(any(test, feature = "e2e-hooks"))]
@@ -11742,6 +11755,14 @@ impl DatabaseRunStateStore {
             #[cfg(test)]
             recovery_batch_reads: Default::default(),
         }
+    }
+
+    pub fn with_scope_encryptor(
+        mut self,
+        encryptor: std::sync::Arc<crate::auth::FernetTokenEncryptor>,
+    ) -> Self {
+        self.scope_encryptor = Some(encryptor);
+        self
     }
 
     async fn hydrate_agent_recovery_events(
@@ -15247,6 +15268,24 @@ impl DatabaseRunStateStore {
         if !admitted {
             return Err(RunAdmissionError::SessionBusy);
         }
+        let provider_owner = record
+            .opening
+            .as_ref()
+            .and_then(|opening| opening.events().first())
+            .and_then(|event| event.pointer("/data/provider_run_owner"))
+            .map(|value| serde_json::from_value::<ProviderRunOwner>(value.clone()))
+            .transpose()
+            .map_err(|error| RunAdmissionError::Persistence(error.to_string()))?;
+        crate::session_fork_coordinator::authorize_provider_fork_session(
+            &mut *tx,
+            &record.user_id,
+            &record.session_id,
+            provider_owner.as_ref(),
+            self.scope_encryptor.as_deref(),
+            crate::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
+        )
+        .await
+        .map_err(|error| RunAdmissionError::Persistence(error.to_string()))?;
         let mut collaborator_event_rows = vec![];
         let mut collaborator_events_on_new_run = false;
         let mut stage_receipt = None;

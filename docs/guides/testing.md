@@ -207,6 +207,11 @@ requires the item never to start. Use `require_board_before_execution` to reject
 unbound pre-reads and require successful evidence under the delivered assignment.
 Parallel batch position alone does not prove cancellation/execution ordering.
 
+The offline `multi_agent_binding_http_e2e` journeys exercise sessionless runtime
+execution, real model/skill HTTP, and canonical SSE projection. They do not
+exercise inbound HTTP authentication or persistent Session creation/admission;
+those boundaries require the real database consumer journey below.
+
 ## MOI consumer compatibility with a fresh Astra database
 
 `Test: MOI fresh-Astra compatibility` starts real MatrixOne and the real Astra
@@ -288,6 +293,48 @@ using Astra request types or fetching a moving MOI branch. It checks:
   before run allocation or model I/O, with stable SSE error classification;
 - a valid turn still completes on that session after the rejected requests,
   without duplicate inference.
+
+The additive `moi_fresh_astra/forks.rs` contract uses the same independent
+signer and real router, with its own `astra_test_moi_fork_<uuid>` database.
+It exercises signed prepare, continuation activation, and exact committed
+root-run cursor lookup, then continues the parent, two siblings, and a nested
+fork through ordinary chat. Signature path and replay controls use the supported
+cursor route; legacy list/read/writer-activation routes retain their
+existing authentication rather than admitting request-signed provider tokens.
+The finite model inventory checks the actual inherited input and excludes later
+parent or sibling turns. Activation replay must preserve a continued child's
+head; activation alone grants no writer lease and makes no inference call.
+Negative controls cover signature/body/path tampering, nonce replay, workspace
+scope isolation, idempotency conflicts, non-root runs, incomplete projection,
+and unavailable historical roots. The earlier consumer baseline is unchanged.
+The same fork journey deletes its middle Session, then its ancestor, and proves
+the descendant can still materialize and continue from the exact pinned history
+after bounded cleanup. Deleted Sessions retain no live head or execution state.
+Deleting the final descendant releases fork metadata, pins and manifest rows,
+including the node-local payloads stored by the current canonical owner.
+
+`moi_fresh_astra/fork_auth_compat.rs` checks that real runtime and Edge user
+tokens retain the existing prepare and writer-activation contract at a
+canonical head before Server projection. These legacy credentials cannot use
+the new provider cursor or continuation-activation controls. A custom
+request-only provider authenticator without mechanism evidence cannot bypass
+scope or retry legacy authentication. The canonical verifier also proves the
+legacy/HMAC mechanism distinction and single nonce consumption.
+
+MOI's new provider fork integration uses request-bound HMAC authentication.
+Those principals own Sessions under `provider_authorized:<provider>:<subject>`;
+legacy MOI user tokens use the separate `external_authorized:moi:<subject>`
+owner namespace and retain their existing subject-owned Session contract.
+Legacy credentials cannot read or control a request-signed provider's fork.
+This integration does not change legacy APIs into workspace-scoped APIs.
+
+New request-signed provider Sessions and forks enforce scope at common Run
+admission and access. Existing ordinary Sessions without a scope binding retain
+their previous chat behavior, but cannot serve as a source for a new provider
+fork. A later Run never claims that Session's historical scope. A malformed
+binding or an existing fork manifest cannot use the ordinary-session fallback.
+The fresh-database fixtures do not establish an existing-database migration or
+repair older ordinary Sessions' pre-existing scope behavior.
 
 Buffered and live consumers share the pinned MOI SSE framing rules, including
 LF/CRLF, multiline data, EOF frames and stopping at `[DONE]`. Negative controls

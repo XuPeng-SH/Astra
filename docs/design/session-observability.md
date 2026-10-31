@@ -272,6 +272,19 @@ Physical page counts, page high watermarks, and page lag are not exposed.
 The committed projection may honestly lag canonical context until its evidence
 has been materialized and the contiguous cursor promoted.
 
+A Session fork installs a validated shared prefix and child canonical head without
+copying parent display rows or allocating historical child runs. The child's
+first own run advances from turn N to N+1 through the existing canonical terminal
+transaction, which commits Context, raw transcript and terminal status together.
+Repeated activation cannot rewind a continued child.
+
+Nested forks use the existing canonical lineage owner. Each ancestor read remains
+within its validated owner, isolation domain, branch, generation and pinned
+sequence. Deleting an intermediate Session removes its live head and execution
+authority while existing fork records and pins retain history needed by prepared
+or active descendants. Bounded bottom-up cleanup releases those records and
+node-local payloads after the last dependent descendant is removed.
+
 ## One-shot local content privacy
 
 `astra --no-journal-content chat ...` (or `ASTRA_JOURNAL_CONTENT_REDACT=1`)

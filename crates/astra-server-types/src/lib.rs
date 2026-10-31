@@ -2202,12 +2202,14 @@ impl From<AdminUserRoleRecord> for AdminUserRoleResponse {
 #[cfg(feature = "server")]
 impl From<SessionRecord> for SessionResponse {
     fn from(value: SessionRecord) -> Self {
+        let mut metadata = value.metadata;
+        metadata.remove(astra_services::auth::session::PROVIDER_SCOPE_PROOF_KEY);
         Self {
             session_id: value.session_id,
             user_id: value.user_id,
             agent_id: value.agent_id,
             title: value.title,
-            metadata: value.metadata,
+            metadata,
             status: value.status,
             event_count: value.event_count,
             created_at: value.created_at,

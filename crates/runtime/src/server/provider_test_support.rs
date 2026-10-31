@@ -14,6 +14,53 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
+/// Exercise provider/binding execution without a persistent Session. This
+/// test-only boundary uses production request conversion, runtime injection,
+/// lifecycle execution and SSE projection; it does not test inbound HTTP
+/// authentication or Session creation/scope admission.
+pub async fn ephemeral_provider_chat_stream(
+    state: &super::AppState,
+    principal: &astra_services::AuthPrincipal,
+    payload: Value,
+) -> Response {
+    let request: super::ChatRequest = serde_json::from_value(payload).expect("test chat request");
+    assert!(
+        request.session_id.is_none(),
+        "ephemeral fixture cannot address a persistent Session"
+    );
+    let mut request = super::chat_request_into_data(request);
+    let result = async {
+        super::provider_runtime_context::inject_effective_runtime_context(
+            state,
+            principal,
+            &mut request,
+        )
+        .await?;
+        state
+            .execution
+            .run_lifecycle_service
+            .stream_chat(principal.user.user_id.clone(), request)
+            .await
+    }
+    .await;
+    match result {
+        Ok(mut stream) => super::sse_streaming_response(
+            stream.session_id,
+            stream.run_id,
+            None,
+            stream
+                .event_rx
+                .take()
+                .expect("a new ephemeral run streams its events"),
+        ),
+        Err((status, error)) => super::sse_error_response_from_error_with_context(
+            status,
+            error.0,
+            super::SseErrorContext::default(),
+        ),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
     pub method: Method,

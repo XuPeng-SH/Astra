@@ -227,8 +227,9 @@ pub use session_cursor::{
 };
 pub use session_fork::{
     ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
-    ForkExcludedAuthorityV1, SESSION_FORK_MANIFEST_SCHEMA_VERSION, SessionForkActivationV1,
-    SessionForkManifestV1, SessionForkStateV1, SessionForkValidationError, SharedManifestPrefixV1,
+    ForkExcludedAuthorityV1, ProviderRunOwner, SESSION_FORK_MANIFEST_SCHEMA_VERSION,
+    SessionForkActivationV1, SessionForkManifestV1, SessionForkStateV1, SessionForkValidationError,
+    SharedManifestPrefixV1,
 };
 pub use session_handoff::{
     HandoffOperationWatermarksV1, HandoffRiskEvidenceV1, MANIFEST_DELTA_SCHEMA_VERSION,

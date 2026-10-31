@@ -1504,6 +1504,7 @@ pub(crate) async fn post_provider_interaction_respond_handler(
         ));
     }
 
+    super::super::run::handlers::authorize_provider_run_session(&state, &principal, run_id).await?;
     let target = state
         .execution
         .run_lifecycle_service
@@ -2259,6 +2260,27 @@ mod edge_callback_insert_tests {
 
     #[async_trait]
     impl RunLifecycleService for ApprovalTargetRunLifecycle {
+        async fn authorize_provider_run_scope(
+            &self,
+            user_id: String,
+            run_id: String,
+            owner: astra_services::runs::ProviderRunOwner,
+        ) -> Result<(), (StatusCode, Json<crate::ErrorResponse>)> {
+            if user_id == "u-approval"
+                && run_id == self.run_id
+                && owner.provider_id == "moi"
+                && owner.provider_scope_id == "workspace-a"
+            {
+                Ok(())
+            } else {
+                Err(astra_core::error_response_coded(
+                    StatusCode::FORBIDDEN,
+                    "Session is outside the authorized scope",
+                    "session_fork_forbidden",
+                ))
+            }
+        }
+
         async fn create_run(
             &self,
             _user_id: String,

@@ -31,6 +31,7 @@ pub(super) async fn resolve_or_create_chat_session_id(
         agent_id,
         session_id_is_trusted,
         false,
+        None,
     )
     .await
     .map(|resolved| resolved.session_id)
@@ -49,6 +50,7 @@ pub(super) async fn resolve_or_create_chat_session(
     agent_id: Option<String>,
     session_id_is_trusted: bool,
     provider_authorized: bool,
+    provider_principal: Option<&AuthPrincipal>,
 ) -> Result<ResolvedChatSession, (StatusCode, Json<ErrorResponse>)> {
     match requested_session_id {
         Some(session_id) => {
@@ -102,6 +104,40 @@ pub(super) async fn resolve_or_create_chat_session(
                     serde_json::Value::String(agent_id.clone()),
                 )])
             });
+
+            if provider_authorized && user.user_id.starts_with("provider_authorized:") {
+                let principal = provider_principal.ok_or_else(|| {
+                    error_response_coded(
+                        StatusCode::FORBIDDEN,
+                        "verified provider identity is required",
+                        "provider_session_creation_forbidden",
+                    )
+                })?;
+                let identity = astra_services::ProviderSessionCreationIdentity::from_principal(
+                    principal,
+                    &format!("chat-{}", uuid::Uuid::new_v4()),
+                )?;
+                let result = state
+                    .session_service
+                    .create_provider_session(
+                        identity,
+                        SessionCreateRequestData {
+                            agent_id,
+                            title: None,
+                            metadata,
+                        },
+                        astra_services::resource_governor::LimitCheck::Allowed,
+                    )
+                    .await?;
+                return Ok(ResolvedChatSession {
+                    session_id: Some(result.session.session_id),
+                    full_llm_capture:
+                        crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
+                            &result.session.metadata,
+                        )),
+                    session_admission_facts: Some(result.admission_facts),
+                });
+            }
 
             match super::session::session_quota::create_session_with_resource_quota(
                 state,
@@ -206,6 +242,7 @@ pub(super) async fn chat_handler(
             &principal.origin,
             astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
         ),
+        Some(&principal),
     )
     .await?;
     chat_data.session_id = resolved.session_id;
@@ -284,6 +321,7 @@ pub(super) async fn chat_stream_handler(
                 &principal.origin,
                 astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
             ),
+            Some(&principal),
         ),
         inject_effective_runtime_context(&state, &principal, &mut chat_data),
     );
@@ -594,7 +632,8 @@ mod session_resolution_tests {
             }));
         state.resource_governor = governor.clone();
         let result =
-            resolve_or_create_chat_session(&state, &test_user(), None, None, false, false).await;
+            resolve_or_create_chat_session(&state, &test_user(), None, None, false, false, None)
+                .await;
         assert!(result.is_err());
         assert_eq!(result.err().unwrap().0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(governor.get_usage("u1").await.sessions_created, 0);
@@ -613,6 +652,7 @@ mod session_resolution_tests {
             Some("agent-1".to_string()),
             false,
             false,
+            None,
         )
         .await
         .expect("session resolution should succeed");
@@ -674,6 +714,7 @@ mod session_resolution_tests {
             None,
             false,
             false,
+            None,
         )
         .await
         .expect("custom session service should resolve an existing session");
@@ -698,6 +739,7 @@ mod session_resolution_tests {
             None,
             false,
             true,
+            None,
         )
         .await
         {

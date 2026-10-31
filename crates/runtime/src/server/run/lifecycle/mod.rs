@@ -15175,6 +15175,56 @@ impl AgenticRunLifecycleService {
         Ok(bindings)
     }
 
+    async fn authorize_fork_session_request(
+        &self,
+        user_id: &str,
+        request: &ChatRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if let Some(session_id) = &request.session_id {
+            self.authorize_fork_session_id(
+                user_id,
+                session_id,
+                request.provider_run_owner.as_ref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn authorize_fork_session_id(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        provider_owner: Option<&astra_services::runs::ProviderRunOwner>,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if let Some(pool) = &self.shared_pool {
+            astra_services::session_fork_coordinator::authorize_provider_fork_session(
+                pool.get(),
+                user_id,
+                session_id,
+                provider_owner,
+                Some(self.encryptor.as_ref()),
+                astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
+            )
+            .await
+            .map_err(|error| match error {
+                astra_services::SessionForkCoordinatorError::Forbidden => error_response_coded(
+                    StatusCode::FORBIDDEN,
+                    "Session fork is outside the authorized scope",
+                    "session_fork_forbidden",
+                ),
+                error => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+            })?;
+        } else if provider_owner.is_some() {
+            return Err(error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Provider session scope cannot be verified",
+                "provider_session_scope_unavailable",
+            ));
+        }
+        Ok(())
+    }
+
     async fn prepare_new_owned_execution(
         &self,
         user_id: String,
@@ -15183,6 +15233,10 @@ impl AgenticRunLifecycleService {
         streaming: bool,
     ) -> Result<NewRunPreparation, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
+        if !streaming {
+            self.authorize_fork_session_request(&user_id, &request)
+                .await?;
+        }
         let request = self.prepare_chat_request(&user_id, request).await?;
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
@@ -15325,9 +15379,16 @@ impl AgenticRunLifecycleService {
         let execution_start_authority = match start_claim {
             DurableRunStartClaim::Started { authority } => authority,
             DurableRunStartClaim::Existing {
+                session_id: existing_session_id,
                 start_request_fingerprint,
                 ..
             } => {
+                self.authorize_fork_session_id(
+                    &user_id,
+                    &existing_session_id,
+                    request.provider_run_owner.as_ref(),
+                )
+                .await?;
                 Self::validate_start_request_fingerprint(
                     start_identity
                         .as_ref()
@@ -16144,6 +16205,40 @@ impl AgenticRunLifecycleService {
 
 #[async_trait]
 impl RunLifecycleService for AgenticRunLifecycleService {
+    async fn authorize_provider_run_scope(
+        &self,
+        user_id: String,
+        run_id: String,
+        owner: astra_services::runs::ProviderRunOwner,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.shared_pool.as_ref().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Provider session scope cannot be verified",
+                "provider_session_scope_unavailable",
+            )
+        })?;
+        let session_id: Option<String> = sqlx::query_scalar(
+            "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_optional(pool.get())
+        .await
+        .map_err(|_| {
+            error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Provider session scope cannot be verified",
+                "provider_session_scope_unavailable",
+            )
+        })?;
+        let session_id = session_id.ok_or_else(|| {
+            error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
+        })?;
+        self.authorize_fork_session_id(&user_id, &session_id, Some(&owner))
+            .await
+    }
+
     fn workspace_executor_id(&self) -> Option<&str> {
         self.selected_server_workspace_provider
             .as_ref()
@@ -16201,6 +16296,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
+        self.authorize_fork_session_request(&user_id, &request)
+            .await?;
         let start_identity = self.run_start_idempotency(&user_id, &request)?;
         // Replays consume frozen execution facts before mutable admission.
         if let Some(identity) = start_identity.as_ref()
@@ -16208,6 +16305,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .load_durable_run_for_user(identity.run_id(), &user_id)
                 .await?
         {
+            self.authorize_fork_session_id(
+                &user_id,
+                &durable.session_id,
+                request.provider_run_owner.as_ref(),
+            )
+            .await?;
             Self::validate_start_request_session(
                 identity,
                 request.session_id.as_deref(),

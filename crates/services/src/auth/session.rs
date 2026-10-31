@@ -13,8 +13,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, MySql, QueryBuilder, Row, query};
+use std::sync::Arc;
 use uuid::Uuid;
 
+pub const PROVIDER_SCOPE_PROOF_KEY: &str = "__astra_provider_scope_proof_v1";
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
 const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (activity_at < ";
 const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (activity_at = ";
@@ -177,6 +179,25 @@ pub trait SessionService: Send + Sync {
         ))
     }
 
+    /// Create a Session with the configured creation quota. Database-backed
+    /// implementations reserve daily usage in the Session insert transaction.
+    async fn create_session_with_resource_quota(
+        &self,
+        user_id: String,
+        request: SessionCreateRequestData,
+        governor: &dyn crate::resource_governor::ResourceGovernor,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        crate::resource_governor::enforce_session_create_quota(
+            &governor.check_session_create(&user_id).await,
+        )?;
+        let session = self
+            .create_session_with_admission_facts(user_id.clone(), request)
+            .await?;
+        governor.record_session_created(&user_id).await;
+        Ok(session)
+    }
+
     async fn list_sessions(
         &self,
         filter: SessionListFilter,
@@ -268,6 +289,7 @@ pub struct SessionCreateRequestData {
 pub struct ProviderSessionCreationIdentity {
     user_id: String,
     session_id: String,
+    scope: crate::runs::ProviderRunOwner,
 }
 
 impl ProviderSessionCreationIdentity {
@@ -316,6 +338,10 @@ impl ProviderSessionCreationIdentity {
         Ok(Self {
             user_id: principal.user.user_id.clone(),
             session_id: format!("{:x}", hash.finalize()),
+            scope: crate::runs::ProviderRunOwner {
+                provider_id: context.provider_id.clone(),
+                provider_scope_id: context.provider_scope_id.clone(),
+            },
         })
     }
 }
@@ -577,10 +603,24 @@ fn session_activity_entry_from_row(
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DatabaseSessionService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    scope_encryptor: Option<Arc<super::FernetTokenEncryptor>>,
+}
+
+impl std::fmt::Debug for DatabaseSessionService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseSessionService")
+            .field("matrixone", &self.matrixone)
+            .field("pool", &self.pool)
+            .field(
+                "scope_encryptor_configured",
+                &self.scope_encryptor.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -605,12 +645,40 @@ impl DatabaseSessionService {
         session_id: String,
         request: SessionCreateRequestData,
         provider_creation: Option<(String, crate::resource_governor::LimitCheck)>,
+        reserve_quota: bool,
+        provider_scope: Option<&crate::runs::ProviderRunOwner>,
     ) -> Result<SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let title = request
             .title
             .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
-        let metadata = serde_json::Value::Object(request.metadata.unwrap_or_default()).to_string();
+        let mut metadata = request.metadata.unwrap_or_default();
+        if metadata.contains_key(PROVIDER_SCOPE_PROOF_KEY) {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "reserved session metadata key",
+                "session_metadata_invalid",
+            ));
+        }
+        if let Some(scope) = provider_scope {
+            let encryptor = self.scope_encryptor.as_ref().ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provider session scope is not configured",
+                    "provider_session_scope_unavailable",
+                )
+            })?;
+            metadata.insert(
+                PROVIDER_SCOPE_PROOF_KEY.to_string(),
+                serde_json::Value::String(encryptor.sign_provider_session_scope(
+                    &user_id,
+                    &session_id,
+                    &scope.provider_id,
+                    &scope.provider_scope_id,
+                )),
+            );
+        }
+        let metadata = serde_json::Value::Object(metadata).to_string();
 
         let mut connection = CancellationSafePoolConnection::acquire(&pool)
             .await
@@ -643,6 +711,34 @@ impl DatabaseSessionService {
                     .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
+                // Replaying the same deterministic creation intent may read
+                // an older unbound Session, but must never backfill its scope.
+                if let Some(scope) = provider_scope
+                    && record.metadata.contains_key(PROVIDER_SCOPE_PROOF_KEY)
+                {
+                    let valid = record
+                        .metadata
+                        .get(PROVIDER_SCOPE_PROOF_KEY)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|proof| {
+                            self.scope_encryptor.as_ref().is_some_and(|encryptor| {
+                                encryptor.verify_provider_session_scope(
+                                    &user_id,
+                                    &session_id,
+                                    &scope.provider_id,
+                                    &scope.provider_scope_id,
+                                    proof,
+                                )
+                            })
+                        });
+                    if !valid {
+                        return Err(error_response_coded(
+                            StatusCode::FORBIDDEN,
+                            "provider session scope cannot be verified",
+                            "provider_session_scope_unverified",
+                        ));
+                    }
+                }
                 tx.commit().await.map_err(internal_error)?;
                 connection.release();
                 return Ok(SessionCreationResult {
@@ -652,6 +748,16 @@ impl DatabaseSessionService {
                 });
             }
             crate::resource_governor::enforce_session_create_quota(quota)?;
+        }
+
+        if reserve_quota {
+            let quota =
+                crate::resource_governor::DatabaseResourceGovernor::reserve_session_creation(
+                    &mut tx, &user_id,
+                )
+                .await
+                .map_err(internal_error)?;
+            crate::resource_governor::enforce_session_create_quota(&quota)?;
         }
 
         query(
@@ -695,6 +801,7 @@ impl DatabaseSessionService {
         Self {
             matrixone,
             pool: None,
+            scope_encryptor: None,
         }
     }
 
@@ -824,6 +931,11 @@ impl DatabaseSessionService {
         self
     }
 
+    pub fn with_scope_encryptor(mut self, encryptor: Arc<super::FernetTokenEncryptor>) -> Self {
+        self.scope_encryptor = Some(encryptor);
+        self
+    }
+
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
         crate::require_shared_pool(
             self.pool.as_ref(),
@@ -840,9 +952,16 @@ impl SessionService for DatabaseSessionService {
         user_id: String,
         request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
-            .await
-            .map(|result| result.session)
+        self.create_session_record(
+            user_id,
+            Uuid::new_v4().to_string(),
+            request,
+            None,
+            false,
+            None,
+        )
+        .await
+        .map(|result| result.session)
     }
 
     async fn create_session_with_admission_facts(
@@ -851,9 +970,16 @@ impl SessionService for DatabaseSessionService {
         request: SessionCreateRequestData,
     ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
     {
-        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
-            .await
-            .map(|result| (result.session, Some(result.admission_facts)))
+        self.create_session_record(
+            user_id,
+            Uuid::new_v4().to_string(),
+            request,
+            None,
+            false,
+            None,
+        )
+        .await
+        .map(|result| (result.session, Some(result.admission_facts)))
     }
 
     async fn create_provider_session(
@@ -869,8 +995,29 @@ impl SessionService for DatabaseSessionService {
             identity.session_id,
             request,
             Some((payload_hash, quota)),
+            true,
+            Some(&identity.scope),
         )
         .await
+    }
+
+    async fn create_session_with_resource_quota(
+        &self,
+        user_id: String,
+        request: SessionCreateRequestData,
+        _governor: &dyn crate::resource_governor::ResourceGovernor,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.create_session_record(
+            user_id,
+            Uuid::new_v4().to_string(),
+            request,
+            None,
+            true,
+            None,
+        )
+        .await
+        .map(|result| (result.session, Some(result.admission_facts)))
     }
 
     async fn list_sessions(
@@ -1049,6 +1196,20 @@ impl SessionService for DatabaseSessionService {
             ));
         }
 
+        if metadata
+            .as_ref()
+            .is_some_and(|value| value.contains_key(PROVIDER_SCOPE_PROOF_KEY))
+            || metadata_patch
+                .as_ref()
+                .is_some_and(|value| value.contains_key(PROVIDER_SCOPE_PROOF_KEY))
+        {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "reserved session metadata key",
+                "session_metadata_invalid",
+            ));
+        }
+
         if title.is_none() && metadata.is_none() && metadata_patch.is_none() && status.is_none() {
             return Ok(existing);
         }
@@ -1097,18 +1258,24 @@ impl SessionService for DatabaseSessionService {
             )
         })?;
 
+        let raw = locked
+            .try_get::<String, _>("metadata_json")
+            .map_err(internal_error)?;
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(internal_error)?;
+        let locked_metadata = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| internal_error("persisted session metadata must be a JSON object"))?;
         let metadata_patch_for_audit = metadata_patch.clone();
         let metadata = match (metadata, metadata_patch) {
-            (Some(metadata), None) => Some(metadata),
+            (Some(mut metadata), None) => {
+                if let Some(proof) = locked_metadata.get(PROVIDER_SCOPE_PROOF_KEY) {
+                    metadata.insert(PROVIDER_SCOPE_PROOF_KEY.to_string(), proof.clone());
+                }
+                Some(metadata)
+            }
             (None, Some(patch)) => {
-                let raw = locked
-                    .try_get::<String, _>("metadata_json")
-                    .map_err(internal_error)?;
-                let value: serde_json::Value =
-                    serde_json::from_str(&raw).map_err(internal_error)?;
-                let mut current = value.as_object().cloned().ok_or_else(|| {
-                    internal_error("persisted session metadata must be a JSON object")
-                })?;
+                let mut current = locked_metadata;
                 apply_metadata_patch(&mut current, patch);
                 Some(current)
             }

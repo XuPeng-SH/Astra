@@ -3,7 +3,8 @@
 //!
 //! This worker is deliberately limited to explicit user delete intents,
 //! expired diagnostics, and runtime objects whose owner was already removed.
-//! It does not transition or end agent_sessions, and it does not expire
+//! It also cancels expired, unused provider fork preparations through their
+//! existing abort and Session deletion owners. It does not expire
 //! session traces.
 //! Durable conversation history remains available until the user deletes the
 //! session through the normal API.
@@ -46,6 +47,8 @@ pub struct RuntimeMaintenanceSweepResult {
     pub observation_collision_receipts_expired: u64,
     /// Expired fork-retention pins released after their grace period.
     pub expired_fork_pins_released: u64,
+    /// Unactivated provider forks cancelled after their retry window.
+    pub expired_provider_prepares_aborted: u64,
     /// Fork records whose child session no longer exists.
     pub orphaned_forks_collected: u64,
     /// Unpinned manifest nodes whose owner session no longer exists.
@@ -131,6 +134,13 @@ pub async fn maintain_runtime_storage(
         expire_session_attachments(pool, policy.batch_limit).await,
     );
     if let Some(coordinator) = fork_coordinator {
+        result.expired_provider_prepares_aborted = record_runtime_storage_maintenance(
+            &mut result.cleanup_errors,
+            "abort_expired_provider_prepares",
+            coordinator
+                .abort_expired_provider_prepares(policy.batch_limit)
+                .await,
+        );
         result.expired_fork_pins_released = record_runtime_storage_maintenance(
             &mut result.cleanup_errors,
             "release_expired_fork_pins",
@@ -163,6 +173,7 @@ impl RuntimeMaintenanceSweepResult {
             .saturating_add(self.model_request_context_events_expired)
             .saturating_add(self.observation_collision_receipts_expired)
             .saturating_add(self.expired_fork_pins_released)
+            .saturating_add(self.expired_provider_prepares_aborted)
             .saturating_add(self.orphaned_forks_collected)
             .saturating_add(self.orphaned_manifests_collected)
             .saturating_add(self.work_branch_control_operations_expired)

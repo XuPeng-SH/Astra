@@ -277,6 +277,83 @@ Physical page references/hashes are no longer part of this response.
 Work transcript responses retain their committed cursor and per-item commitment
 fields; a newer canonical context head does not certify transcript publication.
 
+### Session forks
+
+The operations below retain ordinary Astra owner authentication. Provider access
+to the new run-cursor and continuation-activation operations requires
+request-bound HMAC authentication, binding the exact method, path, route
+template, body digest, and fresh request ID. Scope is verified against the
+source Session's server-authenticated binding or its retained fork manifest,
+not a display message or the latest Run. The child retains that scope.
+
+Existing runtime/Edge user tokens retain the original prepare and writer-
+activation contract, including canonical heads before Server transcript
+projection. They cannot use the new provider cursor or continuation controls,
+or access request-signed Sessions in the distinct provider owner namespace.
+Provider authenticators without explicit mechanism provenance are rejected.
+Invalid request-HMAC credentials never fall back to legacy authentication.
+
+New request-signed Sessions and forks enforce scope on subsequent Run admission
+and access. Older ordinary Sessions without a binding retain their previous
+chat behavior but cannot become new provider fork sources. A later Run does not
+claim their historical scope; malformed bindings and fork manifests cannot use
+the ordinary-session compatibility path.
+
+`GET /sessions/{session_id}/runs/{run_id}/cursor` returns a `SessionCursorV1`
+for that completed root conversation run. It verifies the run's committed
+transcript markers against its retained canonical manifest. It never substitutes
+the current Session head, counts display messages, or reconstructs a legacy
+cursor from text. Canonical terminal settlement commits Context and raw transcript
+with terminal status; a client querying an incomplete run may receive
+`session_fork_cursor_not_ready` and retry this read.
+
+`POST /sessions/{session_id}/forks` accepts
+`{idempotency_key, expected_parent_cursor, reason}` and returns the prepared
+`SessionForkManifestV1`. The key identifies the immutable request; changing the
+request under the same key conflicts.
+
+`POST /sessions/{session_id}/forks/{fork_id}/activate-for-continuation` accepts
+`{}` and returns `{manifest, child_head}`. It activates the shared conversation
+prefix without acquiring or returning a writer lease. The next ordinary
+`/chat/stream` request uses `manifest.child_key.session_id` and admits fresh
+Run-owned Context authority. Retrying activation returns the current child head and never
+rewinds a continued child. This endpoint does not replay tools or inherit runs,
+writers, approvals, mailboxes, invocations, filesystem state, or model credentials.
+The existing `GET /sessions/{session_id}/forks` list,
+`GET /sessions/{session_id}/forks/{fork_id}` read,
+and `POST /sessions/{session_id}/forks/{fork_id}/activate` retain their existing
+authentication contract; request-signed provider credentials do not grant
+access to them. `/activate` retains its writer-lease response.
+
+`POST /sessions/{session_id}/forks/{fork_id}/abort` retains
+`{detail, grace_seconds}` and additionally accepts request-signed provider
+credentials for the matching prepared fork. It cancels preparation without
+granting execution authority; active forks cannot be aborted. Interrupted
+provider preparations expire after 24 hours and maintenance reclaims the
+unused child and pin. Replaying a confirmed aborted operation returns
+`session_fork_aborted`, including after child cleanup. Unknown outcomes must
+still be retried with the same idempotency key.
+
+Fork errors use the existing public error envelope and stable `error_code`:
+
+| HTTP | Code | Meaning |
+| --- | --- | --- |
+| 400 | `session_fork_invalid` | Invalid request |
+| 413 | `session_fork_resource_limit` | Canonical context resource limit exceeded |
+| 403 | `session_fork_forbidden` | Source is outside the authorized provider scope |
+| 404 | `session_fork_not_found` | Scoped run or fork was not found |
+| 409 | `session_fork_cursor_not_ready` | Run or committed transcript projection is incomplete |
+| 409 | `session_fork_cursor_unavailable` | Exact retained canonical root is unavailable |
+| 422 | `session_fork_cursor_unsupported` | Run is not an eligible root conversation commit |
+| 409 | `session_fork_idempotency_mismatch` | Same key with a different request |
+| 409 | `session_fork_writer_conflict` | Existing activation's writer belongs to another actor |
+| 409 | `session_fork_conflict` | Fork lifecycle or context conflict |
+| 410 | `session_fork_aborted` | Preparation was cancelled and can no longer activate |
+| 429 | `per_user_daily_session_quota` | Daily Session creation quota exceeded |
+| 429 | `per_user_concurrent_session_quota` | Concurrent Session quota exceeded |
+| 429 | `per_user_daily_token_quota` | Daily token quota exceeded |
+| 503 | `session_fork_dependency_unavailable` | Dependency or stored-state failure; internal details are not returned |
+
 ### PUT /sessions/{session_id}
 
 ### POST /sessions/{session_id}/close

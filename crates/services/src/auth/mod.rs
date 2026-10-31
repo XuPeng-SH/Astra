@@ -437,6 +437,25 @@ pub enum EdgeTokenBinding {
     MissingBinding,
 }
 
+/// Authentication mechanism established by the verifier for this request.
+/// Provider identity alone cannot distinguish existing user tokens from the
+/// request-bound HMAC mechanism.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestAuthMechanism {
+    /// Successfully verified through the existing current-user credential path.
+    KnownLegacy,
+    /// Successfully verified against this request's method, path, body and nonce.
+    RequestBoundHmac,
+    /// An existing custom verifier supplied no explicit mechanism evidence.
+    Unspecified,
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestAuthResult {
+    pub principal: AuthPrincipal,
+    pub mechanism: RequestAuthMechanism,
+}
+
 #[async_trait]
 pub trait AuthService: Send + Sync {
     async fn reauthentication_options(
@@ -547,6 +566,22 @@ pub trait AuthService: Send + Sync {
         _request: ProviderRequestDescriptor,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         self.current_principal(headers).await
+    }
+
+    /// Existing custom request verifiers remain authoritative. Their successful
+    /// result is deliberately unspecified: consumers must not infer legacy
+    /// admission from a provider principal or retry another verifier.
+    async fn current_principal_for_request_with_provenance(
+        &self,
+        headers: &HeaderMap,
+        request: ProviderRequestDescriptor,
+    ) -> Result<RequestAuthResult, (StatusCode, Json<ErrorResponse>)> {
+        self.current_principal_for_request(headers, request)
+            .await
+            .map(|principal| RequestAuthResult {
+                principal,
+                mechanism: RequestAuthMechanism::Unspecified,
+            })
     }
 
     /// Fresh authorization from a store-created canonical admission before
@@ -1263,6 +1298,76 @@ impl DatabaseAuthService {
         }
         guard.insert(authorization_id.to_string(), expires_at_unix);
         Ok(())
+    }
+
+    async fn verify_request_principal(
+        &self,
+        headers: &HeaderMap,
+        request: ProviderRequestDescriptor,
+    ) -> Result<RequestAuthResult, (StatusCode, Json<ErrorResponse>)> {
+        let Some((provider_id, _action, token)) = Self::external_request_auth_headers(headers)?
+        else {
+            let token = bearer_token(headers)?;
+            let principal = if token.starts_with(MOI_USER_TOKEN_PREFIX) {
+                self.principal_from_edge_token(token, request).await?
+            } else {
+                self.current_principal(headers).await?
+            };
+            return Ok(RequestAuthResult {
+                principal,
+                mechanism: RequestAuthMechanism::KnownLegacy,
+            });
+        };
+        let provider = self.provider_config(&provider_id)?.clone();
+        if provider.auth_type != "hmac" {
+            return Err(provider_request_auth_error(
+                "Provider request auth configuration is unsupported",
+            ));
+        }
+        let authorized = verify_provider_request_hmac_token(
+            &provider.provider,
+            &provider.key,
+            &token,
+            &request,
+        )?;
+        let request_id = request.request_id.as_deref().unwrap_or_default();
+        self.record_provider_request_authorization(&authorized, request_id)
+            .await?;
+        let user_id = format!(
+            "provider_authorized:{}:{}",
+            authorized.provider_id, authorized.external_subject
+        );
+        let username_len = authorized.external_subject.chars().count();
+        if username_len > USERNAME_MAX_LEN {
+            return Err(provider_request_auth_error(
+                "Provider request external subject exceeds the Astra username limit",
+            ));
+        }
+        if user_id.chars().count() > USER_ID_MAX_LEN {
+            return Err(provider_request_auth_error(
+                "Provider-authorized user principal exceeds the Astra user_id limit",
+            ));
+        }
+        let principal = AuthPrincipal::from_provider_request(
+            AuthUserRecord {
+                user_id,
+                username: authorized.external_subject.clone(),
+                email: String::new(),
+                display_name: None,
+            },
+            AuthProviderAuthorizedRequestContext {
+                provider_id: authorized.provider_id,
+                external_subject: authorized.external_subject,
+                provider_scope_id: authorized.provider_scope_id,
+                request_authorization_id: authorized.request_authorization_id,
+                // Provider-request (HMAC server-to-server) calls carry no edge binding.
+                edge_agent_id: None,
+            },
+        );
+        Ok(RequestAuthResult {
+            principal,
+            mechanism: RequestAuthMechanism::RequestBoundHmac,
+        })
     }
 
     fn external_request_auth_headers(
@@ -2257,60 +2362,17 @@ impl AuthService for DatabaseAuthService {
         headers: &HeaderMap,
         request: ProviderRequestDescriptor,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
-        let Some((provider_id, _action, token)) = Self::external_request_auth_headers(headers)?
-        else {
-            let token = bearer_token(headers)?;
-            if token.starts_with(MOI_USER_TOKEN_PREFIX) {
-                return self.principal_from_edge_token(token, request).await;
-            }
-            return self.current_principal(headers).await;
-        };
-        let provider = self.provider_config(&provider_id)?.clone();
-        if provider.auth_type != "hmac" {
-            return Err(provider_request_auth_error(
-                "Provider request auth configuration is unsupported",
-            ));
-        }
-        let authorized = verify_provider_request_hmac_token(
-            &provider.provider,
-            &provider.key,
-            &token,
-            &request,
-        )?;
-        let request_id = request.request_id.as_deref().unwrap_or_default();
-        self.record_provider_request_authorization(&authorized, request_id)
-            .await?;
-        let user_id = format!(
-            "provider_authorized:{}:{}",
-            authorized.provider_id, authorized.external_subject
-        );
-        let username_len = authorized.external_subject.chars().count();
-        if username_len > USERNAME_MAX_LEN {
-            return Err(provider_request_auth_error(
-                "Provider request external subject exceeds the Astra username limit",
-            ));
-        }
-        if user_id.chars().count() > USER_ID_MAX_LEN {
-            return Err(provider_request_auth_error(
-                "Provider-authorized user principal exceeds the Astra user_id limit",
-            ));
-        }
-        Ok(AuthPrincipal::from_provider_request(
-            AuthUserRecord {
-                user_id,
-                username: authorized.external_subject.clone(),
-                email: String::new(),
-                display_name: None,
-            },
-            AuthProviderAuthorizedRequestContext {
-                provider_id: authorized.provider_id,
-                external_subject: authorized.external_subject,
-                provider_scope_id: authorized.provider_scope_id,
-                request_authorization_id: authorized.request_authorization_id,
-                // Provider-request (HMAC server-to-server) calls carry no edge binding.
-                edge_agent_id: None,
-            },
-        ))
+        self.verify_request_principal(headers, request)
+            .await
+            .map(|result| result.principal)
+    }
+
+    async fn current_principal_for_request_with_provenance(
+        &self,
+        headers: &HeaderMap,
+        request: ProviderRequestDescriptor,
+    ) -> Result<RequestAuthResult, (StatusCode, Json<ErrorResponse>)> {
+        self.verify_request_principal(headers, request).await
     }
 
     async fn edge_registration_binding(

@@ -147,9 +147,9 @@ pub use auth::{
     ExternalProviderClient, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
     ExternalRuntimeContextResponse, FernetTokenEncryptor, HttpExternalProviderClient,
     ProviderRequestDescriptor, ProviderSessionCreationIdentity, ReauthenticationProofRecord,
-    ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
-    SessionCreationResult, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData,
+    ReauthenticationPurpose, ReauthenticationRequestData, RequestAuthMechanism, RequestAuthResult,
+    SessionCreateRequestData, SessionCreationResult, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use context::{
     ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
@@ -293,7 +293,8 @@ pub use session_context_coordinator::{
     TransferWriterOutcome, WriterTransferConflictV1, WriterTransferRequestV1,
 };
 pub use session_fork_coordinator::{
-    DatabaseSessionForkCoordinator, PrepareSessionForkV1, SessionForkCoordinatorError,
+    DatabaseSessionForkCoordinator, PrepareSessionForkV1, SessionForkContinuationV1,
+    SessionForkCoordinatorError,
 };
 pub use session_handoff::{
     AttachSessionOutcomeV1, AttachSessionRequestV1, ClaimSessionControllerOutcomeV1,

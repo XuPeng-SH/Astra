@@ -106,6 +106,14 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             post(session::session_handlers::activate_session_handoff_handler),
         )
         .route(
+            "/sessions/{session_id}/runs/{run_id}/cursor",
+            get(session::session_handlers::get_session_run_cursor_handler),
+        )
+        .route(
+            "/sessions/{session_id}/forks/{fork_id}/activate-for-continuation",
+            post(session::session_handlers::activate_session_fork_for_continuation_handler),
+        )
+        .route(
             "/sessions/{session_id}/forks",
             get(session::session_handlers::list_session_forks_handler)
                 .post(session::session_handlers::prepare_session_fork_handler),
