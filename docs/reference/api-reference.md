@@ -161,6 +161,13 @@ responses from changing the current view.
 
 ## Active run permission mode
 
+### POST /chat/runs/{run_id}/resume
+
+Run lists (`GET /runs`), Session Run trees (`GET /sessions/{id}/runs`), and
+resume preflight return `503` when their saved Run state cannot be read, with a
+neutral retry message and no storage details or error code. Missing and
+foreign-owned Runs return `404`. A rejected preflight does not change the Run.
+
 ### POST /chat/runs/{run_id}/permission-mode
 
 The authenticated owner can select a permission policy for an active root run.
@@ -431,39 +438,22 @@ All events in a causal chain.
 
 ---
 
-## Context Snapshots
+## Retired diagnostic products
 
-### POST /context
+The generic `/context` and `/decisions` CRUD/audit endpoints, table-backed
+`/introspection/context/{trend,snapshot,retrieval_quality}` and
+`/introspection/decision-trace`, Server `/sessions/{id}/harness/*` and
+`/admin/harness/sessions`, and self-reported
+`/skills/user/{skill_name}/evaluations` endpoint are removed. Their stored
+payloads have no replacement import or history API. Server harness snapshot
+streaming is also removed; the harness kernel/verifiers and CLI `/inspect`
+remain available.
 
-Create a context snapshot (records exact LLM input before a call).
-
-### GET /context
-
-Query params: `session_id`, `limit`, `after_created_at`, and
-`after_context_capture_id`. The two `after_*` values form a seek cursor and
-must be provided together.
-
-### GET /context/{snapshot_id}
-
----
-
-## Decision Audit
-
-### POST /decisions
-
-Record a decision with link to context snapshot.
-
-### GET /decisions
-
-Query params: `session_id`, `decision_type`, `limit`, `after_created_at`, and
-`after_decision_id`. The two `after_*` values form a seek cursor and must be
-provided together.
-
-### GET /decisions/{decision_id}
-
-### GET /decisions/{decision_id}/audit
-
-Full audit: decision + linked context snapshot + source events.
+`/chat/session/{id}/decision-trace` continues to reflect captured execution
+events and semantic/model evidence. The retired diagnostic source and its old count are omitted from current coverage;
+normal views do not carry retirement warnings. Personal-skill authoring,
+publishing and activation remain supported; activation commits its canonical
+`ui.skill.activate` event and current active-skill state atomically.
 
 ---
 

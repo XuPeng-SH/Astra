@@ -192,6 +192,7 @@ async fn insert_run_row(
     retry_of: Option<&str>,
     retry_scope: &str,
 ) {
+    let mut tx = pool.get().begin().await.unwrap();
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
@@ -210,9 +211,17 @@ async fn insert_run_row(
         .bind(retry_of)
         .bind(retry_scope)
         .bind(status)
-        .execute(pool.get())
+        .execute(&mut *tx)
         .await
         .expect("insert_run_row must persist run tree node");
+    sqlx::query("INSERT INTO agent_run_openings (user_id, run_id, session_id) VALUES (?, ?, ?)")
+        .bind(user_id)
+        .bind(run_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
 
 async fn insert_state_item(
@@ -250,7 +259,7 @@ async fn insert_state_item(
 
 fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRecord {
     DurableRunRecord {
-        opening: None,
+        opening: Default::default(),
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
@@ -271,8 +280,7 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         owner_lease_expires_at: None,
         run_generation: 0,
         last_event_idx: -1,
-        checkpoint_version: None,
-        checkpoint_json: None,
+        current_checkpoint: None,
         error_code: None,
         error_message: None,
 
@@ -818,6 +826,7 @@ async fn cleanup_joint_run(pool: &SharedPool, user_id: &str, run_id: &str) {
     for sql in [
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
     ] {
         sqlx::query(sql)
@@ -1547,25 +1556,6 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     .execute(pool.get())
     .await
     .expect("S07 approval condition update must persist");
-    for condition in [
-        "target_branch == main",
-        "target_branch == main AND tests_green == true",
-    ] {
-        sqlx::query(
-            "INSERT INTO session_state_item_events
-             (event_id, item_id, user_id, session_id, category, item_key, mutation, payload_json, created_at)
-             VALUES (?, ?, ?, ?, 'approval_state', 'release-approval', 'apply_suggestion', ?, NOW(6))",
-        )
-        .bind(id("state-event"))
-        .bind(&approval_item)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(json!({"condition": condition, "approval_id": approval_id}).to_string())
-        .execute(pool.get())
-        .await
-        .expect("S07 approval condition event chain must persist");
-    }
-
     post_user_intent(
         &client,
         addr,
@@ -1821,6 +1811,15 @@ async fn e2e_joint_4_s10_five_level_delegation_and_retry_node() {
         "S10 original executor run must be superseded, got {superseded}"
     );
     handle.abort();
+    let _ = handle.await;
+    astra_services::auth::session::SessionService::delete_session(
+        &astra_services::auth::session::DatabaseSessionService::new(pool.settings().clone())
+            .with_pool(pool.clone()),
+        session_id,
+        user_id,
+    )
+    .await
+    .expect("clean S10 Run tree and Session");
 }
 
 #[tokio::test]

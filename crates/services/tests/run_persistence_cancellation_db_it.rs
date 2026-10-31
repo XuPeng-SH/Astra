@@ -21,6 +21,7 @@ use uuid::Uuid;
 const TEST_OWNER_POD_ID: &str = "run-persistence-cancel-owner";
 
 async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
+    let mut tx = pool.begin().await.expect("begin run fixture");
     sqlx::query(
         "INSERT INTO agent_sessions
          (session_id, user_id, status, event_count, project_retention_policy,
@@ -29,7 +30,7 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
     )
     .bind(session_id)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("seed run persistence session");
     sqlx::query(
@@ -39,7 +40,7 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
     )
     .bind(user_id)
     .bind(session_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("seed run persistence lifecycle fence");
     sqlx::query(
@@ -59,9 +60,17 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
     .bind(run_id)
     .bind(run_id)
     .bind(TEST_OWNER_POD_ID)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("seed run persistence run");
+    sqlx::query("INSERT INTO agent_run_openings (user_id, run_id, session_id) VALUES (?, ?, ?)")
+        .bind(user_id)
+        .bind(run_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .expect("seed empty run opening");
+    tx.commit().await.expect("commit complete run fixture");
 }
 
 async fn hold_pool_checkouts(
@@ -83,6 +92,7 @@ async fn hold_pool_checkouts(
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     for statement in [
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
     ] {
         sqlx::query(statement)

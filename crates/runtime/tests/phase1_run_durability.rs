@@ -85,7 +85,7 @@ fn test_ids() -> (String, String, String) {
 
 fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRecord {
     DurableRunRecord {
-        opening: None,
+        opening: Default::default(),
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
@@ -106,8 +106,7 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         owner_lease_expires_at: None,
         run_generation: 0,
         last_event_idx: -1,
-        checkpoint_version: None,
-        checkpoint_json: None,
+        current_checkpoint: None,
         error_code: None,
         error_message: None,
 
@@ -808,5 +807,91 @@ async fn l3_s10_retry_scope_is_persisted_for_retry_runs() {
     let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(loaded.retry_scope.as_deref(), Some("subtree"));
     assert!(loaded.retry_of.is_some());
+}
+}
+
+shared_db_test! {
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn durable_reads_hide_corrupt_storage() {
+    let pool = setup_pool().await;
+    for damage in ["healthy", "checkpoint", "opening"] {
+        let (run, session, user) = test_ids();
+        insert_session(&pool, &user, &session).await;
+        let store = Arc::new(DatabaseRunStateStore::new(pool.clone()));
+        store.insert_run(durable_record(&run, &session, &user)).await.unwrap();
+        if damage == "checkpoint" {
+            store.save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+                user_id: &user, expected_session_id: &session, run_id: &run,
+                checkpoint_json: r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"preflight"}"#,
+                authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane,
+            }).await.unwrap().unwrap();
+            sqlx::query("UPDATE agent_runs SET current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?")
+                .bind("z".repeat(64)).bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+        } else if damage == "opening" {
+            sqlx::query("DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?")
+                .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+        }
+        let snapshot = || async {
+            sqlx::query_as::<_, (String, i64, i64, Option<String>, i64, i64)>(
+                "SELECT status, run_generation, last_event_idx, current_checkpoint_hash,
+                    (SELECT COUNT(*) FROM agent_run_events e WHERE e.user_id = r.user_id AND e.run_id = r.run_id),
+                    (SELECT COUNT(*) FROM run_checkpoints c WHERE c.user_id = r.user_id AND c.run_id = r.run_id)
+                 FROM agent_runs r WHERE user_id = ? AND run_id = ?"
+            ).bind(&user).bind(&run).fetch_one(pool.get()).await.unwrap()
+        };
+        let before = snapshot().await;
+        // The Session stub permits the foreign tree request so this also
+        // exercises store-level Run filtering; production rejects that Session
+        // at its ownership lookup before reaching the Run reader.
+        for foreign in [false, true] {
+            let app = build_phase1_http_app(pool.clone(), if foreign { format!("foreign-{user}") } else { user.clone() }, store.clone());
+            // Both metadata routes share the presentation boundary; concurrent
+            // reads must retain ownership filtering without mutating state.
+            let request = |path: String| Request::builder().uri(path)
+                .header("authorization", HTTP_TOKEN).body(Body::empty()).unwrap();
+            let (list, tree) = tokio::join!(
+                app.clone().oneshot(request("/runs".into())),
+                app.clone().oneshot(request(format!("/sessions/{session}/runs"))),
+            );
+            for response in [list.unwrap(), tree.unwrap()] {
+                let failed = !foreign && damage == "checkpoint";
+                assert_eq!(response.status(), if failed { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK });
+                let bytes = body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                if failed {
+                    assert_eq!(body["detail"], "Unable to load this run right now. Please try again later.");
+                    assert!(body["error_code"].is_null());
+                } else {
+                    let runs = body["runs"].as_array().unwrap();
+                    assert_eq!(runs.len(), if foreign { 0 } else { 1 });
+                    if !foreign { assert_eq!(runs[0]["run_id"], run); }
+                }
+            }
+            let response = app.oneshot(Request::builder().method("POST")
+                .uri(format!("/chat/runs/{run}/resume"))
+                .header("authorization", HTTP_TOKEN).body(Body::empty()).unwrap()).await.unwrap();
+            let expected = if foreign { StatusCode::NOT_FOUND } else if damage == "healthy" { StatusCode::CONFLICT } else { StatusCode::SERVICE_UNAVAILABLE };
+            assert_eq!(response.status(), expected, "{damage}, foreign={foreign}");
+            let bytes = body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let wire = String::from_utf8(bytes.to_vec()).unwrap();
+            let body: Value = serde_json::from_str(&wire).unwrap();
+            for internal in ["agent_runs", "agent_run_openings", "checkpoint_hash", "decode_run_row", "opening_events_json", "projection"] {
+                assert!(!wire.contains(internal), "internal detail leaked: {wire}");
+            }
+            if !foreign && damage != "healthy" {
+                assert_eq!(body["detail"], "Unable to load this run right now. Please try again later.");
+                assert!(body["error_code"].is_null());
+            }
+            assert_eq!(snapshot().await, before, "failed resume must not mutate durable state");
+        }
+        // Restore the deliberately damaged pair before normal Session cleanup.
+        if damage == "opening" {
+            sqlx::query("INSERT INTO agent_run_openings (user_id,run_id,session_id) VALUES (?,?,?)")
+                .bind(&user).bind(&run).bind(&session).execute(pool.get()).await.unwrap();
+        }
+        use astra_services::auth::session::SessionService;
+        astra_services::auth::session::DatabaseSessionService::new(pool.settings().clone()).with_pool(pool.clone())
+            .delete_session(session, user).await.unwrap();
+    }
 }
 }
