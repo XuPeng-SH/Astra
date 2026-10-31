@@ -11085,9 +11085,9 @@ const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, eve
             producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
      FROM agent_run_events WHERE user_id = ";
 
-// Select positions using narrow columns before reading any payload. In
-// particular, an existing finalized row excludes finished even if its JSON is
-// corrupt or has no data. NULL means absent; event index zero remains valid.
+// Select positions using narrow columns before reading any payload, including
+// the latest physical run_finished. Canonical terminal receipt projections are
+// added by the reader. NULL means absent; event index zero remains valid.
 const RUN_STATUS_FACTS_SELECT_SQL: &str = "WITH selected AS (
  SELECT MIN(CASE WHEN event_type='run_started' THEN event_idx END) AS started,
         MIN(CASE WHEN event_type='workspace_bound' THEN event_idx END) AS workspace,
@@ -18897,10 +18897,10 @@ impl RunStateStore for DatabaseRunStateStore {
                 user_id,
                 expected_session_id,
                 run_id,
-                if events.iter().any(|event| {
-                    event.get("event_type").and_then(serde_json::Value::as_str)
-                        == Some(crate::model_routing::EVENT_TYPE)
-                }) {
+                if events
+                    .iter()
+                    .any(|event| extract_event_type(event) == crate::model_routing::EVENT_TYPE)
+                {
                     RunProjection::Opening
                 } else {
                     RunProjection::Control

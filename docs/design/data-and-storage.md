@@ -23,12 +23,6 @@ delegation-state mirror. Run display is rendered on read from canonical Run, eve
 There is no display table, background mirror repair, or display hash in a
 terminal receipt. Lost-ACK reconciliation validates the actual canonical facts.
 
-Session state projections remain owned by personal-skill activation and
-user-anchor memory. The unused general state-item upsert API and generic mutation
-validator are retired. Session lifecycle fencing, projection reads, artifact
-reference accounting, and retention remain owned by the existing storage
-boundaries.
-
 The unused general authority-event query source API is retired; canonical
 Session authority still persists owner-scoped audit facts. Handoff fencing
 verification reads the exact rejected reservation, including its old lease and
@@ -50,11 +44,10 @@ primary key prevents identity reuse without a separate identity table.
 
 ## Persistence simplification boundary
 
-The production schema inventory contains 117 table declarations. This wave
-retires five additional declarations (`ctx_snapshots`, `ctx_decision_audits`,
-`harness_snapshots`, `session_state_item_events`, `user_skill_evaluations`) and
-adds the immutable `agent_run_openings` payload owner. Earlier retirement of
-ten declarations is already part of the baseline.
+The production schema inventory contains 112 table declarations. The earlier
+retirement of diagnostic projections and separation of immutable Run openings
+are already part of the baseline. This wave removes the five authoring and
+adaptation tables listed below; it adds no replacement table.
 
 | Journey | Boundary and disposition |
 | --- | --- |
@@ -84,13 +77,13 @@ those diagnostic histories. Production defaults already disabled these writes,
 so this does not imply a write reduction on every default production exchange.
 Actual provider usage/cache facts and explicit full captures remain independent.
 
-The diagnostic-only artifact manifest counter is removed with its sole writer.
-Artifacts protected only by that counter now become eligible at their original
-retention deadline. All generic durable reference kinds, state/citation counts,
-byte-content references and upload protocols retain their existing transactions.
+Fresh schemas carry no diagnostic-only artifact manifest or state-item counter.
+Retained durable reference kinds, citation counters, byte-content references and
+upload protocols keep their existing transactions and retention deadlines.
 
 This is a fresh empty database and same-version deployment contract. There is
-no new schema marker, migration, compatibility API or old-data cleanup. Strict
+no additional marker mechanism, migration, compatibility API or old-data cleanup.
+The existing schema contract version advances to v117 and rejects earlier versions. Strict
 request-context JSON decoding is not promised for historical payloads. Existing
 engine snapshots and in-flight old Git operations are not reconciled by the new
 build; stop old workers before handing their workspaces to a new deployment.
@@ -197,11 +190,9 @@ An older completion marker is rejected and requires a new database. Interrupted
 fresh bootstrap can retry under the existing database lease, with readiness
 published only after schema validation succeeds.
 
-Agent metadata is persisted by the database service. Its unused alternative
-in-memory CRUD implementation and self-tests are retired; the unconfigured
-service remains explicit. The owner/name unique constraint is enforced by the
-database, and create or rename conflicts now return HTTP 409 rather than 500.
-Other SQL and malformed persisted-data errors retain their 500 behavior.
+The standalone Agent configuration catalog and its CRUD service are retired.
+Edge registration, heartbeat, AgentBindings and Run execution retain their
+canonical owners; no replacement Agent metadata projection is stored.
 
 ## Session-memory recovery journal
 
@@ -294,8 +285,7 @@ activation, tool outcomes, semantic decision evidence and observer dispatch reta
 existing owners. The metadata-only Sandbox CRUD API and its database-snapshot
 alias are removed; execution isolation belongs to the selected capacity provider
 and workspace. Marketplace report aggregation, global quality statistics and
-ranked search are removed; registry visibility, installation and personal-skill
-authoring, publishing and activation remain. No replacement projections or compatibility paths are added.
+ranked search are removed; registry visibility, installation, publishing and executable activation remain. No replacement projections or compatibility paths are added.
 These cuts apply to fresh databases. They do not delete existing physical tables
 or historical rows, and do not define a mixed-version deployment or data-retention
 transition.
@@ -514,16 +504,6 @@ Archival should preserve allowed metadata while removing or redacting payloads a
 - artifact manifests;
 - eval cases that include private payloads.
 
-## Router deployment state
-
-Fresh schema contract `2026-09-27-v90` adds `model_router_deployments`, keyed by
-owner, with a compare-and-swap revision and typed deployment/revocation JSON. This
-is C0 tuning control state. Mutations and existing `auth_audit_logs` entries share
-one transaction. Routing decisions and reviewed outcomes continue to use
-`agent_run_events`; dashboard queries are bounded projections of that ledger.
-As with the canonical bootstrap policy above, older schema markers are rejected;
-this change does not implement an in-place migration or backfill.
-
 Compressed conversation history is an immutable `context_history_v1` session
 artifact, referenced by `session_transcript` with the owning session ID. It
 remains reachable until the existing owned-session deletion releases its
@@ -702,3 +682,26 @@ rows when its index returned nothing. No generated occupancy fields, new owner
 state or transcript counters are added to mask that behavior. The current
 schema therefore retains the existing admission and raw-history owners; this
 PR does not claim all remaining queries have history-independent cost.
+
+## Retired authoring and adaptation state
+
+Fresh schema contract `2026-10-31-v117` removes `agent_agents`,
+`user_skill_sources`, `user_skill_versions`, `session_state_items` and
+`model_router_deployments`, and removes the state-item artifact pin counter.
+Executable AgentBindings, Skills, Work graphs, explicit Memory, canonical Run
+and Context records remain with their existing owners. Session state reads no
+longer aggregate state-item summaries or user-anchor projections. Platform
+snapshot reads no longer query the Agent configuration catalog. Configured Auto
+routing no longer queries a deployment registry.
+
+The existing bootstrap contract rejects earlier database versions before Server
+state, listeners or sweepers start. This is a fresh-database cutover, with no
+migration or compatibility path. It does not transfer existing users, Sessions,
+Runs, Work or artifacts. Keep old databases and backups separate; stop old pods
+and settle in-flight custody/effects before switching deployments. Never point
+the new retention sweeper at an unbootstrapped old pool: direct library helpers
+are not Server startup and do not perform contract admission themselves.
+
+Artifact retention keeps citation counters and durable reference edges. The
+retired `state_item` reference kind is rejected; retained kinds continue to pin
+payloads until their owning lifecycle releases them.

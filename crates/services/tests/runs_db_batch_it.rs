@@ -2376,189 +2376,215 @@ async fn batched_probe_conflicts_collation_and_overlapping_writers_preserve_atom
 /// Opt-in database capacity probe, not a claim about 1,000 running LLM loops.
 /// Compare one and four independent pool/store owners at the same total quota.
 #[cfg(feature = "capacity-probes")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated MatrixOne; opt in with --features capacity-probes"]
-async fn thousand_session_append_preserves_results_across_independent_pools() {
+async fn assert_thousand_session_append_preserves_results(replicas: usize) {
+    let total_started = std::time::Instant::now();
     use futures_util::{StreamExt, future::join_all, stream};
     let (bootstrap, mut settings) = common::setup_pool_and_settings().await;
     isolated_database::require_isolated_database(&settings.database);
-    for replicas in [1_usize, 4] {
-        let prefix = common::id("append-scale");
-        settings.db_pool_max_connections = 32 / replicas as u32;
-        settings.db_pool_min_connections = 0;
-        let mut pools = Vec::new();
-        let mut stores = Vec::new();
-        for replica in 0..replicas {
-            let pool = SharedPool::new(&settings).await.unwrap();
-            stores.push(
-                DatabaseRunStateStore::new(pool.clone())
-                    .with_owner_pod_id(format!("scale-{replica}")),
-            );
-            pools.push(pool);
-        }
-        let identities: Vec<_> = (0..1000)
-            .map(|n| {
-                (
-                    format!("{prefix}-u{}", n / 10),
-                    format!("{prefix}-s{n}"),
-                    format!("{prefix}-r{n}"),
-                )
-            })
-            .collect();
-        stream::iter(identities.iter().enumerate())
-            .for_each_concurrent(32, |(n, (user, session, run))| {
-                let pool = &pools[n % replicas];
-                let store = &stores[n % replicas];
-                async move {
-                    insert_run_fixture(
-                        pool,
-                        store,
-                        durable_run_record(run.clone(), user.clone(), session.clone()),
-                    )
-                    .await;
-                }
-            })
-            .await;
-        let batch: Vec<_> = (0..16)
-            .map(|n| make_idempotent_event("agent_progress", &format!("scale-{n}"), json!({"n":n})))
-            .collect();
-        for replay in [false, true] {
-            let barrier = Arc::new(tokio::sync::Barrier::new(1000));
-            let started = std::time::Instant::now();
-            let calls = identities
-                .iter()
-                .enumerate()
-                .map(|(n, (user, session, run))| {
-                    // Replay through a different replica, not an instance-local cache.
-                    let store = &stores[(n + usize::from(replay)) % replicas];
-                    let batch = &batch;
-                    let barrier = barrier.clone();
-                    async move {
-                        barrier.wait().await;
-                        let started = std::time::Instant::now();
-                        let result = store.append_events_batch(user, session, run, batch).await;
-                        (result, started.elapsed().as_micros())
-                    }
-                });
-            let results = tokio::time::timeout(Duration::from_secs(120), join_all(calls))
-                .await
-                .unwrap();
-            let mut latencies: Vec<_> = results
-                .into_iter()
-                .map(|(result, elapsed)| {
-                    result.unwrap();
-                    elapsed
-                })
-                .collect();
-            latencies.sort_unstable();
-            eprintln!(
-                "append_scale replicas={replicas} total_connections=32 sessions=1000 owners=100 replay={replay} wall_ms={} p50_us={} p95_us={} p99_us={}",
-                started.elapsed().as_millis(),
-                latencies[499],
-                latencies[949],
-                latencies[989]
-            );
-            let bad: i64 = sqlx::query_scalar(
-                "SELECT CAST(COUNT(*) AS SIGNED) FROM (
-                   SELECT runs.run_id FROM agent_runs runs
-                   LEFT JOIN agent_run_events events
-                     ON events.user_id = runs.user_id AND events.run_id = runs.run_id
-                   WHERE runs.user_id LIKE ? GROUP BY runs.run_id
-                   HAVING COUNT(events.id) <> 17 OR MIN(events.event_idx) <> 0
-                       OR MAX(events.event_idx) <> 16 OR MAX(runs.last_event_idx) <> 16
-                 ) invalid_runs",
+    let prefix = common::id("append-scale");
+    settings.db_pool_max_connections = 32 / replicas as u32;
+    settings.db_pool_min_connections = 0;
+    let mut pools = Vec::new();
+    let mut stores = Vec::new();
+    for replica in 0..replicas {
+        let pool = SharedPool::new(&settings).await.unwrap();
+        stores.push(
+            DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(format!("scale-{replica}")),
+        );
+        pools.push(pool);
+    }
+    let identities: Vec<_> = (0..1000)
+        .map(|n| {
+            (
+                format!("{prefix}-u{}", n / 10),
+                format!("{prefix}-s{n}"),
+                format!("{prefix}-r{n}"),
             )
+        })
+        .collect();
+    let seed_started = std::time::Instant::now();
+    stream::iter(identities.iter().enumerate())
+        .for_each_concurrent(32, |(n, (user, session, run))| {
+            let pool = &pools[n % replicas];
+            let store = &stores[n % replicas];
+            async move {
+                insert_run_fixture(
+                    pool,
+                    store,
+                    durable_run_record(run.clone(), user.clone(), session.clone()),
+                )
+                .await;
+            }
+        })
+        .await;
+    eprintln!(
+        "seed_scale replicas={replicas} sessions=1000 wall_ms={}",
+        seed_started.elapsed().as_millis()
+    );
+    let batch: Vec<_> = (0..16)
+        .map(|n| make_idempotent_event("agent_progress", &format!("scale-{n}"), json!({"n":n})))
+        .collect();
+    for replay in [false, true] {
+        let barrier = Arc::new(tokio::sync::Barrier::new(1000));
+        let started = std::time::Instant::now();
+        let calls = identities
+            .iter()
+            .enumerate()
+            .map(|(n, (user, session, run))| {
+                // Replay through a different replica, not an instance-local cache.
+                let store = &stores[(n + usize::from(replay)) % replicas];
+                let batch = &batch;
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    let started = std::time::Instant::now();
+                    let result = store.append_events_batch(user, session, run, batch).await;
+                    (result, started.elapsed().as_micros())
+                }
+            });
+        let results = tokio::time::timeout(Duration::from_secs(120), join_all(calls))
+            .await
+            .unwrap();
+        let mut latencies: Vec<_> = results
+            .into_iter()
+            .map(|(result, elapsed)| {
+                result.unwrap();
+                elapsed
+            })
+            .collect();
+        latencies.sort_unstable();
+        eprintln!(
+            "append_scale replicas={replicas} total_connections=32 sessions=1000 owners=100 replay={replay} wall_ms={} p50_us={} p95_us={} p99_us={}",
+            started.elapsed().as_millis(),
+            latencies[499],
+            latencies[949],
+            latencies[989]
+        );
+        let bad: i64 = sqlx::query_scalar(
+            "SELECT CAST(COUNT(*) AS SIGNED) FROM (
+               SELECT runs.run_id FROM agent_runs runs
+               LEFT JOIN agent_run_events events
+                 ON events.user_id = runs.user_id AND events.run_id = runs.run_id
+               WHERE runs.user_id LIKE ? GROUP BY runs.run_id
+               HAVING COUNT(events.id) <> 17 OR MIN(events.event_idx) <> 0
+                   OR MAX(events.event_idx) <> 16 OR MAX(runs.last_event_idx) <> 16
+             ) invalid_runs",
+        )
+        .bind(format!("{prefix}%"))
+        .fetch_one(bootstrap.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            bad, 0,
+            "every run must retain its exact contiguous result after cross-replica replay"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id LIKE ?")
             .bind(format!("{prefix}%"))
             .fetch_one(bootstrap.get())
             .await
             .unwrap();
-            assert_eq!(
-                bad, 0,
-                "every run must retain its exact contiguous result after cross-replica replay"
-            );
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id LIKE ?")
-                    .bind(format!("{prefix}%"))
-                    .fetch_one(bootstrap.get())
-                    .await
-                    .unwrap();
-            assert_eq!(count, 1000);
-        }
-        let facts = [
-            json!({"event_type":"run_started","idempotency_key":"status-start","data":{"transport":"edge","explain_analyze_requested":true}}),
-            json!({"event_type":"workspace_bound","idempotency_key":"status-workspace","data":{"workspace":{"id":"scale-workspace"}}}),
-            json!({"event_type":"executor_bound","idempotency_key":"status-executor","data":{"executor":{"id":"scale-executor"}}}),
-            json!({"event_type":"run_finished","idempotency_key":"status-finish","data":{"prompt_tokens":10}}),
-            json!({"event_type":"run_accounting_finalized","idempotency_key":"status-accounting","data":{"prompt_tokens":20}}),
-            json!({"event_type":"run_finished","idempotency_key":"status-later-finish","data":{"prompt_tokens":99}}),
-        ];
-        eprintln!("status_fixture replicas={replicas} prefix={prefix}");
-        // Both empty and populated facts must work through another pool owner.
-        for populated in [false, true] {
-            if populated {
-                stream::iter(identities.iter().enumerate())
-                    .for_each_concurrent(32, |(n, (user, session, run))| {
-                        let store = &stores[n % replicas];
-                        let facts = &facts;
-                        async move {
-                            store
-                                .append_events_batch(user, session, run, facts)
-                                .await
-                                .unwrap();
-                        }
-                    })
-                    .await;
-            }
-            let started = std::time::Instant::now();
-            let statuses = identities
-                .iter()
-                .enumerate()
-                .map(|(n, (user, session, run))| {
-                    let store = &stores[(n + 1) % replicas];
-                    async move {
-                        let started = std::time::Instant::now();
-                        let status = store
-                            .load_run_status_snapshot(user, run)
-                            .await
-                            .unwrap()
-                            .unwrap();
-                        assert_eq!(
-                            (&status.user_id, &status.session_id, &status.run_id),
-                            (user, session, run)
-                        );
-                        assert_eq!(status.last_event_idx, if populated { 22 } else { 16 });
-                        assert_eq!(status.explain_requested, populated);
-                        if populated {
-                            assert_eq!(status.workspace.unwrap()["id"], "scale-workspace");
-                            assert_eq!(status.executor.unwrap()["id"], "scale-executor");
-                            assert_eq!(status.transport.as_deref(), Some("edge"));
-                            assert_eq!(status.accounting.unwrap()["prompt_tokens"], 20);
-                        } else {
-                            assert!(
-                                status.workspace.is_none()
-                                    && status.executor.is_none()
-                                    && status.accounting.is_none()
-                            );
-                        }
-                        started.elapsed().as_micros()
-                    }
-                });
-            let mut latencies = tokio::time::timeout(Duration::from_secs(120), join_all(statuses))
-                .await
-                .unwrap();
-            latencies.sort_unstable();
-            eprintln!(
-                "status_scale replicas={replicas} populated={populated} total_connections=32 sessions=1000 owners=100 wall_ms={} p50_us={} p95_us={}",
-                started.elapsed().as_millis(),
-                latencies[499],
-                latencies[949]
-            );
-        }
-        drop(stores);
-        for pool in pools {
-            pool.close().await;
-        }
+        assert_eq!(count, 1000);
     }
+    let facts = [
+        json!({"event_type":"run_started","idempotency_key":"status-start","data":{"transport":"edge","explain_analyze_requested":true}}),
+        json!({"event_type":"workspace_bound","idempotency_key":"status-workspace","data":{"workspace":{"id":"scale-workspace"}}}),
+        json!({"event_type":"executor_bound","idempotency_key":"status-executor","data":{"executor":{"id":"scale-executor"}}}),
+        json!({"event_type":"run_finished","idempotency_key":"status-finish","data":{"prompt_tokens":10}}),
+        json!({"event_type":"run_finished","idempotency_key":"status-later-finish","data":{"prompt_tokens":99}}),
+    ];
+    eprintln!("status_fixture replicas={replicas} prefix={prefix}");
+    // Empty and populated facts use the next store; four replicas exercise
+    // a different pool owner, while the one-replica case stays on one pool.
+    for populated in [false, true] {
+        if populated {
+            let facts_started = std::time::Instant::now();
+            stream::iter(identities.iter().enumerate())
+                .for_each_concurrent(32, |(n, (user, session, run))| {
+                    let store = &stores[n % replicas];
+                    let facts = &facts;
+                    async move {
+                        store
+                            .append_events_batch(user, session, run, facts)
+                            .await
+                            .unwrap();
+                    }
+                })
+                .await;
+            eprintln!(
+                "facts_scale replicas={replicas} sessions=1000 wall_ms={}",
+                facts_started.elapsed().as_millis()
+            );
+        }
+        let started = std::time::Instant::now();
+        let statuses = identities
+            .iter()
+            .enumerate()
+            .map(|(n, (user, session, run))| {
+                let store = &stores[(n + 1) % replicas];
+                async move {
+                    let started = std::time::Instant::now();
+                    let status = store
+                        .load_run_status_snapshot(user, run)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        (&status.user_id, &status.session_id, &status.run_id),
+                        (user, session, run)
+                    );
+                    assert_eq!(status.last_event_idx, if populated { 21 } else { 16 });
+                    assert_eq!(status.explain_requested, populated);
+                    if populated {
+                        assert_eq!(status.workspace.unwrap()["id"], "scale-workspace");
+                        assert_eq!(status.executor.unwrap()["id"], "scale-executor");
+                        assert_eq!(status.transport.as_deref(), Some("edge"));
+                        assert_eq!(status.accounting.unwrap()["prompt_tokens"], 99);
+                    } else {
+                        assert!(
+                            status.workspace.is_none()
+                                && status.executor.is_none()
+                                && status.accounting.is_none()
+                        );
+                    }
+                    started.elapsed().as_micros()
+                }
+            });
+        let mut latencies = tokio::time::timeout(Duration::from_secs(120), join_all(statuses))
+            .await
+            .unwrap();
+        latencies.sort_unstable();
+        eprintln!(
+            "status_scale replicas={replicas} populated={populated} total_connections=32 sessions=1000 owners=100 wall_ms={} p50_us={} p95_us={}",
+            started.elapsed().as_millis(),
+            latencies[499],
+            latencies[949]
+        );
+    }
+    let teardown_started = std::time::Instant::now();
+    drop(stores);
+    for pool in pools {
+        pool.close().await;
+    }
+    bootstrap.close().await;
+    eprintln!(
+        "total_scale replicas={replicas} sessions=1000 teardown_ms={} total_ms={}",
+        teardown_started.elapsed().as_millis(),
+        total_started.elapsed().as_millis()
+    );
+}
+
+#[cfg(feature = "capacity-probes")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne; opt in with --features capacity-probes"]
+async fn thousand_session_append_preserves_results_one_pool() {
+    assert_thousand_session_append_preserves_results(1).await;
+}
+
+#[cfg(feature = "capacity-probes")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne; opt in with --features capacity-probes"]
+async fn thousand_session_append_preserves_results_four_pools() {
+    assert_thousand_session_append_preserves_results(4).await;
 }
 
 /// Dedup + non-keyed events: events without idempotency_key are never affected
@@ -3026,11 +3052,11 @@ async fn assert_auto_model_routing_commit(
     store: &dyn RunStateStore,
     run: &DurableRunRecord,
     pool: Option<&SharedPool>,
+    discriminator: &str,
 ) {
     use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
     use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
     let decision = ModelRoutingDecision {
-        rollout: None,
         schema_version: 2,
         features: None,
         policy_version: "easy-read-only-v1".into(),
@@ -3048,8 +3074,54 @@ async fn assert_auto_model_routing_commit(
         delegation_model_requirement: None,
         delegation_model_source: None,
     };
-    let event =
+    let mut event =
         json!({"event_type": EVENT_TYPE, "idempotency_key": DECISION_KEY, "data": decision});
+    if discriminator == "type" {
+        let kind = event.as_object_mut().unwrap().remove("event_type").unwrap();
+        event["type"] = kind;
+    }
+    // Reject retired provenance and unknown policies through the same fenced
+    // append used by production, without changing the baseline or event cursor.
+    let before = store
+        .load_run(&run.user_id, &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for change in [
+        json!({"rollout": null}),
+        json!({"rollout": {"cohort": "control"}}),
+        json!({"rollout": {"cohort": "shadow"}}),
+        json!({"rollout": {"cohort": "treatment"}}),
+        json!({"policy_version": "learned-canary-v1"}),
+        json!({"policy_version": "unknown-policy"}),
+    ] {
+        let mut rejected = event.clone();
+        rejected["data"]
+            .as_object_mut()
+            .unwrap()
+            .extend(change.as_object().unwrap().clone());
+        assert!(
+            store
+                .append_events_if_current_generation_and_status(
+                    &run.user_id,
+                    &run.session_id,
+                    &run.run_id,
+                    run.run_generation,
+                    &["running"],
+                    &[rejected],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_run(&run.user_id, &run.run_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
     if let Some(pool) = pool {
         let before = store
             .load_run(&run.user_id, &run.run_id)
@@ -3192,7 +3264,7 @@ async fn assert_auto_model_routing_commit(
         !unchanged
             .events
             .iter()
-            .any(|e| e["event_type"] == EVENT_TYPE)
+            .any(|e| astra_services::runs::extract_event_type(e) == EVENT_TYPE)
     );
     for _ in 0..2 {
         assert!(
@@ -3223,7 +3295,7 @@ async fn assert_auto_model_routing_commit(
         committed
             .events
             .iter()
-            .filter(|e| e["event_type"] == EVENT_TYPE)
+            .filter(|e| astra_services::runs::extract_event_type(e) == EVENT_TYPE)
             .count(),
         1
     );
@@ -3278,17 +3350,19 @@ async fn assert_auto_model_routing_commit(
 
 #[tokio::test]
 async fn auto_model_routing_memory_commit_is_atomic_and_fenced() {
-    let store = astra_services::runs::InMemoryRunStateStore::new();
-    let mut run = durable_run_record(
-        "routing-memory".into(),
-        "routing-user".into(),
-        "routing-session".into(),
-    );
-    run.events = vec![make_event("run_started", json!({}))];
-    run.model_offering_id = Some("strong".into());
-    run.resolved_model_name = Some("strong-model".into());
-    store.insert_run(run.clone()).await.unwrap();
-    assert_auto_model_routing_commit(&store, &run, None).await;
+    for discriminator in ["event_type", "type"] {
+        let store = astra_services::runs::InMemoryRunStateStore::new();
+        let mut run = durable_run_record(
+            format!("routing-memory-{discriminator}"),
+            "routing-user".into(),
+            "routing-session".into(),
+        );
+        run.events = vec![make_event("run_started", json!({}))];
+        run.model_offering_id = Some("strong".into());
+        run.resolved_model_name = Some("strong-model".into());
+        store.insert_run(run.clone()).await.unwrap();
+        assert_auto_model_routing_commit(&store, &run, None, discriminator).await;
+    }
 }
 
 #[tokio::test]
@@ -3296,17 +3370,19 @@ async fn auto_model_routing_memory_commit_is_atomic_and_fenced() {
 async fn auto_model_routing_database_commit_is_atomic_and_fenced() {
     isolated_database::require_isolated_database(&common::require_db_it_env().database);
     let (pool, store) = setup().await;
-    let id = uuid::Uuid::new_v4().to_string();
-    let mut run = durable_run_record(
-        format!("routing-{id}"),
-        format!("routing-user-{id}"),
-        format!("routing-session-{id}"),
-    );
-    run.events = vec![make_event("run_started", json!({}))];
-    run.model_offering_id = Some("strong".into());
-    run.resolved_model_name = Some("strong-model".into());
-    insert_run_fixture(&pool, store.as_ref(), run.clone()).await;
-    assert_auto_model_routing_commit(store.as_ref(), &run, Some(&pool)).await;
+    for discriminator in ["event_type", "type"] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut run = durable_run_record(
+            format!("routing-{id}"),
+            format!("routing-user-{id}"),
+            format!("routing-session-{id}"),
+        );
+        run.events = vec![make_event("run_started", json!({}))];
+        run.model_offering_id = Some("strong".into());
+        run.resolved_model_name = Some("strong-model".into());
+        insert_run_fixture(&pool, store.as_ref(), run.clone()).await;
+        assert_auto_model_routing_commit(store.as_ref(), &run, Some(&pool), discriminator).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
