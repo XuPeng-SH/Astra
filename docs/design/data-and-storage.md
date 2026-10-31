@@ -101,10 +101,23 @@ build; stop old workers before handing their workspaces to a new deployment.
 in exactly one `agent_run_openings` row per Run, including Runs with no opening.
 The existing creation transaction writes both rows, initial events and admitted
 Context together. Full readers verify the opening hashes and reject a missing
-payload row; control/frames-only readers explicitly carry an unloaded body. Checkpoint
-writes use the same admitted and locked control projection: they validate the
-current checkpoint reference without loading or certifying the cold opening.
-Executable recovery and full reads retain opening integrity validation.
+payload row; control/frames-only readers explicitly carry an unloaded body.
+Control-only transactions use the existing admitted and locked control projection:
+recovery ownership claims, cancellation, terminal/pause transitions, checkpoint
+writes, ordinary generation-fenced event drains and user intent reconciliation.
+They validate control references without loading or certifying the cold opening.
+A recovery batch retains control records, rather than accumulating every
+candidate's immutable opening while its locks are held. A claim establishes
+custody and an authoritative frontier; it does not authorize execution.
+
+Fresh execution resume, explicit running/waiting status transitions,
+invocation-bound intents, Provider interactions and model-routing admission
+retain complete opening validation. Approval and AskUser waits/resolutions use
+control facts; resolving an existing live wait can return its executor to running
+without granting a fresh executor. Every exact-session
+locked read selects its projection explicitly, sharing the same Session admission,
+lock order, generation/lease/cancellation fences and transaction owner. No cache,
+additional SQL round trip or duplicate lifecycle state is introduced.
 Conversation selection, watermark and admitted opening bytes share one statement
 snapshot. Session deletion removes opening rows before Run rows.
 
@@ -116,6 +129,14 @@ B may still be newest by history creation order. Immutable handoff retries keep
 the original stored bytes and hash. Owner/generation/lease/cancellation admission,
 checkpoint persistence and the final Run CAS remain one transaction. Historical
 handoff-reference validation retains its separate custody/tail rules.
+
+The unused atomic-terminal write/replay API is removed. Runtime settlement uses
+one canonical terminal receipt owner, with Context/transcript orchestration in
+the lifecycle transaction. Shared control admission, physical control-event
+receipts and hash validation remain because canonical receipt resolution uses
+them. Out-of-tree Rust callers must use canonical settlement; no compatibility
+adapter or in-flight legacy settlement resolver is retained. Historical events
+remain readable through the ordinary event reader.
 
 The bounded terminal receipt and error remain on the Run row to preserve atomic
 terminal settlement without another write. Recency updates retain their existing
@@ -552,8 +573,8 @@ execution/usage use Run. Audit turn views over explicitly ingested client roots
 can therefore be empty for Server-only sessions; they do not certify whether a
 conversation or execution occurred.
 
-The immutable Run opening uses two canonical `LONGTEXT` columns on the same
-`agent_runs` row: `opening_events_json` holds admission facts and
+The immutable Run opening uses two canonical `LONGTEXT` columns on its
+`agent_run_openings` row: `opening_events_json` holds admission facts and
 `opening_context_json` holds the original input and an optional admitted Context
 base. Root and delegated Runs use the same input carrier. Generic creation
 recaptures admission facts, preserves exact input (including an empty string),
@@ -561,7 +582,7 @@ and rejects prebound Context authority; only the Root creation transaction may
 bind its captured Context grant. An input alone never authorizes Context access
 or skips the existing binding checks. The opening uses one v2 schema and hash
 framing, with no historical-data conversion or old-format read path.
-Each part is stored once, in the same Run INSERT. One opening hash covers
+Each part is stored once, in the same Run creation transaction. One opening hash covers
 the complete logical value, with an aggregate 8 MiB UTF-8 limit including JSON
 framing. Status, observation and opening replay read the event column directly;
 they do not extract it from a large Context document. Compact metadata reads

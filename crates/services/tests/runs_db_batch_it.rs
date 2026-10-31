@@ -3022,7 +3022,11 @@ async fn root_discovery_uses_admission_order_and_decodes_narrow_owner_scoped_ide
     }
 }
 
-async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &DurableRunRecord) {
+async fn assert_auto_model_routing_commit(
+    store: &dyn RunStateStore,
+    run: &DurableRunRecord,
+    pool: Option<&SharedPool>,
+) {
     use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
     use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
     let decision = ModelRoutingDecision {
@@ -3046,6 +3050,50 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
     };
     let event =
         json!({"event_type": EVENT_TYPE, "idempotency_key": DECISION_KEY, "data": decision});
+    if let Some(pool) = pool {
+        let before = store
+            .load_run(&run.user_id, &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original: String = sqlx::query_scalar(
+            "SELECT opening_events_json FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&run.user_id)
+        .bind(&run.run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
+        changed[0]["data"]["integrity_probe"] = json!(true);
+        sqlx::query("UPDATE agent_run_openings SET opening_events_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(changed.to_string()).bind(&run.user_id).bind(&run.run_id).execute(pool.get()).await.unwrap();
+        let error = store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                std::slice::from_ref(&event),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("immutable Run opening does not match its admitted identity"),
+            "{error}"
+        );
+        sqlx::query("UPDATE agent_run_openings SET opening_events_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(original).bind(&run.user_id).bind(&run.run_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            store
+                .load_run(&run.user_id, &run.run_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
     let mut batch = vec![event.clone()];
     batch.extend((0..24).map(|index| {
         json!({
@@ -3236,10 +3284,11 @@ async fn auto_model_routing_memory_commit_is_atomic_and_fenced() {
         "routing-user".into(),
         "routing-session".into(),
     );
+    run.events = vec![make_event("run_started", json!({}))];
     run.model_offering_id = Some("strong".into());
     run.resolved_model_name = Some("strong-model".into());
     store.insert_run(run.clone()).await.unwrap();
-    assert_auto_model_routing_commit(&store, &run).await;
+    assert_auto_model_routing_commit(&store, &run, None).await;
 }
 
 #[tokio::test]
@@ -3253,10 +3302,11 @@ async fn auto_model_routing_database_commit_is_atomic_and_fenced() {
         format!("routing-user-{id}"),
         format!("routing-session-{id}"),
     );
+    run.events = vec![make_event("run_started", json!({}))];
     run.model_offering_id = Some("strong".into());
     run.resolved_model_name = Some("strong-model".into());
     insert_run_fixture(&pool, store.as_ref(), run.clone()).await;
-    assert_auto_model_routing_commit(store.as_ref(), &run).await;
+    assert_auto_model_routing_commit(store.as_ref(), &run, Some(&pool)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3533,6 +3583,210 @@ async fn checkpoint_save_keeps_large_opening_out_of_the_locked_read() {
         store.save_checkpoint(request()).await.is_err(),
         "the control read must still validate the current checkpoint reference"
     );
+    DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .delete_session(session, user)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn recovery_claim_keeps_large_openings_out_of_locked_batch() {
+    use astra_services::runs::{DurableRunOpening, OpeningBody};
+    let (pool, store) = setup().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let mut expected = Vec::new();
+    for _ in 0..2 {
+        let run = uuid::Uuid::new_v4().to_string();
+        let mut record = durable_run_record(run.clone(), user.clone(), session.clone());
+        record.events =
+            vec![json!({"event_type":"run_started", "data":{"text":"x".repeat(6 * 1024 * 1024)}})];
+        record.opening = DurableRunOpening::capture(&record.events).unwrap().into();
+        insert_run_fixture(&pool, &store, record).await;
+        seed_current_checkpoint_fixture(
+            &pool,
+            &user,
+            &session,
+            &run,
+            Some(r#"{"version":"phase_checkpoint_v1"}"#),
+        )
+        .await;
+        expected.push(store.load_run(&user, &run).await.unwrap().unwrap());
+    }
+    let queries = Queries::default();
+    let claims = store
+        .claim_recoverable_active_runs(256)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    let statements = queries.0.lock().unwrap().clone();
+    assert!(
+        statements
+            .iter()
+            .any(|sql| sql.contains("FROM agent_runs") && sql.contains("FOR UPDATE"))
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|sql| !sql.contains("agent_run_openings")),
+        "ownership claims must not load cold openings"
+    );
+    for before in expected {
+        let claim = claims
+            .iter()
+            .find(|claim| claim.run.run_id == before.run_id)
+            .expect("run claimed");
+        assert_eq!(claim.claimed_from_generation, before.run_generation);
+        assert_eq!(claim.run.run_generation, before.run_generation + 1);
+        assert_eq!(claim.run.last_event_idx, before.last_event_idx);
+        assert_eq!(claim.run.current_checkpoint, before.current_checkpoint);
+        assert_eq!(claim.run.opening_hash, before.opening_hash);
+        assert!(matches!(claim.run.opening, OpeningBody::NotLoaded));
+        let after = store
+            .load_run(&user, &before.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.opening, before.opening,
+            "complete reads must retain the original bytes and integrity checks"
+        );
+    }
+    DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .delete_session(session, user)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn corrupt_cold_openings_do_not_block_control_but_cannot_resume_execution() {
+    let (pool, store) = setup().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let mut runs = Vec::new();
+    for statement in [
+        Some(
+            "UPDATE agent_run_openings SET opening_events_json = 'invalid' WHERE user_id = ? AND run_id = ?",
+        ),
+        Some("DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?"),
+        None,
+    ] {
+        let run = uuid::Uuid::new_v4().to_string();
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record(run.clone(), user.clone(), session.clone()),
+        )
+        .await;
+        if let Some(statement) = statement {
+            sqlx::query(statement)
+                .bind(&user)
+                .bind(&run)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        runs.push(run);
+    }
+    let healthy_run = runs.last().unwrap().clone();
+    let claims = store.claim_recoverable_active_runs(256).await.unwrap();
+    for run in runs {
+        let claim = claims
+            .iter()
+            .find(|claim| claim.run.run_id == run)
+            .expect("cold corruption must not poison the control batch");
+        let generation = claim.run.run_generation;
+        let events = [make_idempotent_event(
+            "agent_progress",
+            "control-drain",
+            json!({"text":"accounting drain"}),
+        )];
+        assert!(
+            !store
+                .append_events_if_current_generation_and_status(
+                    &user,
+                    &session,
+                    &run,
+                    generation - 1,
+                    &["running"],
+                    &events
+                )
+                .await
+                .unwrap()
+        );
+        let queries = Queries::default();
+        assert!(
+            store
+                .append_events_if_current_generation_and_status(
+                    &user,
+                    &session,
+                    &run,
+                    generation,
+                    &["running"],
+                    &events
+                )
+                .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            queries
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|sql| !sql.contains("agent_run_openings"))
+        );
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user,
+                    &session,
+                    &run,
+                    &["running"],
+                    Some(generation),
+                    "paused",
+                    Some("user_resume"),
+                    None,
+                    &[]
+                )
+                .await
+                .unwrap()
+        );
+        if run != healthy_run {
+            assert!(
+                store
+                    .update_run_status_with_events_if_current(
+                        &user,
+                        &session,
+                        &run,
+                        &["paused"],
+                        Some(generation),
+                        "running",
+                        None,
+                        None,
+                        &[]
+                    )
+                    .await
+                    .is_err(),
+                "execution transitions still require a valid opening"
+            );
+            assert!(store.load_run(&user, &run).await.is_err());
+        } else {
+            assert_eq!(
+                store.load_run(&user, &run).await.unwrap().unwrap().status,
+                "paused"
+            );
+        }
+        let control = store.load_run_control(&user, &run).await.unwrap().unwrap();
+        assert_eq!(control.status, "paused");
+        assert_eq!(control.run_generation, generation);
+        assert_eq!(control.last_event_idx, claim.run.last_event_idx + 1);
+    }
     DatabaseSessionService::new(pool.settings().clone())
         .with_pool(pool.clone())
         .delete_session(session, user)
