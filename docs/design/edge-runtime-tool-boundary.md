@@ -714,8 +714,10 @@ substrings in unrelated directory names. Explicit credential directories and
 environment-file variants remain protected. System paths are matched against
 the actual system boundary, not a similarly named tree inside a workspace.
 The shell selects the executable at runtime. A utility name alone grants no
-exception to protected-path checks. The CLI workspace scanner preserves
-literal tilde and single-quoted parameter syntax when resolving file operands.
+exception to protected-path checks. Workspace and shared path checks use the
+same shell word lexer. Quoted or escaped literal text keeps its spelling when
+checks resolve the path, while recognized shell references retain their
+expansion semantics.
 The native provider projects the sandbox's path rules into its filesystem
 masks without consulting the Server filesystem. A provider's path-only mask
 may also hide a directory whose name matches a sensitive filename pattern.

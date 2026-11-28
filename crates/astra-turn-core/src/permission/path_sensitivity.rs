@@ -16,7 +16,9 @@ use std::{
 };
 
 use astra_sandbox::{
-    InternalPathKind, is_dangerous_file_path, is_sensitive_directory, is_sensitive_path,
+    BashPathScan, BashPathToken, InternalPathKind, bash_home_suffix, bash_path_tokens,
+    decode_bash_path_word, is_dangerous_file_path, is_sensitive_directory, is_sensitive_path,
+    mark_literal_bash_path_word,
 };
 use astra_services::SessionArtifactStore;
 use serde_json::Value;
@@ -74,11 +76,11 @@ impl SensitivePathMatch {
             return astra_sandbox::has_literal_bash_write_redirect(command, &self.token)
                 .then_some(PathAccess::Write);
         }
-        let paths = astra_sandbox::parse_bash_literal_paths(command)?;
+        let mut paths = astra_sandbox::parse_bash_literal_paths(command)?;
         if self.access == PathAccess::Read && paths.read_redirects.contains(&self.token) {
             return Some(PathAccess::Read);
         }
-        paths.commands.iter().find_map(|argv| {
+        paths.commands.iter_mut().find_map(|argv| {
             let hit = read_only_argv_path_match(argv, context)??;
             (!hit.inferred && hit.token == self.token && hit.sensitivity == self.sensitivity)
                 .then_some(hit.access)
@@ -423,7 +425,7 @@ impl PathSensitivityContext {
             ) => self.deny_tool_result_reads && kind == InternalPathKind::SessionToolResult,
         };
         gated.then(|| SensitivePathMatch {
-            token: path.to_string(),
+            token: decode_bash_path_word(path).into_owned(),
             sensitivity,
             access,
             inferred: matches!(access, PathAccess::Read) && contains_glob_meta(path),
@@ -434,10 +436,12 @@ impl PathSensitivityContext {
         let Some(root) = self.approved_workspace.as_deref() else {
             return false;
         };
-        if path.contains(['$', '`']) || contains_glob_meta(path) || path.starts_with('~') {
+        let literal = decode_bash_path_word(path);
+        if literal.contains(['$', '`']) || contains_glob_meta(&literal) || literal.starts_with('~')
+        {
             return false;
         }
-        let path = Path::new(path);
+        let path = Path::new(literal.as_ref());
         let target = if path.is_absolute() {
             path.to_path_buf()
         } else if self.approved_relative_writes {
@@ -457,13 +461,14 @@ impl PathSensitivityContext {
 fn is_read_sensitive_path(path: &str) -> bool {
     let expanded = expand_home_path(path);
     is_sensitive_path(&expanded)
-        || matches_sensitive_path(path)
+        || matches_sensitive_path(&decode_bash_path_word(path))
         || matches_sensitive_path(&expanded.to_string_lossy())
 }
 
 fn is_write_sensitive_path(path: &str) -> bool {
     let expanded = expand_home_path(path);
-    is_dangerous_file_path(path) || is_dangerous_file_path(&expanded.to_string_lossy())
+    is_dangerous_file_path(&decode_bash_path_word(path))
+        || is_dangerous_file_path(&expanded.to_string_lossy())
 }
 
 fn is_agent_skill_content_path(path: &str) -> bool {
@@ -607,23 +612,12 @@ fn contains_glob_meta(path: &str) -> bool {
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
-    let Some(home) = dirs::home_dir() else {
-        return PathBuf::from(path);
-    };
-
-    if path == "~" {
-        return home;
+    if let Some(suffix) = bash_home_suffix(path)
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(decode_bash_path_word(suffix).as_ref());
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return home.join(rest);
-    }
-    if let Some(rest) = path.strip_prefix("$HOME/") {
-        return home.join(rest);
-    }
-    if let Some(rest) = path.strip_prefix("${HOME}/") {
-        return home.join(rest);
-    }
-    PathBuf::from(path)
+    PathBuf::from(decode_bash_path_word(path).as_ref())
 }
 
 fn canonicalize_existing_or_nearest(path: &Path) -> Option<PathBuf> {
@@ -752,9 +746,9 @@ fn read_only_shell_path_match(
     command: &str,
     context: &mut PathSensitivityContext,
 ) -> Option<Option<SensitivePathMatch>> {
-    let commands = astra_sandbox::parse_bash_commands_for_path_analysis(command)?;
+    let mut commands = astra_sandbox::parse_bash_commands_for_path_analysis(command)?;
     let mut can_downgrade = true;
-    for argv in &commands {
+    for argv in &mut commands {
         match read_only_argv_path_match(argv, context) {
             Some(Some(hit)) => return Some(Some(hit)),
             Some(None) => {}
@@ -765,13 +759,18 @@ fn read_only_shell_path_match(
 }
 
 fn read_only_argv_path_match(
-    argv: &[String],
+    argv: &mut [String],
     context: &mut PathSensitivityContext,
 ) -> Option<Option<SensitivePathMatch>> {
     if crate::cloud::approval_policy::bash_argv_approval_reason(argv).is_some() {
         return None;
     }
     let command_index = first_command_token_index(argv)?;
+    // The AST decoder produced literal argv. Keep a literal home-looking
+    // prefix distinct from an expansion in the lexical scan.
+    for word in argv.iter_mut().skip(command_index + 1) {
+        mark_literal_bash_path_word(word);
+    }
     let hit = known_shell_operand_match(argv, command_index, true, context)?;
     // The lexical command index can skip wrappers without resolving their
     // option values or working directory.
@@ -1055,7 +1054,7 @@ fn sensitive_path_match_for_shell_segment(
     inferred_access: PathAccess,
     context: &mut PathSensitivityContext,
 ) -> Option<SensitivePathMatch> {
-    let (tokens, redirects) = shell_tokenize_like_bash(segment);
+    let (tokens, redirects) = shell_path_operands(segment);
     if let Some(hit) = redirection_sensitive_path_match(segment, &redirects, context) {
         return Some(hit.with_inferred_access(true));
     }
@@ -1065,7 +1064,7 @@ fn sensitive_path_match_for_shell_segment(
         && literal_data_command(&tokens)
         && astra_sandbox::parse_bash_literal_paths(segment).is_some_and(|paths| {
             paths.commands.len() == 1
-                && paths.commands[0] == tokens
+                && literal_argv_matches(&paths.commands[0], &tokens)
                 && paths.read_redirects.is_empty()
                 && paths.write_redirects.is_empty()
         })
@@ -1075,8 +1074,9 @@ fn sensitive_path_match_for_shell_segment(
     if let Some(hit) = known_shell_operand_match(&tokens, command_index, false, context) {
         return hit.map(|hit| {
             let literal_argv = command_index == 0
-                && astra_sandbox::parse_bash_literal_paths(segment)
-                    .is_some_and(|paths| paths.commands.len() == 1 && paths.commands[0] == tokens);
+                && astra_sandbox::parse_bash_literal_paths(segment).is_some_and(|paths| {
+                    paths.commands.len() == 1 && literal_argv_matches(&paths.commands[0], &tokens)
+                });
             hit.with_inferred_access(!literal_argv)
         });
     }
@@ -1281,8 +1281,12 @@ fn redirection_sensitive_path_match(
         let access = *access;
         let token = token.as_str();
         let proven_write = access == PathAccess::Write
-            && shell_path_operand(token)
-                .is_some_and(|path| astra_sandbox::has_literal_bash_write_redirect(segment, &path));
+            && shell_path_operand(token).is_some_and(|path| {
+                astra_sandbox::has_literal_bash_write_redirect(
+                    segment,
+                    &decode_bash_path_word(&path),
+                )
+            });
         if context.known_shell_effects_only && access == PathAccess::Write && !proven_write {
             continue;
         }
@@ -1958,95 +1962,27 @@ fn looks_like_shell_assignment(token: &str) -> bool {
             .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
 }
 
-/// Split word arguments from unquoted redirection operators and their targets.
-fn shell_tokenize_like_bash(input: &str) -> (Vec<String>, Vec<(String, PathAccess)>) {
-    enum Token {
-        Word(String),
-        Redirect(String),
-    }
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut started = false;
-    let mut plain_number = true;
-    let mut chars = input.chars().peekable();
-    let mut in_double_quote = false;
-    let mut in_single_quote = false;
+fn literal_argv_matches(argv: &[String], tokens: &[String]) -> bool {
+    argv.len() == tokens.len()
+        && argv
+            .iter()
+            .zip(tokens)
+            .all(|(arg, token)| arg == decode_bash_path_word(token).as_ref())
+}
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if !in_single_quote => {
-                in_double_quote = !in_double_quote;
-                started = true;
-                plain_number = false;
-            }
-            '\'' if !in_double_quote => {
-                in_single_quote = !in_single_quote;
-                started = true;
-                plain_number = false;
-            }
-            '\\' if !in_single_quote => {
-                if let Some(next) = chars.next()
-                    && !matches!(next, '\n' | '\r')
-                {
-                    current.push(next);
-                    started = true;
-                    plain_number = false;
-                }
-            }
-            '>' | '<' if !in_double_quote && !in_single_quote => {
-                let mut op = String::new();
-                if started && plain_number && !current.is_empty() {
-                    op.push_str(&current);
-                    current.clear();
-                } else if started {
-                    tokens.push(Token::Word(std::mem::take(&mut current)));
-                }
-                started = false;
-                plain_number = true;
-                op.push(ch);
-                if chars.peek().is_some_and(|next| *next == ch) {
-                    op.push(chars.next().unwrap());
-                }
-                let operator = op.trim_start_matches(|ch: char| ch.is_ascii_digit());
-                if (operator == "<<" && chars.peek() == Some(&'<'))
-                    || (operator == "<" && chars.peek() == Some(&'>'))
-                    || (operator == ">" && chars.peek() == Some(&'|'))
-                {
-                    op.push(chars.next().unwrap());
-                }
-                if chars.peek().is_some_and(|next| *next == '&') {
-                    op.push(chars.next().unwrap());
-                }
-                tokens.push(Token::Redirect(op));
-            }
-            c if c.is_whitespace() && !in_double_quote && !in_single_quote => {
-                if started {
-                    tokens.push(Token::Word(std::mem::take(&mut current)));
-                }
-                started = false;
-                plain_number = true;
-            }
-            _ => {
-                current.push(ch);
-                started = true;
-                plain_number &= ch.is_ascii_digit() && !in_single_quote && !in_double_quote;
-            }
-        }
-    }
-
-    if started {
-        tokens.push(Token::Word(current));
-    }
-
+/// Separate command argv from file redirections for operand classification.
+fn shell_path_operands(input: &str) -> (Vec<String>, Vec<(String, PathAccess)>) {
     let mut words = Vec::new();
     let mut redirects = Vec::new();
-    let mut tokens = tokens.into_iter().peekable();
+    let mut tokens = bash_path_tokens(input, BashPathScan::CommandOperands)
+        .into_iter()
+        .peekable();
     while let Some(token) = tokens.next() {
         match token {
-            Token::Word(word) => words.push(word),
-            Token::Redirect(op) => {
-                if matches!(tokens.peek(), Some(Token::Word(_)))
-                    && let Some(Token::Word(target)) = tokens.next()
+            BashPathToken::Word(word) => words.push(word),
+            BashPathToken::Redirect(op) => {
+                if matches!(tokens.peek(), Some(BashPathToken::Word(_)))
+                    && let Some(BashPathToken::Word(target)) = tokens.next()
                     && let Some(access) = redirection_access(&op, &target)
                 {
                     redirects.push((target, access));

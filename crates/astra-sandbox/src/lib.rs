@@ -9,6 +9,7 @@
 //! 3. **Policy engine** — configurable per-session security rules
 
 mod bash_ast;
+mod bash_path_words;
 mod command;
 mod git_safety;
 mod path;
@@ -23,6 +24,10 @@ pub use bash_ast::{
     BashLiteralPaths, bash_has_stable_working_directory, has_literal_bash_write_redirect,
     parse_bash_commands_for_path_analysis, parse_bash_literal_paths, parse_plain_bash_commands,
     strip_benign_bash_redirects,
+};
+pub use bash_path_words::{
+    BashPathScan, BashPathToken, bash_home_suffix, bash_path_tokens, decode_bash_path_word,
+    mark_literal_bash_path_word,
 };
 pub use command::{
     BashCommandPathOperands, CommandRisk, SandboxCommandError, analyze_command_risks,

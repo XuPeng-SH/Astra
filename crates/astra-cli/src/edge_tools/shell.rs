@@ -899,55 +899,14 @@ fn check_bash_sensitive_path_boundary(
     })
 }
 
-fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = input.chars().peekable();
-    let mut in_double_quote = false;
-    let mut in_single_quote = false;
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if !in_single_quote => in_double_quote = !in_double_quote,
-            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            '\\' if !in_single_quote => {
-                if in_double_quote
-                    && chars
-                        .peek()
-                        .is_some_and(|next| !matches!(next, '$' | '`' | '"' | '\\' | '\n'))
-                {
-                    current.push(ch);
-                    continue;
-                }
-                if let Some(next) = chars.next() {
-                    if next == '\n' || next == '\r' {
-                        continue;
-                    }
-                    if let Some(escaped) = escaped_shell_analysis_char(next) {
-                        current.push(escaped);
-                    } else {
-                        current.push(next);
-                    }
-                }
-            }
-            // Tilde expansion never occurs in quotes. Single quotes also keep
-            // parameter and brace syntax literal until path resolution.
-            '~' if in_single_quote || in_double_quote => current.push(ESCAPED_SHELL_TILDE),
-            c if in_single_quote => current.push(escaped_shell_analysis_char(c).unwrap_or(c)),
-            c if c.is_whitespace() && !in_double_quote && !in_single_quote => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    tokens
+fn shell_path_words(input: &str) -> Vec<String> {
+    astra_sandbox::bash_path_tokens(input, astra_sandbox::BashPathScan::PathExpressions)
+        .into_iter()
+        .filter_map(|token| match token {
+            astra_sandbox::BashPathToken::Word(word) => Some(word),
+            astra_sandbox::BashPathToken::Redirect(_) => None,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1132,43 +1091,6 @@ fn first_segment_subcommand(parts: &[String]) -> Option<&str> {
     Some(base.rsplit('/').next().unwrap_or(base))
 }
 
-const ESCAPED_SHELL_DOLLAR: char = '\u{E000}';
-const ESCAPED_SHELL_TILDE: char = '\u{E001}';
-const ESCAPED_SHELL_OPEN_BRACE: char = '\u{E002}';
-const ESCAPED_SHELL_CLOSE_BRACE: char = '\u{E003}';
-
-fn escaped_shell_analysis_char(ch: char) -> Option<char> {
-    match ch {
-        '$' => Some(ESCAPED_SHELL_DOLLAR),
-        '~' => Some(ESCAPED_SHELL_TILDE),
-        '{' => Some(ESCAPED_SHELL_OPEN_BRACE),
-        '}' => Some(ESCAPED_SHELL_CLOSE_BRACE),
-        _ => None,
-    }
-}
-
-fn restore_escaped_shell_analysis_chars(arg: &str) -> std::borrow::Cow<'_, str> {
-    if !arg.contains([
-        ESCAPED_SHELL_DOLLAR,
-        ESCAPED_SHELL_TILDE,
-        ESCAPED_SHELL_OPEN_BRACE,
-        ESCAPED_SHELL_CLOSE_BRACE,
-    ]) {
-        return std::borrow::Cow::Borrowed(arg);
-    }
-    std::borrow::Cow::Owned(
-        arg.chars()
-            .map(|ch| match ch {
-                ESCAPED_SHELL_DOLLAR => '$',
-                ESCAPED_SHELL_TILDE => '~',
-                ESCAPED_SHELL_OPEN_BRACE => '{',
-                ESCAPED_SHELL_CLOSE_BRACE => '}',
-                _ => ch,
-            })
-            .collect(),
-    )
-}
-
 fn shell_short_flag_cluster(flag: &str) -> Option<&str> {
     let rest = flag.strip_prefix('-')?;
     if rest.is_empty() || rest.starts_with('-') || !rest.chars().all(|ch| ch.is_ascii_alphabetic())
@@ -1218,7 +1140,7 @@ fn validate_plain_command_path_arg(
     arg: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<ShellRunError> {
-    let literal_arg = restore_escaped_shell_analysis_chars(arg);
+    let literal_arg = astra_sandbox::decode_bash_path_word(arg);
     let expanded = expand_static_dir_reference(policy, arg, oldpwd);
     if let Some(kind) = unresolved_static_dir_reference_kind(arg, expanded.is_some()) {
         return Some(ShellRunError::from(format!(
@@ -1282,7 +1204,7 @@ fn brace_expansion_boundary_review_message(policy: &BashPathContext<'_>, arg: &s
     format!(
         "{}The command references '{}' using shell brace expansion, which may fan out to multiple paths that cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
         SANDBOX_DENIED_PREFIX,
-        arg,
+        astra_sandbox::decode_bash_path_word(arg),
         policy.project_root.display(),
     )
 }
@@ -1296,7 +1218,7 @@ fn check_shell_interpreter_path_boundary(
     let check_command = |source: &str| {
         check_bash_path_boundary_in_context(
             policy,
-            &restore_escaped_shell_analysis_chars(source),
+            &astra_sandbox::decode_bash_path_word(source),
             oldpwd,
         )
     };
@@ -1390,15 +1312,9 @@ fn expand_static_dir_reference(
 }
 
 fn expand_home_dir_reference(arg: &str) -> Option<std::path::PathBuf> {
+    let suffix = astra_sandbox::bash_home_suffix(arg)?;
     let home = dirs::home_dir()?;
-    if matches!(arg, "~" | "$HOME" | "${HOME}") {
-        return Some(home);
-    }
-    let suffix = arg
-        .strip_prefix("~/")
-        .or_else(|| arg.strip_prefix("$HOME/"))
-        .or_else(|| arg.strip_prefix("${HOME}/"))?;
-    Some(home.join(restore_escaped_shell_analysis_chars(suffix).as_ref()))
+    Some(home.join(astra_sandbox::decode_bash_path_word(suffix).as_ref()))
 }
 
 fn expand_project_dir_reference(
@@ -1415,7 +1331,7 @@ fn expand_project_dir_reference(
     Some(
         policy
             .working_dir
-            .join(restore_escaped_shell_analysis_chars(suffix).as_ref()),
+            .join(astra_sandbox::decode_bash_path_word(suffix).as_ref()),
     )
 }
 
@@ -1431,7 +1347,7 @@ fn expand_oldpwd_dir_reference(
         .strip_prefix("$OLDPWD/")
         .or_else(|| arg.strip_prefix("${OLDPWD}/"))
         .or_else(|| arg.strip_prefix("~-/"))?;
-    Some(oldpwd.join(restore_escaped_shell_analysis_chars(suffix).as_ref()))
+    Some(oldpwd.join(astra_sandbox::decode_bash_path_word(suffix).as_ref()))
 }
 
 fn unresolved_static_dir_reference_kind(arg: &str, expanded: bool) -> Option<&'static str> {
@@ -1780,7 +1696,7 @@ fn check_redirection_path_boundary(
                         || matches!(target_ch, '|' | ';' | '&' | '\n' | '\r' | '<' | '>' | ')'))
                 {
                     let raw_target = command[target_start..byte_idx].trim();
-                    if let Some(target) = shell_tokenize_like_bash(raw_target).first()
+                    if let Some(target) = shell_path_words(raw_target).first()
                         && let Some(msg) = validate_command_path_arg(policy, target, oldpwd)
                     {
                         return Some(msg);
@@ -1793,7 +1709,7 @@ fn check_redirection_path_boundary(
 
             if idx >= chars.len() {
                 let raw_target = command[target_start..].trim();
-                if let Some(target) = shell_tokenize_like_bash(raw_target).first()
+                if let Some(target) = shell_path_words(raw_target).first()
                     && let Some(msg) = validate_command_path_arg(policy, target, oldpwd)
                 {
                     return Some(msg);
@@ -2341,7 +2257,7 @@ fn shell_loop_body_token_indices(
 
 fn shell_loop_body_subcommand_requires_boundary_review(body: &str) -> Option<String> {
     for segment in bash_command_segments(body) {
-        let parts = shell_tokenize_like_bash(segment);
+        let parts = shell_path_words(segment);
         let Some(base) = first_segment_subcommand(&parts) else {
             continue;
         };
@@ -2906,7 +2822,7 @@ fn check_single_command_path_boundary(
         return Some(msg);
     }
 
-    let parts = shell_tokenize_like_bash(command);
+    let parts = shell_path_words(command);
     if parts.is_empty() {
         return None;
     }
@@ -9169,42 +9085,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Bash integration: command semantics in output
     // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn bash_resolves_quoted_paths_from_the_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = test_executor_in(dir.path());
-        for folder in ["~", "$HOME"] {
-            std::fs::create_dir(dir.path().join(folder)).unwrap();
-            std::fs::write(dir.path().join(folder).join("fixture"), "workspace fixture").unwrap();
-        }
-        for command in [
-            "cat '~/fixture'",
-            r#"cat "~/fixture""#,
-            "cat '$HOME/fixture'",
-            r#"bash -c 'cat "~/fixture"'"#,
-        ] {
-            let result = executor
-                .execute_with_metadata("bash", &serde_json::json!({"command": command}))
-                .await;
-            assert!(!result.is_error, "{command}: {result:?}");
-            assert!(result.output.contains("workspace fixture"), "{result:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn stat_keeps_protected_paths_behind_the_bash_guard() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = test_executor_in(dir.path());
-        std::fs::write(dir.path().join(".env"), "fixture contents").unwrap();
-        let result = executor
-            .execute_with_metadata("bash", &serde_json::json!({"command": "stat .env"}))
-            .await;
-        assert!(result.is_error, "{result:?}");
-        let facts = result.tool_result_fields.expect("pre-start denial facts");
-        assert_eq!(facts["execution_started"], false);
-        assert_eq!(facts["recovery_evidence"]["cause"], "permission_boundary");
-    }
 
     #[tokio::test]
     async fn bash_reports_nonzero_status_without_guessing_a_domain_answer() {

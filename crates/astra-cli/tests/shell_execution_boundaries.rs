@@ -24,6 +24,56 @@ fn git(root: &Path, args: &[&str]) {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn quoted_shell_paths_resolve_the_same_way_with_and_without_the_workspace_overlay() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    // The literal tilde is a directory in the selected workdir. Expanding
+    // it as HOME before normalizing would select the system's etc directory.
+    let levels = dirs::home_dir().unwrap().components().count().max(2);
+    let workdir = (1..levels).fold(root.to_path_buf(), |dir, _| dir.join("nested"));
+    std::fs::create_dir_all(workdir.join("~")).unwrap();
+    std::fs::create_dir_all(workdir.join("$HOME")).unwrap();
+    std::fs::create_dir(root.join("etc")).unwrap();
+    for path in [
+        root.join("etc/fixture"),
+        workdir.join("literal}.txt"),
+        workdir.join("$HOME/fixture"),
+    ] {
+        std::fs::write(path, "workspace fixture").unwrap();
+    }
+    std::fs::write(workdir.join(".env"), "synthetic fixture").unwrap();
+
+    let executor = executor(root);
+    let tilde = format!("cat '~/{}etc/fixture'", "../".repeat(levels));
+    for policy in [Some(SandboxPolicy::for_project(root)), None] {
+        *executor.sandbox_policy.write().unwrap() = policy;
+        for command in [
+            tilde.as_str(),
+            r#"cat "literal}.txt""#,
+            r#"cat "${PWD}/literal}.txt""#,
+            r#"bash -c 'cat "\$HOME/fixture"'"#,
+        ] {
+            let result = executor
+                .execute_with_metadata("bash", &json!({"command": command, "workdir": &workdir}))
+                .await;
+            assert!(!result.is_error, "{command}: {result:?}");
+            assert_eq!(result.output.trim(), "workspace fixture", "{command}");
+        }
+        let denied = executor
+            .execute_with_metadata(
+                "bash",
+                &json!({"command": "stat '.env'", "workdir": &workdir}),
+            )
+            .await;
+        assert!(denied.is_error, "{denied:?}");
+        let facts = denied.tool_result_fields.expect("pre-start denial facts");
+        assert_eq!(facts["execution_started"], false);
+        assert_eq!(facts["recovery_evidence"]["cause"], "permission_boundary");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn find_expression_operands_use_the_shell_path_boundary() {
     let workspace = tempfile::tempdir().unwrap();
     let secret = workspace.path().join(".env");
