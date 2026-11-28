@@ -713,6 +713,9 @@ Credential file markers use filename boundaries rather than arbitrary
 substrings in unrelated directory names. Explicit credential directories and
 environment-file variants remain protected. System paths are matched against
 the actual system boundary, not a similarly named tree inside a workspace.
+Known metadata operands may inspect credential-marked paths. Directory listings,
+file-valued options and redirections still have their own preflight checks.
+System paths and owned tool-result artifacts retain their preflight rules.
 The native provider projects the sandbox's path rules into its filesystem
 masks without consulting the Server filesystem. A provider's path-only mask
 may also hide a directory whose name matches a sensitive filename pattern.

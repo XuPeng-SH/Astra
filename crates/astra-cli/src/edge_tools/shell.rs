@@ -371,10 +371,6 @@ fn annotate_environment_background_termination(
     ]);
 }
 
-fn empty_nonzero_exit_output(exit_code: i32) -> String {
-    format!("Error: command failed (exit code {exit_code})")
-}
-
 // ---------------------------------------------------------------------------
 // Bash security layer — detect dangerous or potentially destructive commands.
 //
@@ -4838,7 +4834,7 @@ impl ToolExecutor {
             result = if out.status.success() {
                 "(no output)".to_string()
             } else {
-                empty_nonzero_exit_output(exit_code)
+                exit_semantics::process_exit_status(exit_code)
             };
         } else {
             result =
@@ -4851,7 +4847,8 @@ impl ToolExecutor {
             }
 
             if !out.status.success() {
-                result.push_str(&format!("\n(exit code {exit_code})"));
+                result.push('\n');
+                result.push_str(&exit_semantics::process_exit_status(exit_code));
             }
         }
         let mut outcome = if out.status.success() {
@@ -4957,7 +4954,12 @@ struct BashOutputRenderer {
 }
 
 impl BashOutputRenderer {
-    fn render_output(&self, command: &str, out: std::process::Output) -> (String, bool) {
+    fn render_output(
+        &self,
+        command: &str,
+        out: &std::process::Output,
+        exit_code: i32,
+    ) -> (String, bool) {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let mut result = String::new();
@@ -4969,20 +4971,8 @@ impl BashOutputRenderer {
         }
         let has_warning = !result.is_empty();
 
-        let exit_code = astra_tools::shell_ops::exit_code_from_status(&out.status);
-        let exit_semantics = exit_semantics::classify_exit(exit_code);
-        let result_class = exit_semantics::classify_command_result(Some(exit_code));
-        let execution_failed = exit_semantics.is_tool_error() || result_class.is_tool_error();
-
-        // `execute()` is a legacy string-only boundary. It cannot carry the
-        // structured `is_error` bit returned by `render_bash_outcome`, so an
-        // execution failure must have a stable textual failure envelope as
-        // well. Otherwise a useful stderr line such as "command not found"
-        // was recorded as a successful tool call by string consumers.
-        if execution_failed {
-            result.push_str(&format!(
-                "Error: bash execution failed (exit code {exit_code})"
-            ));
+        if exit_code != 0 {
+            result.push_str(&exit_semantics::process_exit_status(exit_code));
         }
         if !stdout.is_empty() {
             if !result.is_empty() {
@@ -5000,20 +4990,13 @@ impl BashOutputRenderer {
         if (!stdout.is_empty() || !stderr.is_empty())
             && stdout.trim().is_empty()
             && stderr.trim().is_empty()
-            && !execution_failed
+            && exit_code == 0
             && !has_warning
         {
             return ("(output contains only whitespace)".to_string(), false);
         }
         if result.is_empty() {
-            return (
-                if out.status.success() {
-                    "(no output)".to_string()
-                } else {
-                    empty_nonzero_exit_output(exit_code)
-                },
-                false,
-            );
+            return ("(no output)".to_string(), false);
         }
 
         result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
@@ -5026,10 +5009,6 @@ impl BashOutputRenderer {
                 astra_text_utils::credential_redaction::truncate_redacted_head_tail(&result, limit);
         }
 
-        // Preserve the actual exit code alongside command output.
-        if !out.status.success() && !execution_failed {
-            result.push_str(&format!("\n(exit code {exit_code})"));
-        }
         if let Some(hint) = exit_semantics::shell_exit_hint(exit_code) {
             result.push('\n');
             result.push_str(hint);
@@ -5047,8 +5026,8 @@ impl BashOutputRenderer {
         let exit_code = astra_tools::shell_ops::exit_code_from_status(&out.status);
         let exit_semantics = astra_tools::exit_semantics::classify_exit(exit_code);
         let result_class = astra_tools::exit_semantics::classify_command_result(Some(exit_code));
-        let (output, truncated) = self.render_output(command, out);
-        let mut outcome = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
+        let (output, truncated) = self.render_output(command, &out, exit_code);
+        let mut outcome = if exit_code != 0 {
             super::ToolExecutionOutcome::error(output)
         } else {
             super::ToolExecutionOutcome::ok(output)
@@ -9168,6 +9147,35 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    async fn bash_inspects_metadata_without_reading_credential_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        std::fs::create_dir(dir.path().join(".docker")).unwrap();
+        std::fs::write(dir.path().join(".docker/config.json"), "fixture contents").unwrap();
+
+        let inventory = executor
+            .execute_with_metadata(
+                "bash",
+                &serde_json::json!({"command": "du -sh .docker 2>/dev/null"}),
+            )
+            .await;
+        assert!(!inventory.is_error, "{inventory:?}");
+        assert!(inventory.output.contains(".docker"), "{inventory:?}");
+
+        let read = executor
+            .execute_with_metadata(
+                "bash",
+                &serde_json::json!({"command": "du -sh .docker; cat .docker/config.json"}),
+            )
+            .await;
+        assert!(read.is_error, "{read:?}");
+        assert!(!read.output.contains("fixture contents"), "{read:?}");
+        let facts = read.tool_result_fields.expect("pre-start denial facts");
+        assert_eq!(facts["execution_started"], false);
+        assert_eq!(facts["recovery_evidence"]["cause"], "permission_boundary");
+    }
+
+    #[tokio::test]
     async fn bash_reports_nonzero_status_without_guessing_a_domain_answer() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
@@ -9180,7 +9188,7 @@ mod tests {
                 .execute_with_metadata("bash", &serde_json::json!({"command": command}))
                 .await;
             assert!(result.is_error, "{command}: {result:?}");
-            assert!(result.output.contains("exit code 1"), "{result:?}");
+            assert!(result.output.starts_with("[exit code: 1]"), "{result:?}");
             let fields = result.tool_result_fields.unwrap();
             assert_eq!(fields["exit_code"], 1);
             assert_eq!(fields["result_class"], "execution_error");

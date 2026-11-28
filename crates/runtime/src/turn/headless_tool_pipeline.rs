@@ -5467,7 +5467,7 @@ mod tests {
         for index in 0..15 {
             let execution = make_shell_result(
                 format!("grep absent_{index} /dev/null"),
-                astra_tools::ToolResult::error("bash execution failed (exit code 1)".to_string())
+                astra_tools::ToolResult::error("[exit code: 1]".to_string())
                     .with_exit_code(1)
                     .with_failure_evidence(astra_tools::exit_semantics::command_failed_evidence(
                         astra_core::ErrorKind::Unknown,

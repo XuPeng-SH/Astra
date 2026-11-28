@@ -16201,24 +16201,17 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn bash_nonzero_exit_includes_exit_code() {
-        let (exec, _dir) = test_executor();
-        let result = exec
-            .execute("bash", &json!({"command": "echo nope >&2; exit 42"}))
-            .await;
-        assert!(result.contains("exit code: 42"));
-        assert!(result.contains("stderr:"));
-        assert!(result.contains("nope"));
-    }
-
-    #[tokio::test]
-    async fn bash_nonzero_exit_sets_error_metadata() {
+    async fn bash_nonzero_exit_preserves_output_and_metadata() {
         let (exec, _dir) = test_executor();
         let result = exec
             .execute_with_metadata("bash", &json!({"command": "echo nope >&2; exit 42"}))
             .await;
         assert!(result.is_error, "got: {}", result.output);
-        assert!(result.output.contains("exit code: 42"));
+        assert!(result.output.contains("[exit code: 42]"));
+        assert!(result.output.contains("stderr:\nnope"));
+        let metadata = result.metadata.expect("observed exit metadata");
+        assert_eq!(metadata["exit_code"], 42);
+        assert_eq!(metadata["recovery_evidence"]["cause"], "command_failed");
     }
 
     #[tokio::test]

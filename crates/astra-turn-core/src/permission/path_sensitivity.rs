@@ -11,12 +11,14 @@
 //! enforcement still owns full command validation.
 
 use std::{
+    cell::LazyCell,
     collections::HashMap,
     path::{Component, Path, PathBuf},
 };
 
 use astra_sandbox::{
-    InternalPathKind, is_dangerous_file_path, is_sensitive_directory, is_sensitive_path,
+    InternalPathKind, is_dangerous_file_path, is_sensitive_directory, is_sensitive_os_dir,
+    is_sensitive_path,
 };
 use astra_services::SessionArtifactStore;
 use serde_json::Value;
@@ -42,6 +44,7 @@ pub enum PathAccess {
     Read,
     List,
     Write,
+    Metadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +220,7 @@ fn describe_bash_path_denial(
         Some(PathAccess::Read) => "the read operand",
         Some(PathAccess::List) => "the list operand",
         Some(PathAccess::Write) => "the write operand",
+        Some(PathAccess::Metadata) => "the metadata operand",
         None => {
             let mut reason = format!(
                 "Sandbox: Protected-path preflight blocked the command under the rule for {rule}. This executor could not establish the access or selected paths. The command was not run."
@@ -252,7 +256,7 @@ struct PathSensitivityContext {
     lexical_only: bool,
     sessions_root: Option<PathBuf>,
     deny_tool_result_reads: bool,
-    paths: HashMap<String, (PathSensitivity, Option<InternalPathKind>)>,
+    paths: HashMap<String, (PathSensitivity, Option<InternalPathKind>, bool)>,
 }
 
 impl PathSensitivityContext {
@@ -307,7 +311,7 @@ impl PathSensitivityContext {
         }
     }
 
-    fn classify(&mut self, path: &str) -> (PathSensitivity, Option<InternalPathKind>) {
+    fn classify(&mut self, path: &str) -> (PathSensitivity, Option<InternalPathKind>, bool) {
         if let Some(result) = self.paths.get(path) {
             return *result;
         }
@@ -317,6 +321,7 @@ impl PathSensitivityContext {
             return (
                 PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionToolResult),
                 None,
+                false,
             );
         }
         let has_glob = contains_glob_meta(path);
@@ -345,13 +350,15 @@ impl PathSensitivityContext {
             classify_session_relative_path(relative, has_glob)
         });
         let mut read_sensitive = is_read_sensitive_path(path)
-            || (self.directory.is_some() && self.local_sensitive_path(&lexical, false))
+            || (self.directory.is_some() && self.local_sensitive_path(&lexical, is_sensitive_path))
             || local_candidate.is_some_and(|p| {
-                self.local_sensitive_path(p, false) || is_read_sensitive_path(&p.to_string_lossy())
+                self.local_sensitive_path(p, is_sensitive_path)
+                    || is_read_sensitive_path(&p.to_string_lossy())
             });
         if read_sensitive && !self.lexical_only && self.directory.is_some() && resolved.is_dir() {
-            read_sensitive = self.local_sensitive_path(&lexical, true)
-                || local_candidate.is_some_and(|p| self.local_sensitive_path(p, true));
+            read_sensitive = self.local_sensitive_path(&lexical, is_sensitive_directory)
+                || local_candidate
+                    .is_some_and(|p| self.local_sensitive_path(p, is_sensitive_directory));
         }
         let sensitivity = if let Some(kind) = session.filter(|_| !has_glob) {
             PathSensitivity::InternalArtifactReadOnly(kind)
@@ -369,19 +376,16 @@ impl PathSensitivityContext {
         } else {
             PathSensitivity::Normal
         };
-        let result = (sensitivity, session.filter(|_| has_glob));
+        let system_sensitive = sensitivity == PathSensitivity::Sensitive
+            && (self.local_sensitive_path(&lexical, is_sensitive_os_dir)
+                || local_candidate
+                    .is_some_and(|p| self.local_sensitive_path(p, is_sensitive_os_dir)));
+        let result = (sensitivity, session.filter(|_| has_glob), system_sensitive);
         self.paths.insert(path.to_owned(), result);
         result
     }
 
-    fn local_sensitive_path(&self, path: &Path, directory: bool) -> bool {
-        let sensitive = |path: &Path| {
-            if directory {
-                is_sensitive_directory(path)
-            } else {
-                is_sensitive_path(path)
-            }
-        };
+    fn local_sensitive_path(&self, path: &Path, sensitive: fn(&Path) -> bool) -> bool {
         sensitive(path)
             || self.system_aliases.iter().any(|(alias, original)| {
                 path.strip_prefix(alias)
@@ -391,7 +395,7 @@ impl PathSensitivityContext {
     }
 
     fn requires_gate(&mut self, path: &str, access: PathAccess) -> Option<SensitivePathMatch> {
-        let (mut sensitivity, listing) = self.classify(path);
+        let (mut sensitivity, listing, system_sensitive) = self.classify(path);
         if matches!(access, PathAccess::List)
             && (self.lexical_only || self.directory.is_none())
             && sensitivity == PathSensitivity::Sensitive
@@ -406,21 +410,21 @@ impl PathSensitivityContext {
                 && matches!(access, PathAccess::List))
                 || (self.deny_tool_result_reads
                     && kind == InternalPathKind::SessionToolResult
-                    && matches!(access, PathAccess::Read | PathAccess::List)))
+                    && access != PathAccess::Write))
         {
             sensitivity = PathSensitivity::InternalArtifactReadOnly(kind);
         }
         let gated = match (sensitivity, access) {
             (PathSensitivity::Normal, _) => false,
+            (PathSensitivity::Sensitive, PathAccess::Metadata) => system_sensitive,
             (PathSensitivity::Sensitive, _) => true,
             (PathSensitivity::WriteSensitive, PathAccess::Write) => !self.ignore_write_sensitive,
             (PathSensitivity::WriteSensitive, PathAccess::Read) if contains_glob_meta(path) => true,
-            (PathSensitivity::WriteSensitive, PathAccess::Read | PathAccess::List) => false,
+            (PathSensitivity::WriteSensitive, _) => false,
             (PathSensitivity::InternalArtifactReadOnly(_), PathAccess::Write) => true,
-            (
-                PathSensitivity::InternalArtifactReadOnly(kind),
-                PathAccess::Read | PathAccess::List,
-            ) => self.deny_tool_result_reads && kind == InternalPathKind::SessionToolResult,
+            (PathSensitivity::InternalArtifactReadOnly(kind), _) => {
+                self.deny_tool_result_reads && kind == InternalPathKind::SessionToolResult
+            }
         };
         gated.then(|| SensitivePathMatch {
             token: path.to_string(),
@@ -772,7 +776,7 @@ fn read_only_argv_path_match(
         return None;
     }
     let command_index = first_command_token_index(argv)?;
-    let hit = known_shell_operand_match(argv, command_index, true, context)?;
+    let hit = known_shell_operand_match(argv, command_index, true, || command_index == 0, context)?;
     // The lexical command index can skip wrappers without resolving their
     // option values or working directory.
     let hit = hit.map(|hit| hit.with_inferred_access(command_index != 0));
@@ -1072,13 +1076,16 @@ fn sensitive_path_match_for_shell_segment(
     {
         return None;
     }
-    if let Some(hit) = known_shell_operand_match(&tokens, command_index, false, context) {
-        return hit.map(|hit| {
-            let literal_argv = command_index == 0
-                && astra_sandbox::parse_bash_literal_paths(segment)
-                    .is_some_and(|paths| paths.commands.len() == 1 && paths.commands[0] == tokens);
-            hit.with_inferred_access(!literal_argv)
-        });
+    // An expansion can introduce a file-valued option or a subshell.
+    let literal_argv = LazyCell::new(|| {
+        command_index == 0
+            && astra_sandbox::parse_bash_literal_paths(segment)
+                .is_some_and(|paths| paths.commands.len() == 1 && paths.commands[0] == tokens)
+    });
+    if let Some(hit) =
+        known_shell_operand_match(&tokens, command_index, false, || *literal_argv, context)
+    {
+        return hit.map(|hit| hit.with_inferred_access(!*literal_argv));
     }
     if crate::cloud::approval_policy::bash_command_is_read_only(segment) {
         return None;
@@ -1108,6 +1115,7 @@ fn known_shell_operand_match(
     tokens: &[String],
     command_index: usize,
     require_known: bool,
+    literal_argv: impl FnOnce() -> bool,
     context: &mut PathSensitivityContext,
 ) -> Option<Option<SensitivePathMatch>> {
     if require_known && literal_data_command(&tokens[command_index..]) {
@@ -1177,23 +1185,15 @@ fn known_shell_operand_match(
                 .map(|hit| Some(hit.with_inferred_access(!complete)))
                 .or_else(|| (!require_known || complete).then_some(None));
         }
-        "ls" | "ll" => {
-            return generic_read_operand_match(
-                &tokens[args_start..],
-                command,
-                PathAccess::List,
-                require_known,
-                context,
-            );
-        }
         "sort" | "tree" | "date" | "uniq" | "cut" | "paste" | "nl" | "column" | "fmt" | "fold"
-        | "expand" | "wc" | "file" => {
+        | "expand" | "wc" | "file" | "du" => {
             let paths =
                 crate::cloud::approval_policy::shell_command_paths(command, &tokens[args_start..])?;
-            let positional_access = if command == "tree" && !paths.positionals_are_reads {
-                PathAccess::List
-            } else {
-                PathAccess::Read
+            let positional_access = match paths.positional_access {
+                Some(PathAccess::Metadata) if !literal_argv() => PathAccess::List,
+                Some(access) => access,
+                None if matches!(command, "tree" | "du") => PathAccess::List,
+                None => PathAccess::Read,
             };
             for path in paths.positionals {
                 if let Some(hit) =
@@ -1218,12 +1218,16 @@ fn known_shell_operand_match(
             }
             return Some(None);
         }
-        "cat" | "head" | "tail" | "less" | "more" | "stat" | "du" | "basename" | "dirname"
-        | "realpath" | "readlink" | "test" => {
+        "ls" | "ll" | "cat" | "head" | "tail" | "less" | "more" | "stat" | "basename"
+        | "dirname" | "realpath" | "readlink" | "test" => {
             return generic_read_operand_match(
                 &tokens[args_start..],
                 command,
-                PathAccess::Read,
+                match command {
+                    "ls" | "ll" => PathAccess::List,
+                    "stat" if literal_argv() => PathAccess::Metadata,
+                    _ => PathAccess::Read,
+                },
                 require_known,
                 context,
             );
@@ -1708,7 +1712,7 @@ fn find_sensitive_path_match(
                     let hit = if shell_basename(&command[command_index]) == "find" {
                         None
                     } else {
-                        known_shell_operand_match(command, command_index, false, context)
+                        known_shell_operand_match(command, command_index, false, || false, context)
                     };
                     match hit {
                         Some(Some(hit)) => return Some(hit),
@@ -2391,6 +2395,33 @@ mod tests {
     }
 
     #[test]
+    fn bash_metadata_operands_do_not_waive_content_or_write_checks() {
+        for command in [
+            "du -sh cache ~/.docker 2>/dev/null",
+            "stat .env",
+            "du -s --exclude=.env .ssh",
+        ] {
+            let denial = bash_protected_path_denial(command);
+            assert!(denial.is_none(), "{command}: {denial:?}");
+        }
+        for (command, access) in [
+            ("du -sh .ssh; cat .env", PathAccess::Read),
+            ("du -s --files0-from=.env .ssh", PathAccess::Read),
+            ("du --summarize --exclude-f .env .ssh", PathAccess::Read),
+            ("stat .env < .env", PathAccess::Read),
+            ("du -sh .ssh > .env", PathAccess::Write),
+            ("du -s \"$flags\" .ssh", PathAccess::List),
+            ("du -a .ssh", PathAccess::List),
+            ("du -as .ssh", PathAccess::List),
+            ("du --s .ssh", PathAccess::List),
+            ("stat /etc", PathAccess::Metadata),
+        ] {
+            let hit = sensitive_path_match_for_shell_command(command).expect(command);
+            assert_eq!(hit.access, access, "{command}");
+        }
+    }
+
+    #[test]
     fn file_option_paths_in_compounds_remain_checked() {
         for command in [
             "{ file --magic-file=.env .claude/README.md; }",
@@ -2571,6 +2602,8 @@ mod tests {
         let error = bash_tool_result_denial_in_directory(&read, temp.path()).unwrap();
         assert!(error.contains("owned tool-result artifact"), "{error}");
         assert!(error.contains("introspect"), "{error}");
+        let metadata = format!("stat '{}'", artifact.display());
+        assert!(bash_tool_result_denial_in_directory(&metadata, temp.path()).is_some());
         let glob = format!("cat '{}'/call_*", artifact.parent().unwrap().display());
         assert!(bash_tool_result_denial_in_directory(&glob, temp.path()).is_some());
         let handle = "artifact://session/tool-result/result_example";

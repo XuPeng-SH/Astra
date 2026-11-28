@@ -104,6 +104,11 @@ pub fn classify_command_result(exit_code: Option<i32>) -> CommandResultClass {
     }
 }
 
+/// A command exit is a process observation even if the command failed.
+pub fn process_exit_status(exit_code: i32) -> String {
+    format!("[exit code: {exit_code}]")
+}
+
 /// A drained pipe can end with a partial credential if its producer was
 /// interrupted. Use this conservative check only for display redaction.
 pub fn shell_output_tail_may_be_partial(exit_code: i32) -> bool {

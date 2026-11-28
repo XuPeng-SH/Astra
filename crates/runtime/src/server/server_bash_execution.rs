@@ -394,7 +394,10 @@ pub(crate) fn tool_result_from_server_bash_output(
     let command_failed = output.exit_code.is_some_and(|code| code != 0)
         || output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty();
     let mut result = if command_failed {
-        astra_tools::ToolResult::error(format!("Error: {body}"))
+        if output.exit_code.is_none() {
+            body.insert_str(0, "Error: ");
+        }
+        astra_tools::ToolResult::error(body)
     } else {
         astra_tools::ToolResult::text(body)
     };
@@ -432,13 +435,11 @@ pub(crate) fn format_server_bash_output(output: &IsolatedOutput, timeout_secs: f
         body.push_str("stderr:\n");
         body.push_str(&output.stderr);
     }
-    if let Some(code) = output.exit_code {
-        if code != 0 {
-            if !body.is_empty() && !body.ends_with('\n') {
-                body.push('\n');
-            }
-            body.push_str(&format!("(exit code: {code})"));
+    if let Some(code) = output.exit_code.filter(|&code| code != 0) {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
         }
+        body.push_str(&astra_tools::exit_semantics::process_exit_status(code));
     }
     if output.stdout_capped || output.stderr_capped {
         if !body.is_empty() && !body.ends_with('\n') {
@@ -1094,7 +1095,7 @@ mod tests {
                 .and_then(serde_json::Value::as_i64),
             Some(1)
         );
-        assert!(result.output.contains("(exit code: 1)"), "{result:?}");
+        assert!(result.output.contains("[exit code: 1]"), "{result:?}");
     }
 
     #[test]

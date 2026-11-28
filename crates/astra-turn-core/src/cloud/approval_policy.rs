@@ -4,6 +4,8 @@
 //! CLI permission prompts use [`cloud_gated_tool_kind`] so icons (Execute vs Write) and cloud gating
 //! cannot drift.
 
+use crate::permission::path_sensitivity::PathAccess;
+
 /// Canonical tool names requiring user approval, derived from the central
 /// [`crate::tool_categories`] registry.
 pub static CLOUD_APPROVAL_REQUIRED_TOOLS: std::sync::LazyLock<Vec<&'static str>> =
@@ -652,7 +654,7 @@ pub(crate) struct CommandPaths<'a> {
     pub positionals: Vec<&'a str>,
     pub reads: Vec<&'a str>,
     pub writes: Vec<&'a str>,
-    pub positionals_are_reads: bool,
+    pub positional_access: Option<PathAccess>,
 }
 
 fn sort_argv_is_read_only(args: &[String]) -> bool {
@@ -749,6 +751,26 @@ pub(crate) fn shell_command_paths<'a>(
             None,
             &[("--files0-from", PathOption::Read)],
         )),
+        "du" => Some(text_input_paths(
+            args,
+            "BdIt",
+            &[
+                "block-size",
+                "exclude",
+                "max-depth",
+                "threshold",
+                "time-style",
+            ],
+            None,
+            &[
+                ("-s", PathOption::Positionals(PathAccess::Metadata)),
+                ("--summarize", PathOption::Positionals(PathAccess::Metadata)),
+                ("-a", PathOption::Positionals(PathAccess::List)),
+                ("--all", PathOption::Positionals(PathAccess::List)),
+                ("--exclude-from", PathOption::Read),
+                ("--files0-from", PathOption::Read),
+            ],
+        )),
         "file" => Some(text_input_paths(
             args,
             "eFP",
@@ -773,8 +795,8 @@ pub(crate) fn shell_command_paths<'a>(
                 ("--hintro", PathOption::Read),
                 ("--houtro", PathOption::Read),
                 ("-o", PathOption::WriteSeparate),
-                ("--fromfile", PathOption::ReadPositionals),
-                ("--fromtabfile", PathOption::ReadPositionals),
+                ("--fromfile", PathOption::Positionals(PathAccess::Read)),
+                ("--fromtabfile", PathOption::Positionals(PathAccess::Read)),
             ],
         )),
         "sort" => Some(text_input_paths(
@@ -806,7 +828,7 @@ pub(crate) fn shell_command_paths<'a>(
                 positionals: Vec::new(),
                 reads: Vec::new(),
                 writes: Vec::new(),
-                positionals_are_reads: false,
+                positional_access: None,
             };
             let mut index = 0;
             while let Some(argument) = args.get(index).map(String::as_str) {
@@ -867,7 +889,7 @@ enum PathOption {
     ReadList,
     Write,
     WriteSeparate,
-    ReadPositionals,
+    Positionals(PathAccess),
 }
 
 /// Collect positional inputs and file-valued options, including short clusters
@@ -883,7 +905,7 @@ fn text_input_paths<'a>(
         positionals: Vec::new(),
         reads: Vec::new(),
         writes: Vec::new(),
-        positionals_are_reads: false,
+        positional_access: None,
     };
     let mut index = 0;
     let mut positional_only = false;
@@ -894,12 +916,16 @@ fn text_input_paths<'a>(
             let (option, attached) = arg[2..]
                 .split_once('=')
                 .map_or((&arg[2..], None), |(option, value)| (option, Some(value)));
-            let path_option = path_options.iter().find(|(name, _)| {
-                name.strip_prefix("--")
-                    .is_some_and(|name| name.starts_with(option))
+            let path_option = path_options.iter().find(|(name, role)| {
+                name.strip_prefix("--").is_some_and(|name| {
+                    name == option
+                        || (!matches!(role, PathOption::Positionals(PathAccess::Metadata))
+                            && !long_values.contains(&option)
+                            && name.starts_with(option))
+                })
             });
             if let Some((_, role)) = path_option {
-                let value = if matches!(role, PathOption::ReadPositionals) {
+                let value = if matches!(role, PathOption::Positionals(_)) {
                     None
                 } else {
                     attached.or_else(|| {
@@ -907,7 +933,7 @@ fn text_input_paths<'a>(
                         args.get(index).map(String::as_str)
                     })
                 };
-                add_file_value(&mut paths, value, *role);
+                record_path_option(&mut paths, value, *role);
             } else if exact_switch != Some(option)
                 && long_values.iter().any(|value| value.starts_with(option))
                 && attached.is_none()
@@ -921,6 +947,10 @@ fn text_input_paths<'a>(
                         .is_some_and(|name| name.len() == 1 && name.starts_with(flag))
                 });
                 if let Some((_, role)) = path_option {
+                    if matches!(role, PathOption::Positionals(_)) {
+                        record_path_option(&mut paths, None, *role);
+                        continue;
+                    }
                     let end = position + flag.len_utf8() + 1;
                     let value = if end == arg.len() || matches!(role, PathOption::WriteSeparate) {
                         index += 1;
@@ -928,7 +958,7 @@ fn text_input_paths<'a>(
                     } else {
                         Some(&arg[end..])
                     };
-                    add_file_value(&mut paths, value, *role);
+                    record_path_option(&mut paths, value, *role);
                     if matches!(role, PathOption::WriteSeparate) && end != arg.len() {
                         continue;
                     }
@@ -949,9 +979,14 @@ fn text_input_paths<'a>(
     paths
 }
 
-fn add_file_value<'a>(paths: &mut CommandPaths<'a>, value: Option<&'a str>, role: PathOption) {
+fn record_path_option<'a>(paths: &mut CommandPaths<'a>, value: Option<&'a str>, role: PathOption) {
     match role {
-        PathOption::ReadPositionals => paths.positionals_are_reads = true,
+        PathOption::Positionals(access) => {
+            // A summary switch cannot waive an explicit listing or read.
+            if access != PathAccess::Metadata || paths.positional_access.is_none() {
+                paths.positional_access = Some(access);
+            }
+        }
         PathOption::Read => {
             if let Some(value) = value.filter(|value| *value != "-") {
                 paths.reads.push(value);

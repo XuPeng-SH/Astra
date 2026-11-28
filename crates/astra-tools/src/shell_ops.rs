@@ -1711,7 +1711,7 @@ async fn execute_bash_inner(
     result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
 
     let exit_note = (output.exit_code != 0 && !output.timed_out && !output.cancelled)
-        .then(|| format!("[exit code: {}]", output.exit_code));
+        .then(|| crate::exit_semantics::process_exit_status(output.exit_code));
     // Keep diagnostics and terminal facts visible without writing unrequested
     // output into the workspace. The producer has no task reader here.
     let finish_presentation = |text: String| {

@@ -37,7 +37,8 @@ pub use git_safety::{
 pub use path::{SandboxPathError, canonicalize_parent_and_append, normalize_path, validate_path};
 pub use policy::{
     IsolationLevel, SandboxPolicy, SensitivePathRules, is_never_readable_path,
-    is_sensitive_directory, is_sensitive_path, is_sensitive_system_dir, sensitive_path_rules,
+    is_sensitive_directory, is_sensitive_os_dir, is_sensitive_path, is_sensitive_system_dir,
+    sensitive_path_rules,
 };
 pub use process_isolation::{
     BashInvocationOwner, CgroupGuard, InvocationSupervisor, IsolatedOutput, IsolationConfig,
