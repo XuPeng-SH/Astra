@@ -54,7 +54,7 @@ criteria:
     name: bash
     document: error
     path: ""
-    contains: "exit code 1"
+    contains: "[exit code: 1]"
   - type: journal_tool_outcome_count
     name: bash
     ok: true

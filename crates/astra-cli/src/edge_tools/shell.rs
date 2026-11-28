@@ -1190,13 +1190,14 @@ fn validate_command_path_arg(
         return Some(msg);
     }
 
-    validate_plain_command_path_arg(policy, arg, oldpwd)
+    validate_plain_command_path_arg(policy, arg, oldpwd, validate_path)
 }
 
 fn validate_plain_command_path_arg(
     policy: &BashPathContext<'_>,
     arg: &str,
     oldpwd: Option<&std::path::Path>,
+    validate: fn(&SandboxPolicy, &str) -> Result<PathBuf, astra_sandbox::SandboxPathError>,
 ) -> Option<ShellRunError> {
     let literal_arg = restore_escaped_shell_analysis_chars(arg);
     if let Some(kind) = unresolved_static_dir_reference_kind(policy, arg, oldpwd) {
@@ -1217,7 +1218,7 @@ fn validate_plain_command_path_arg(
         policy.working_dir.join(&literal_arg)
     };
     let path_str = resolved.to_string_lossy();
-    if let Err(error) = validate_path(policy, &path_str) {
+    if let Err(error) = validate(policy, &path_str) {
         if error.is_boundary_violation() {
             let mut error = ShellRunError::new(format!(
                 "{}The command references '{}' which is outside the project directory '{}'. Ask the user for permission before accessing files outside the project.",
@@ -1246,7 +1247,9 @@ fn validate_brace_expansion_path_arg(
         )),
         BraceExpansionCandidates::Expanded(candidates) => {
             for candidate in candidates {
-                if validate_plain_command_path_arg(policy, &candidate, oldpwd).is_some() {
+                if validate_plain_command_path_arg(policy, &candidate, oldpwd, validate_path)
+                    .is_some()
+                {
                     return Some(ShellRunError::from(
                         brace_expansion_boundary_review_message(policy, arg),
                     ));
@@ -2889,6 +2892,27 @@ fn check_single_command_path_boundary(
     }
 
     let base = parts[0].rsplit('/').next().unwrap_or(parts[0].as_str());
+
+    if let Some(violation) =
+        astra_turn_core::permission::path_sensitivity::check_bash_observational_paths(
+            command,
+            base,
+            |path, access| {
+                use astra_turn_core::permission::path_sensitivity::PathAccess;
+                match access {
+                    PathAccess::Metadata => validate_plain_command_path_arg(
+                        policy,
+                        path,
+                        oldpwd,
+                        astra_sandbox::validate_metadata_path,
+                    ),
+                    _ => validate_command_path_arg(policy, path, oldpwd),
+                }
+            },
+        )
+    {
+        return violation;
+    }
 
     if is_shell_interpreter_command(base) {
         return check_shell_interpreter_path_boundary(policy, &parts, oldpwd);
@@ -9153,14 +9177,13 @@ mod tests {
         std::fs::create_dir(dir.path().join(".docker")).unwrap();
         std::fs::write(dir.path().join(".docker/config.json"), "fixture contents").unwrap();
 
-        let inventory = executor
-            .execute_with_metadata(
-                "bash",
-                &serde_json::json!({"command": "du -sh .docker 2>/dev/null"}),
-            )
-            .await;
-        assert!(!inventory.is_error, "{inventory:?}");
-        assert!(inventory.output.contains(".docker"), "{inventory:?}");
+        for command in ["du -sh .docker 2>/dev/null", "stat .docker/config.json"] {
+            let inventory = executor
+                .execute_with_metadata("bash", &serde_json::json!({"command": command}))
+                .await;
+            assert!(!inventory.is_error, "{command}: {inventory:?}");
+            assert!(inventory.output.contains(".docker"), "{inventory:?}");
+        }
 
         let read = executor
             .execute_with_metadata(

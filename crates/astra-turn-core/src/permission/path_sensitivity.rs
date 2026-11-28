@@ -101,6 +101,29 @@ pub fn bash_protected_path_denial_in_directory(command: &str, directory: &Path) 
     bash_protected_path_denial_in_context(command, &mut context)
 }
 
+/// Share the observable filesystem operands with the CLI workspace validator.
+/// Outer `None` leaves the command to the caller's existing scanner.
+/// Redirections are checked separately.
+pub fn check_bash_observational_paths<T>(
+    segment: &str,
+    program: &str,
+    mut check: impl FnMut(&str, PathAccess) -> Option<T>,
+) -> Option<Option<T>> {
+    if !matches!(program, "du" | "stat") {
+        return None;
+    }
+    let (argv, _) = shell_tokenize_like_bash(segment);
+    if shell_basename(argv.first()?) != program {
+        return None;
+    }
+    let paths = crate::cloud::approval_policy::shell_command_paths(program, &argv[1..])?;
+    Some(
+        paths
+            .operands(program, || is_literal_shell_argv(segment, &argv))
+            .find_map(|(path, access)| check(path, access)),
+    )
+}
+
 /// Enforce the tool-result reader boundary alongside an existing workspace sandbox.
 pub fn bash_tool_result_denial_in_directory(command: &str, directory: &Path) -> Option<String> {
     let mut context = PathSensitivityContext::new(Some(directory));
@@ -1077,11 +1100,8 @@ fn sensitive_path_match_for_shell_segment(
         return None;
     }
     // An expansion can introduce a file-valued option or a subshell.
-    let literal_argv = LazyCell::new(|| {
-        command_index == 0
-            && astra_sandbox::parse_bash_literal_paths(segment)
-                .is_some_and(|paths| paths.commands.len() == 1 && paths.commands[0] == tokens)
-    });
+    let literal_argv =
+        LazyCell::new(|| command_index == 0 && is_literal_shell_argv(segment, &tokens));
     if let Some(hit) =
         known_shell_operand_match(&tokens, command_index, false, || *literal_argv, context)
     {
@@ -1100,6 +1120,11 @@ fn sensitive_path_match_for_shell_segment(
         .map(|hit| hit.with_inferred_access(true));
     context.approved_workspace = approved_workspace;
     hit
+}
+
+fn is_literal_shell_argv(segment: &str, tokens: &[String]) -> bool {
+    astra_sandbox::parse_bash_literal_paths(segment)
+        .is_some_and(|paths| paths.commands.len() == 1 && paths.commands[0] == tokens)
 }
 
 fn literal_data_command(argv: &[String]) -> bool {
@@ -1186,46 +1211,24 @@ fn known_shell_operand_match(
                 .or_else(|| (!require_known || complete).then_some(None));
         }
         "sort" | "tree" | "date" | "uniq" | "cut" | "paste" | "nl" | "column" | "fmt" | "fold"
-        | "expand" | "wc" | "file" | "du" => {
+        | "expand" | "wc" | "file" | "du" | "stat" => {
             let paths =
                 crate::cloud::approval_policy::shell_command_paths(command, &tokens[args_start..])?;
-            let positional_access = match paths.positional_access {
-                Some(PathAccess::Metadata) if !literal_argv() => PathAccess::List,
-                Some(access) => access,
-                None if matches!(command, "tree" | "du") => PathAccess::List,
-                None => PathAccess::Read,
-            };
-            for path in paths.positionals {
-                if let Some(hit) =
-                    shell_operand_sensitive_path_match(path, positional_access, context)
-                {
-                    return Some(Some(hit));
-                }
-            }
-            for path in paths.reads {
-                if let Some(hit) =
-                    shell_operand_sensitive_path_match(path, PathAccess::Read, context)
-                {
-                    return Some(Some(hit));
-                }
-            }
-            for path in paths.writes {
-                if let Some(hit) =
-                    shell_operand_sensitive_path_match(path, PathAccess::Write, context)
-                {
-                    return Some(Some(hit));
-                }
-            }
-            return Some(None);
+            return Some(
+                paths
+                    .operands(command, literal_argv)
+                    .find_map(|(path, access)| {
+                        shell_operand_sensitive_path_match(path, access, context)
+                    }),
+            );
         }
-        "ls" | "ll" | "cat" | "head" | "tail" | "less" | "more" | "stat" | "basename"
-        | "dirname" | "realpath" | "readlink" | "test" => {
+        "ls" | "ll" | "cat" | "head" | "tail" | "less" | "more" | "basename" | "dirname"
+        | "realpath" | "readlink" | "test" => {
             return generic_read_operand_match(
                 &tokens[args_start..],
                 command,
                 match command {
                     "ls" | "ll" => PathAccess::List,
-                    "stat" if literal_argv() => PathAccess::Metadata,
                     _ => PathAccess::Read,
                 },
                 require_known,
@@ -2400,6 +2403,7 @@ mod tests {
             "du -sh cache ~/.docker 2>/dev/null",
             "stat .env",
             "du -s --exclude=.env .ssh",
+            "du -s --time .ssh",
         ] {
             let denial = bash_protected_path_denial(command);
             assert!(denial.is_none(), "{command}: {denial:?}");
@@ -2407,6 +2411,7 @@ mod tests {
         for (command, access) in [
             ("du -sh .ssh; cat .env", PathAccess::Read),
             ("du -s --files0-from=.env .ssh", PathAccess::Read),
+            ("du -s -X .env cache", PathAccess::Read),
             ("du --summarize --exclude-f .env .ssh", PathAccess::Read),
             ("stat .env < .env", PathAccess::Read),
             ("du -sh .ssh > .env", PathAccess::Write),
@@ -2414,11 +2419,20 @@ mod tests {
             ("du -a .ssh", PathAccess::List),
             ("du -as .ssh", PathAccess::List),
             ("du --s .ssh", PathAccess::List),
+            ("du --time .ssh", PathAccess::List),
+            ("du -s --unrecognized .ssh", PathAccess::List),
             ("stat /etc", PathAccess::Metadata),
         ] {
             let hit = sensitive_path_match_for_shell_command(command).expect(command);
             assert_eq!(hit.access, access, "{command}");
         }
+
+        let stat = check_bash_observational_paths(
+            "stat -f '--format' workspace-file",
+            "stat",
+            |path, access| (path == "workspace-file").then_some(access),
+        );
+        assert_eq!(stat, Some(Some(PathAccess::Metadata)));
     }
 
     #[test]

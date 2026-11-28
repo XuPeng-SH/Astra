@@ -97,11 +97,8 @@ async fn repeated_failed_builds_preserve_diagnostics_without_inventing_progress(
             result.tool_result_fields.as_ref().unwrap()["exit_code"],
             code
         );
-        assert!(
-            result.output.contains(diagnostic)
-                && result.output.contains(&format!("exit code {code}")),
-            "{result:?}"
-        );
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains(diagnostic), "{result:?}");
         assert!(
             !result.output.contains("build succeeded") && !result.output.contains("0 failed"),
             "{result:?}"

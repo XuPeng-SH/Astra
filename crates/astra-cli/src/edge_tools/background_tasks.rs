@@ -3699,17 +3699,12 @@ mod tests {
             .await;
 
         let events = wait_for_task_terminal(&mut reg, &id).await;
-        let completion = events
-            .iter()
-            .find_map(|event| match event {
-                BgTaskEvent::Completed { id: eid, .. } if eid == &id => Some("completed"),
-                BgTaskEvent::Failed { id: eid, error, .. } if eid == &id => Some(error.as_str()),
-                _ => None,
-            })
-            .expect("background grep should emit a terminal event");
-
-        assert!(completion.contains("exit code 1"), "{completion}");
-        assert_eq!(reg.get(&id).unwrap().projected_status(), "failed");
+        assert!(events.iter().any(|event| {
+            matches!(event, BgTaskEvent::Failed { id: event_id, .. } if event_id == &id)
+        }));
+        let task = reg.get(&id).expect("background grep task");
+        assert_eq!(task.exit_code, Some(1));
+        assert_eq!(task.projected_status(), "failed");
     }
 
     #[tokio::test]

@@ -716,6 +716,9 @@ the actual system boundary, not a similarly named tree inside a workspace.
 Known metadata operands may inspect credential-marked paths. Directory listings,
 file-valued options and redirections still have their own preflight checks.
 System paths and owned tool-result artifacts retain their preflight rules.
+Standard and Strict CLI apply the same operand roles within their workspace
+boundary. An unrecognized option keeps the conservative access role for an
+operand instead of granting metadata access.
 The native provider projects the sandbox's path rules into its filesystem
 masks without consulting the Server filesystem. A provider's path-only mask
 may also hide a directory whose name matches a sensitive filename pattern.

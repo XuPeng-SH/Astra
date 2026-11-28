@@ -10953,7 +10953,7 @@ all_consumers: true
                     "name": "bash",
                     "ok": false,
                     "args_full": r#"{"command":"probe"}"#,
-                    "error": "status=failed\nError: bash execution failed (exit code 1)\n(exit code 1)"
+                    "error": "status=failed\n[exit code: 1]"
                 }]
             }),
         )]);
@@ -10961,7 +10961,7 @@ all_consumers: true
             name: "bash".into(),
             document: JournalToolDocument::Error,
             path: String::new(),
-            contains: "exit code 1".into(),
+            contains: "[exit code: 1]".into(),
         };
 
         let results = evaluate_deterministic_with_session(

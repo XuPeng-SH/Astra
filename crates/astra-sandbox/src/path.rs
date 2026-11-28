@@ -1,6 +1,6 @@
 //! Path validation and boundary enforcement.
 
-use super::policy::{IsolationLevel, SandboxPolicy, is_never_readable_path};
+use super::policy::{IsolationLevel, SandboxPolicy, is_never_readable_path, is_sensitive_os_dir};
 use std::path::{Path, PathBuf};
 
 /// Error type for path validation failures.
@@ -80,6 +80,22 @@ impl SandboxPathError {
 ///
 /// Returns `SandboxPathError` if the path escapes the boundary or can't be resolved.
 pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, SandboxPathError> {
+    validate_path_with(policy, path, is_never_readable_path)
+}
+
+/// Validate a proven metadata operand against the same workspace boundary.
+pub fn validate_metadata_path(
+    policy: &SandboxPolicy,
+    path: &str,
+) -> Result<PathBuf, SandboxPathError> {
+    validate_path_with(policy, path, is_sensitive_os_dir)
+}
+
+fn validate_path_with(
+    policy: &SandboxPolicy,
+    path: &str,
+    protected: fn(&Path) -> bool,
+) -> Result<PathBuf, SandboxPathError> {
     // Resolve the raw path
     let raw = Path::new(path);
     let resolved = if raw.is_absolute() {
@@ -90,7 +106,7 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
 
     if policy.isolation == IsolationLevel::Permissive {
         let sensitive_candidate = sensitive_check_path(&resolved);
-        if is_never_readable_path(&resolved) || is_never_readable_path(&sensitive_candidate) {
+        if protected(&resolved) || protected(&sensitive_candidate) {
             return Err(SandboxPathError::SensitivePath {
                 requested: path.to_string(),
             });
@@ -102,7 +118,7 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
     // remains subject to filesystem changes after this check.
     let canonical = canonicalize_parent_and_append(&resolved)?;
 
-    if is_never_readable_path(&resolved) || is_never_readable_path(&canonical) {
+    if protected(&resolved) || protected(&canonical) {
         return Err(SandboxPathError::SensitivePath {
             requested: path.to_string(),
         });
@@ -223,6 +239,23 @@ mod tests {
 
     fn strict_policy(root: &str) -> SandboxPolicy {
         SandboxPolicy::strict(root)
+    }
+
+    #[test]
+    fn metadata_uses_the_same_workspace_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut policy = SandboxPolicy::for_project(root.path());
+        policy.clear_allowed_paths();
+        assert!(validate_metadata_path(&policy, ".env").is_ok());
+        assert!(matches!(
+            validate_path(&policy, ".env"),
+            Err(SandboxPathError::SensitivePath { .. })
+        ));
+        assert!(matches!(
+            validate_metadata_path(&policy, outside.path().to_str().unwrap()),
+            Err(SandboxPathError::BoundaryEscape { .. })
+        ));
     }
 
     #[test]
