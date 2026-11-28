@@ -4,8 +4,6 @@
 //! CLI permission prompts use [`cloud_gated_tool_kind`] so icons (Execute vs Write) and cloud gating
 //! cannot drift.
 
-use crate::permission::path_sensitivity::PathAccess;
-
 /// Canonical tool names requiring user approval, derived from the central
 /// [`crate::tool_categories`] registry.
 pub static CLOUD_APPROVAL_REQUIRED_TOOLS: std::sync::LazyLock<Vec<&'static str>> =
@@ -651,39 +649,10 @@ const SORT_VALUE_OPTIONS: &[&str] = &[
 ];
 
 pub(crate) struct CommandPaths<'a> {
-    positionals: Vec<&'a str>,
-    reads: Vec<&'a str>,
-    writes: Vec<&'a str>,
-    positional_access: Option<PathAccess>,
-    options_known: bool,
-}
-
-impl<'a> CommandPaths<'a> {
-    pub(crate) fn operands(
-        self,
-        command: &str,
-        literal_argv: impl FnOnce() -> bool,
-    ) -> impl Iterator<Item = (&'a str, PathAccess)> {
-        let default_access = if matches!(command, "tree" | "du") {
-            PathAccess::List
-        } else {
-            PathAccess::Read
-        };
-        let positional_access = match self.positional_access {
-            Some(PathAccess::Metadata) if !self.options_known || !literal_argv() => default_access,
-            Some(access) => access,
-            None => default_access,
-        };
-        self.positionals
-            .into_iter()
-            .map(move |path| (path, positional_access))
-            .chain(self.reads.into_iter().map(|path| (path, PathAccess::Read)))
-            .chain(
-                self.writes
-                    .into_iter()
-                    .map(|path| (path, PathAccess::Write)),
-            )
-    }
+    pub positionals: Vec<&'a str>,
+    pub reads: Vec<&'a str>,
+    pub writes: Vec<&'a str>,
+    pub positionals_are_reads: bool,
 }
 
 fn sort_argv_is_read_only(args: &[String]) -> bool {
@@ -704,7 +673,7 @@ pub(crate) fn shell_command_paths<'a>(
             args,
             "fsw",
             &["skip-fields", "skip-chars", "check-chars"],
-            ("", &[]),
+            None,
             &[],
         )),
         "cut" => Some(text_input_paths(
@@ -717,10 +686,10 @@ pub(crate) fn shell_command_paths<'a>(
                 "fields",
                 "output-delimiter",
             ],
-            ("", &[]),
+            None,
             &[],
         )),
-        "paste" => Some(text_input_paths(args, "d", &["delimiters"], ("", &[]), &[])),
+        "paste" => Some(text_input_paths(args, "d", &["delimiters"], None, &[])),
         "nl" => Some(text_input_paths(
             args,
             "bdfhilnsvw",
@@ -736,7 +705,7 @@ pub(crate) fn shell_command_paths<'a>(
                 "starting-line-number",
                 "number-width",
             ],
-            ("", &[]),
+            None,
             &[],
         )),
         "column" => Some(text_input_paths(
@@ -761,23 +730,23 @@ pub(crate) fn shell_command_paths<'a>(
                 "tree-parent",
             ],
             // --table is a switch, despite being a prefix of value options.
-            ("", &["table"]),
+            Some("table"),
             &[],
         )),
         "fmt" => Some(text_input_paths(
             args,
             "wgp",
             &["width", "goal", "prefix"],
-            ("", &[]),
+            None,
             &[],
         )),
-        "fold" => Some(text_input_paths(args, "w", &["width"], ("", &[]), &[])),
-        "expand" => Some(text_input_paths(args, "t", &["tabs"], ("", &[]), &[])),
+        "fold" => Some(text_input_paths(args, "w", &["width"], None, &[])),
+        "expand" => Some(text_input_paths(args, "t", &["tabs"], None, &[])),
         "wc" => Some(text_input_paths(
             args,
             "",
             &["total"],
-            ("", &[]),
+            None,
             &[("--files0-from", PathOption::Read)],
         )),
         "du" => Some(text_input_paths(
@@ -790,67 +759,18 @@ pub(crate) fn shell_command_paths<'a>(
                 "threshold",
                 "time-style",
             ],
-            (
-                "0ADHLPSbcghklmnrx",
-                &[
-                    "apparent-size",
-                    "bytes",
-                    "count-links",
-                    "dereference",
-                    "dereference-args",
-                    "human-readable",
-                    "inodes",
-                    "no-dereference",
-                    "null",
-                    "one-file-system",
-                    "separate-dirs",
-                    "si",
-                    "time",
-                    "total",
-                    "help",
-                    "version",
-                ],
-            ),
+            Some("time"),
             &[
-                ("-s", PathOption::Positionals(PathAccess::Metadata)),
-                ("--summarize", PathOption::Positionals(PathAccess::Metadata)),
-                ("-a", PathOption::Positionals(PathAccess::List)),
-                ("--all", PathOption::Positionals(PathAccess::List)),
                 ("-X", PathOption::Read),
                 ("--exclude-from", PathOption::Read),
                 ("--files0-from", PathOption::Read),
             ],
         )),
-        "stat" => {
-            // GNU and BSD disagree about whether -f consumes a format. Keep
-            // detached values visible to workspace policy across both forms.
-            let mut paths = text_input_paths(
-                args,
-                "",
-                &[],
-                (
-                    "cFLfnlqrstx",
-                    &[
-                        "cached",
-                        "dereference",
-                        "file-system",
-                        "format",
-                        "printf",
-                        "terse",
-                        "help",
-                        "version",
-                    ],
-                ),
-                &[],
-            );
-            paths.positional_access = Some(PathAccess::Metadata);
-            Some(paths)
-        }
         "file" => Some(text_input_paths(
             args,
             "eFP",
             &["exclude", "exclude-quiet", "separator", "parameter"],
-            ("", &[]),
+            None,
             &[
                 ("-f", PathOption::Read),
                 ("--files-from", PathOption::Read),
@@ -863,15 +783,15 @@ pub(crate) fn shell_command_paths<'a>(
             args,
             "LPIHT",
             &["filelimit", "timefmt", "sort", "charset"],
-            ("", &[]),
+            None,
             &[
                 ("--gitfile", PathOption::Read),
                 ("--infofile", PathOption::Read),
                 ("--hintro", PathOption::Read),
                 ("--houtro", PathOption::Read),
                 ("-o", PathOption::WriteSeparate),
-                ("--fromfile", PathOption::Positionals(PathAccess::Read)),
-                ("--fromtabfile", PathOption::Positionals(PathAccess::Read)),
+                ("--fromfile", PathOption::ReadPositionals),
+                ("--fromtabfile", PathOption::ReadPositionals),
             ],
         )),
         "sort" => Some(text_input_paths(
@@ -886,7 +806,7 @@ pub(crate) fn shell_command_paths<'a>(
                 "compress-program",
                 "sort",
             ],
-            ("", &[]),
+            None,
             &[
                 ("--files0-from", PathOption::Read),
                 ("--random-source", PathOption::Read),
@@ -903,8 +823,7 @@ pub(crate) fn shell_command_paths<'a>(
                 positionals: Vec::new(),
                 reads: Vec::new(),
                 writes: Vec::new(),
-                positional_access: None,
-                options_known: true,
+                positionals_are_reads: false,
             };
             let mut index = 0;
             while let Some(argument) = args.get(index).map(String::as_str) {
@@ -965,7 +884,7 @@ enum PathOption {
     ReadList,
     Write,
     WriteSeparate,
-    Positionals(PathAccess),
+    ReadPositionals,
 }
 
 /// Collect positional inputs and file-valued options, including short clusters
@@ -974,16 +893,14 @@ fn text_input_paths<'a>(
     args: &'a [String],
     short_values: &str,
     long_values: &[&str],
-    switches: (&str, &[&str]),
+    exact_switch: Option<&str>,
     path_options: &[(&str, PathOption)],
 ) -> CommandPaths<'a> {
-    let (short_switches, long_switches) = switches;
     let mut paths = CommandPaths {
         positionals: Vec::new(),
         reads: Vec::new(),
         writes: Vec::new(),
-        positional_access: None,
-        options_known: true,
+        positionals_are_reads: false,
     };
     let mut index = 0;
     let mut positional_only = false;
@@ -994,45 +911,26 @@ fn text_input_paths<'a>(
             let (option, attached) = arg[2..]
                 .split_once('=')
                 .map_or((&arg[2..], None), |(option, value)| (option, Some(value)));
-            if long_switches.contains(&option) {
-                index += 1;
-                continue;
-            }
-            let path_option = path_options.iter().find(|(name, role)| {
+            let path_option = path_options.iter().find(|(name, _)| {
                 name.strip_prefix("--").is_some_and(|name| {
-                    name == option
-                        || (!matches!(role, PathOption::Positionals(PathAccess::Metadata))
-                            && !long_values.contains(&option)
-                            && name.starts_with(option))
+                    name == option || (!long_values.contains(&option) && name.starts_with(option))
                 })
             });
             if let Some((_, role)) = path_option {
-                let value = if matches!(role, PathOption::Positionals(_)) {
+                let value = if matches!(role, PathOption::ReadPositionals) {
                     None
                 } else {
-                    let value = attached.or_else(|| {
+                    attached.or_else(|| {
                         index += 1;
                         args.get(index).map(String::as_str)
-                    });
-                    paths.options_known &= value.is_some();
-                    value
+                    })
                 };
-                record_path_option(&mut paths, value, *role);
-            } else if long_values.contains(&option) {
-                if attached.is_none() {
-                    index += 1;
-                    paths.options_known &= index < args.len();
-                }
-            } else {
-                paths.options_known = false;
-                if long_values.iter().any(|value| value.starts_with(option))
-                    && !long_switches
-                        .iter()
-                        .any(|switch| switch.starts_with(option))
-                    && attached.is_none()
-                {
-                    index += 1;
-                }
+                add_file_value(&mut paths, value, *role);
+            } else if exact_switch != Some(option)
+                && long_values.iter().any(|value| value.starts_with(option))
+                && attached.is_none()
+            {
+                index += 1;
             }
         } else if !positional_only && arg.starts_with('-') && arg != "-" {
             for (position, flag) in arg[1..].char_indices() {
@@ -1041,10 +939,6 @@ fn text_input_paths<'a>(
                         .is_some_and(|name| name.len() == 1 && name.starts_with(flag))
                 });
                 if let Some((_, role)) = path_option {
-                    if matches!(role, PathOption::Positionals(_)) {
-                        record_path_option(&mut paths, None, *role);
-                        continue;
-                    }
                     let end = position + flag.len_utf8() + 1;
                     let value = if end == arg.len() || matches!(role, PathOption::WriteSeparate) {
                         index += 1;
@@ -1052,8 +946,7 @@ fn text_input_paths<'a>(
                     } else {
                         Some(&arg[end..])
                     };
-                    paths.options_known &= value.is_some();
-                    record_path_option(&mut paths, value, *role);
+                    add_file_value(&mut paths, value, *role);
                     if matches!(role, PathOption::WriteSeparate) && end != arg.len() {
                         continue;
                     }
@@ -1062,11 +955,9 @@ fn text_input_paths<'a>(
                 if short_values.contains(flag) {
                     if position + flag.len_utf8() + 1 == arg.len() {
                         index += 1;
-                        paths.options_known &= index < args.len();
                     }
                     break;
                 }
-                paths.options_known &= short_switches.contains(flag);
             }
         } else if arg != "-" {
             paths.positionals.push(arg);
@@ -1076,14 +967,9 @@ fn text_input_paths<'a>(
     paths
 }
 
-fn record_path_option<'a>(paths: &mut CommandPaths<'a>, value: Option<&'a str>, role: PathOption) {
+fn add_file_value<'a>(paths: &mut CommandPaths<'a>, value: Option<&'a str>, role: PathOption) {
     match role {
-        PathOption::Positionals(access) => {
-            // A summary switch cannot waive an explicit listing or read.
-            if access != PathAccess::Metadata || paths.positional_access.is_none() {
-                paths.positional_access = Some(access);
-            }
-        }
+        PathOption::ReadPositionals => paths.positionals_are_reads = true,
         PathOption::Read => {
             if let Some(value) = value.filter(|value| *value != "-") {
                 paths.reads.push(value);

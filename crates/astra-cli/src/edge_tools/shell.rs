@@ -911,6 +911,14 @@ fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
             '"' if !in_single_quote => in_double_quote = !in_double_quote,
             '\'' if !in_double_quote => in_single_quote = !in_single_quote,
             '\\' if !in_single_quote => {
+                if in_double_quote
+                    && chars
+                        .peek()
+                        .is_some_and(|next| !matches!(next, '$' | '`' | '"' | '\\' | '\n'))
+                {
+                    current.push(ch);
+                    continue;
+                }
                 if let Some(next) = chars.next() {
                     if next == '\n' || next == '\r' {
                         continue;
@@ -922,6 +930,10 @@ fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
                     }
                 }
             }
+            // Tilde expansion never occurs in quotes. Single quotes also keep
+            // parameter and brace syntax literal until path resolution.
+            '~' if in_single_quote || in_double_quote => current.push(ESCAPED_SHELL_TILDE),
+            c if in_single_quote => current.push(escaped_shell_analysis_char(c).unwrap_or(c)),
             c if c.is_whitespace() && !in_double_quote && !in_single_quote => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
@@ -1135,16 +1147,26 @@ fn escaped_shell_analysis_char(ch: char) -> Option<char> {
     }
 }
 
-fn restore_escaped_shell_analysis_chars(arg: &str) -> String {
-    arg.chars()
-        .map(|ch| match ch {
-            ESCAPED_SHELL_DOLLAR => '$',
-            ESCAPED_SHELL_TILDE => '~',
-            ESCAPED_SHELL_OPEN_BRACE => '{',
-            ESCAPED_SHELL_CLOSE_BRACE => '}',
-            _ => ch,
-        })
-        .collect()
+fn restore_escaped_shell_analysis_chars(arg: &str) -> std::borrow::Cow<'_, str> {
+    if !arg.contains([
+        ESCAPED_SHELL_DOLLAR,
+        ESCAPED_SHELL_TILDE,
+        ESCAPED_SHELL_OPEN_BRACE,
+        ESCAPED_SHELL_CLOSE_BRACE,
+    ]) {
+        return std::borrow::Cow::Borrowed(arg);
+    }
+    std::borrow::Cow::Owned(
+        arg.chars()
+            .map(|ch| match ch {
+                ESCAPED_SHELL_DOLLAR => '$',
+                ESCAPED_SHELL_TILDE => '~',
+                ESCAPED_SHELL_OPEN_BRACE => '{',
+                ESCAPED_SHELL_CLOSE_BRACE => '}',
+                _ => ch,
+            })
+            .collect(),
+    )
 }
 
 fn shell_short_flag_cluster(flag: &str) -> Option<&str> {
@@ -1165,7 +1187,6 @@ fn is_shell_read_from_stdin_flag(flag: &str) -> bool {
 }
 
 enum ShellFlagValueKind {
-    NestedCommand,
     InitCommand,
     Path,
     Other,
@@ -1173,7 +1194,6 @@ enum ShellFlagValueKind {
 
 fn shell_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
     match flag {
-        "--command" => Some(ShellFlagValueKind::NestedCommand),
         "-C" | "--init-command" => Some(ShellFlagValueKind::InitCommand),
         "--rcfile" | "--init-file" => Some(ShellFlagValueKind::Path),
         "-o" | "+o" | "-O" | "+O" => Some(ShellFlagValueKind::Other),
@@ -1190,17 +1210,17 @@ fn validate_command_path_arg(
         return Some(msg);
     }
 
-    validate_plain_command_path_arg(policy, arg, oldpwd, validate_path)
+    validate_plain_command_path_arg(policy, arg, oldpwd)
 }
 
 fn validate_plain_command_path_arg(
     policy: &BashPathContext<'_>,
     arg: &str,
     oldpwd: Option<&std::path::Path>,
-    validate: fn(&SandboxPolicy, &str) -> Result<PathBuf, astra_sandbox::SandboxPathError>,
 ) -> Option<ShellRunError> {
     let literal_arg = restore_escaped_shell_analysis_chars(arg);
-    if let Some(kind) = unresolved_static_dir_reference_kind(policy, arg, oldpwd) {
+    let expanded = expand_static_dir_reference(policy, arg, oldpwd);
+    if let Some(kind) = unresolved_static_dir_reference_kind(arg, expanded.is_some()) {
         return Some(ShellRunError::from(format!(
             "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Use a literal path within the project or a typed file tool so the access scope can be checked. Access outside the project requires permission.",
             SANDBOX_DENIED_PREFIX,
@@ -1211,14 +1231,14 @@ fn validate_plain_command_path_arg(
     }
 
     let resolved = if literal_arg.starts_with('/') {
-        std::path::PathBuf::from(&literal_arg)
-    } else if let Some(expanded) = expand_static_dir_reference(policy, arg, oldpwd) {
+        std::path::PathBuf::from(literal_arg.as_ref())
+    } else if let Some(expanded) = expanded {
         expanded
     } else {
-        policy.working_dir.join(&literal_arg)
+        policy.working_dir.join(literal_arg.as_ref())
     };
     let path_str = resolved.to_string_lossy();
-    if let Err(error) = validate(policy, &path_str) {
+    if let Err(error) = validate_path(policy, &path_str) {
         if error.is_boundary_violation() {
             let mut error = ShellRunError::new(format!(
                 "{}The command references '{}' which is outside the project directory '{}'. Ask the user for permission before accessing files outside the project.",
@@ -1247,9 +1267,7 @@ fn validate_brace_expansion_path_arg(
         )),
         BraceExpansionCandidates::Expanded(candidates) => {
             for candidate in candidates {
-                if validate_plain_command_path_arg(policy, &candidate, oldpwd, validate_path)
-                    .is_some()
-                {
+                if validate_plain_command_path_arg(policy, &candidate, oldpwd).is_some() {
                     return Some(ShellRunError::from(
                         brace_expansion_boundary_review_message(policy, arg),
                     ));
@@ -1274,15 +1292,23 @@ fn check_shell_interpreter_path_boundary(
     parts: &[String],
     oldpwd: Option<&std::path::Path>,
 ) -> Option<ShellRunError> {
+    // The outer shell passes decoded text as the inner shell's source.
+    let check_command = |source: &str| {
+        check_bash_path_boundary_in_context(
+            policy,
+            &restore_escaped_shell_analysis_chars(source),
+            oldpwd,
+        )
+    };
     let mut idx = 1usize;
     while idx < parts.len() {
         let arg = parts[idx].as_str();
 
         if let Some(inner) = arg.strip_prefix("--command=") {
-            return check_bash_path_boundary_in_context(policy, inner, oldpwd);
+            return check_command(inner);
         }
         if let Some(inner) = arg.strip_prefix("--init-command=") {
-            if let Some(msg) = check_bash_path_boundary_in_context(policy, inner, oldpwd) {
+            if let Some(msg) = check_command(inner) {
                 return Some(msg);
             }
             idx += 1;
@@ -1305,10 +1331,11 @@ fn check_shell_interpreter_path_boundary(
                 .and_then(|script| validate_command_path_arg(policy, script, oldpwd));
         }
 
-        if is_nested_shell_c_flag(arg) {
+        if is_nested_shell_c_flag(arg) || arg == "--command" {
             return parts
                 .get(idx + 1)
-                .and_then(|inner| check_bash_path_boundary_in_context(policy, inner, oldpwd));
+                .map(String::as_str)
+                .and_then(check_command);
         }
 
         if is_shell_read_from_stdin_flag(arg) {
@@ -1316,14 +1343,9 @@ fn check_shell_interpreter_path_boundary(
         }
 
         match shell_flag_value_kind(arg) {
-            Some(ShellFlagValueKind::NestedCommand) => {
-                return parts
-                    .get(idx + 1)
-                    .and_then(|inner| check_bash_path_boundary_in_context(policy, inner, oldpwd));
-            }
             Some(ShellFlagValueKind::InitCommand) => {
                 if let Some(inner) = parts.get(idx + 1)
-                    && let Some(msg) = check_bash_path_boundary_in_context(policy, inner, oldpwd)
+                    && let Some(msg) = check_command(inner)
                 {
                     return Some(msg);
                 }
@@ -1376,7 +1398,7 @@ fn expand_home_dir_reference(arg: &str) -> Option<std::path::PathBuf> {
         .strip_prefix("~/")
         .or_else(|| arg.strip_prefix("$HOME/"))
         .or_else(|| arg.strip_prefix("${HOME}/"))?;
-    Some(home.join(suffix))
+    Some(home.join(restore_escaped_shell_analysis_chars(suffix).as_ref()))
 }
 
 fn expand_project_dir_reference(
@@ -1390,7 +1412,11 @@ fn expand_project_dir_reference(
         .strip_prefix("$PWD/")
         .or_else(|| arg.strip_prefix("${PWD}/"))
         .or_else(|| arg.strip_prefix("~+/"))?;
-    Some(policy.working_dir.join(suffix))
+    Some(
+        policy
+            .working_dir
+            .join(restore_escaped_shell_analysis_chars(suffix).as_ref()),
+    )
 }
 
 fn expand_oldpwd_dir_reference(
@@ -1405,14 +1431,10 @@ fn expand_oldpwd_dir_reference(
         .strip_prefix("$OLDPWD/")
         .or_else(|| arg.strip_prefix("${OLDPWD}/"))
         .or_else(|| arg.strip_prefix("~-/"))?;
-    Some(oldpwd.join(suffix))
+    Some(oldpwd.join(restore_escaped_shell_analysis_chars(suffix).as_ref()))
 }
 
-fn unresolved_static_dir_reference_kind(
-    policy: &BashPathContext<'_>,
-    arg: &str,
-    oldpwd: Option<&std::path::Path>,
-) -> Option<&'static str> {
+fn unresolved_static_dir_reference_kind(arg: &str, expanded: bool) -> Option<&'static str> {
     if is_named_tilde_user_reference(arg) {
         return Some("~user home-directory expansion");
     }
@@ -1422,9 +1444,7 @@ fn unresolved_static_dir_reference_kind(
         || is_complex_dir_parameter_reference(arg, "OLDPWD"))
     .then_some("shell parameter expansion from a directory anchor")
     .or_else(|| {
-        (expand_static_dir_reference(policy, arg, oldpwd).is_none()
-            && contains_unresolved_shell_variable(arg))
-        .then_some("shell variable expansion")
+        (!expanded && contains_unresolved_shell_variable(arg)).then_some("shell variable expansion")
     })
 }
 
@@ -2892,27 +2912,6 @@ fn check_single_command_path_boundary(
     }
 
     let base = parts[0].rsplit('/').next().unwrap_or(parts[0].as_str());
-
-    if let Some(violation) =
-        astra_turn_core::permission::path_sensitivity::check_bash_observational_paths(
-            command,
-            base,
-            |path, access| {
-                use astra_turn_core::permission::path_sensitivity::PathAccess;
-                match access {
-                    PathAccess::Metadata => validate_plain_command_path_arg(
-                        policy,
-                        path,
-                        oldpwd,
-                        astra_sandbox::validate_metadata_path,
-                    ),
-                    _ => validate_command_path_arg(policy, path, oldpwd),
-                }
-            },
-        )
-    {
-        return violation;
-    }
 
     if is_shell_interpreter_command(base) {
         return check_shell_interpreter_path_boundary(policy, &parts, oldpwd);
@@ -7805,6 +7804,7 @@ mod tests {
         let policy = SandboxPolicy::for_project("/home/user/project");
         for (label, cmd) in [
             ("bash -c", r#"bash -c "cat /etc/passwd""#),
+            ("inner tilde expansion", "bash -c 'cat ~/workspace-fixture'"),
             ("bash -lc", r#"bash -lc "cat /etc/passwd""#),
             ("bash -ceu", r#"bash -ceu "cat /etc/passwd""#),
             ("bash script path", "bash /etc/passwd"),
@@ -9171,29 +9171,37 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn bash_inspects_metadata_without_reading_credential_contents() {
+    async fn bash_resolves_quoted_paths_from_the_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        std::fs::create_dir(dir.path().join(".docker")).unwrap();
-        std::fs::write(dir.path().join(".docker/config.json"), "fixture contents").unwrap();
-
-        for command in ["du -sh .docker 2>/dev/null", "stat .docker/config.json"] {
-            let inventory = executor
+        for folder in ["~", "$HOME"] {
+            std::fs::create_dir(dir.path().join(folder)).unwrap();
+            std::fs::write(dir.path().join(folder).join("fixture"), "workspace fixture").unwrap();
+        }
+        for command in [
+            "cat '~/fixture'",
+            r#"cat "~/fixture""#,
+            "cat '$HOME/fixture'",
+            r#"bash -c 'cat "~/fixture"'"#,
+        ] {
+            let result = executor
                 .execute_with_metadata("bash", &serde_json::json!({"command": command}))
                 .await;
-            assert!(!inventory.is_error, "{command}: {inventory:?}");
-            assert!(inventory.output.contains(".docker"), "{inventory:?}");
+            assert!(!result.is_error, "{command}: {result:?}");
+            assert!(result.output.contains("workspace fixture"), "{result:?}");
         }
+    }
 
-        let read = executor
-            .execute_with_metadata(
-                "bash",
-                &serde_json::json!({"command": "du -sh .docker; cat .docker/config.json"}),
-            )
+    #[tokio::test]
+    async fn stat_keeps_protected_paths_behind_the_bash_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        std::fs::write(dir.path().join(".env"), "fixture contents").unwrap();
+        let result = executor
+            .execute_with_metadata("bash", &serde_json::json!({"command": "stat .env"}))
             .await;
-        assert!(read.is_error, "{read:?}");
-        assert!(!read.output.contains("fixture contents"), "{read:?}");
-        let facts = read.tool_result_fields.expect("pre-start denial facts");
+        assert!(result.is_error, "{result:?}");
+        let facts = result.tool_result_fields.expect("pre-start denial facts");
         assert_eq!(facts["execution_started"], false);
         assert_eq!(facts["recovery_evidence"]["cause"], "permission_boundary");
     }

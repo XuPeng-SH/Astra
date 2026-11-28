@@ -296,7 +296,6 @@ fn parse_literal_bash_commands(
     let mut stack = vec![root];
     let mut command_nodes = Vec::new();
     let allow_redirects = write_targets.is_some();
-    let allow_home_paths = read_targets.is_some();
     while let Some(node) = stack.pop() {
         let kind = node.kind();
         if kind == "file_redirect"
@@ -336,7 +335,7 @@ fn parse_literal_bash_commands(
     command_nodes.sort_by_key(Node::start_byte);
     let commands = command_nodes
         .into_iter()
-        .map(|node| parse_plain_command(node, command, allow_redirects, allow_home_paths))
+        .map(|node| parse_plain_command(node, command, allow_redirects))
         .collect::<Option<Vec<_>>>()?;
     (!commands.is_empty()).then_some(commands)
 }
@@ -490,12 +489,7 @@ pub fn strip_benign_bash_redirects(command: &str) -> String {
     output
 }
 
-fn parse_plain_command(
-    node: Node<'_>,
-    source: &str,
-    allow_redirects: bool,
-    allow_home_paths: bool,
-) -> Option<Vec<String>> {
+fn parse_plain_command(node: Node<'_>, source: &str, allow_redirects: bool) -> Option<Vec<String>> {
     if node.kind() != "command" {
         return None;
     }
@@ -505,18 +499,6 @@ fn parse_plain_command(
         let word = match child.kind() {
             "file_redirect" if allow_redirects => continue,
             "command_name" => parse_plain_word(child.named_child(0)?, source)?,
-            "word" if allow_home_paths => {
-                let raw = child.utf8_text(source.as_bytes()).ok()?;
-                if raw == "~" {
-                    raw.to_owned()
-                } else if let Some(path) =
-                    raw.strip_prefix('~').filter(|path| path.starts_with('/'))
-                {
-                    format!("~{}", decode_unquoted_shell_word(path)?)
-                } else {
-                    parse_plain_word(child, source)?
-                }
-            }
             "word" | "number" | "string" | "raw_string" | "concatenation" => {
                 parse_plain_word(child, source)?
             }

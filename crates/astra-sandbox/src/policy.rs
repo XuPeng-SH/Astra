@@ -339,15 +339,6 @@ pub fn sensitive_path_rules() -> SensitivePathRules {
 /// any of these to the sandbox would expose entire subtrees of secrets or
 /// kernel state. Use [`is_sensitive_path`] for the file/credential-level check.
 pub fn is_sensitive_system_dir(path: &std::path::Path) -> bool {
-    matches_sensitive_directory(path, true)
-}
-
-/// Whether a path is in a protected operating-system subtree.
-pub fn is_sensitive_os_dir(path: &std::path::Path) -> bool {
-    matches_sensitive_directory(path, false)
-}
-
-fn matches_sensitive_directory(path: &std::path::Path, include_credentials: bool) -> bool {
     // Absolute parent components must not hide a system root from this
     // lexical check. Callers that access files also check the resolved path.
     let normalized;
@@ -391,20 +382,23 @@ fn matches_sensitive_directory(path: &std::path::Path, include_credentials: bool
             return true;
         }
     }
-    include_credentials
-        && SENSITIVE_CRED_DIR_MARKERS.iter().any(|marker| {
-            let relative_marker = marker.trim_start_matches('/');
-            lower == relative_marker
-                || lower
-                    .strip_prefix(relative_marker)
-                    .is_some_and(|tail| tail.starts_with('/'))
-                || lower.match_indices(*marker).any(|(offset, _)| {
-                    matches!(
-                        lower.as_bytes().get(offset + marker.len()),
-                        None | Some(b'/')
-                    )
-                })
-        })
+    for marker in SENSITIVE_CRED_DIR_MARKERS {
+        let relative_marker = marker.trim_start_matches('/');
+        if lower == relative_marker
+            || lower
+                .strip_prefix(relative_marker)
+                .is_some_and(|tail| tail.starts_with('/'))
+            || lower.match_indices(*marker).any(|(offset, _)| {
+                matches!(
+                    lower.as_bytes().get(offset + marker.len()),
+                    None | Some(b'/')
+                )
+            })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether a directory or one of its ancestors is explicitly protected.

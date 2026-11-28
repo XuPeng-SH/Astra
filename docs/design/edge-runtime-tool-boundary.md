@@ -713,12 +713,9 @@ Credential file markers use filename boundaries rather than arbitrary
 substrings in unrelated directory names. Explicit credential directories and
 environment-file variants remain protected. System paths are matched against
 the actual system boundary, not a similarly named tree inside a workspace.
-Known metadata operands may inspect credential-marked paths. Directory listings,
-file-valued options and redirections still have their own preflight checks.
-System paths and owned tool-result artifacts retain their preflight rules.
-Standard and Strict CLI apply the same operand roles within their workspace
-boundary. An unrecognized option keeps the conservative access role for an
-operand instead of granting metadata access.
+The shell selects the executable at runtime. A utility name alone grants no
+exception to protected-path checks. The CLI workspace scanner preserves
+literal tilde and single-quoted parameter syntax when resolving file operands.
 The native provider projects the sandbox's path rules into its filesystem
 masks without consulting the Server filesystem. A provider's path-only mask
 may also hide a directory whose name matches a sensitive filename pattern.
@@ -727,7 +724,7 @@ The executor retains its workspace and command-risk checks. Protected-path
 preflight examines known operand roles instead of treating path-like text in
 arbitrary command arguments as a file access. GNU date can be selected through
 `PATH` on any host, so its file options are checked even where BSD date uses
-the same short options for data. GNU `find -files0-from`, `wc`, `file`, and
+the same short options for data. GNU `find -files0-from`, `du`, `wc`, `file`, and
 `sort`, explicit `git config --file` operands, and `find` file-output and
 literal execute actions are checked according to their read or write role,
 including when the command itself is not read-only.
