@@ -48,11 +48,15 @@ async fn quoted_shell_paths_resolve_the_same_way_with_and_without_the_workspace_
     let executor = executor(root);
     let parents = "../".repeat(levels);
     let tilde = format!("cat '~/{parents}etc/fixture'");
+    let quoted_slash = format!(r#"cat ~"/{parents}etc/fixture""#);
+    let escaped_slash = format!(r#"cat ~\/{parents}etc/fixture"#);
     let joined = format!(r#"cat "$"'HOME/{parents}etc/fixture'"#);
     for policy in [Some(SandboxPolicy::for_project(root)), None] {
         *executor.sandbox_policy.write().unwrap() = policy;
         for command in [
             tilde.as_str(),
+            quoted_slash.as_str(),
+            escaped_slash.as_str(),
             joined.as_str(),
             r#"cat "'/etc/fixture""#,
             r#"cat "$PWD"'/literal}.txt'"#,

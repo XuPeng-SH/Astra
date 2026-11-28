@@ -5,20 +5,22 @@ use crate::cli::workspace_trust::{
     TrustState, WorkspaceTrustEvaluation, WorkspaceTrustLedger, WorkspaceTrustReason,
     evaluate_workspace_trust, project_permissions_hash,
 };
+use crate::edge_tools::expand_home_path_arg;
 use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, cloud_gated_tool_kind, cloud_gated_tool_kind_with_args,
 };
 use astra_turn_core::permission::engine::{
     DecisionEnvelope, DecisionSource, HardDecision, allow_rule_preview,
-    allow_rule_preview_for_match_target,
+    allow_rule_preview_for_match_target, evaluate_permission,
+    stored_override_allows_sensitive_path,
 };
 use astra_turn_core::permission::match_target::{
     AllowMatchTarget, default_match_target, fingerprint_for_match_target,
 };
 use astra_turn_core::permission::memory_profile::resolved_write_path;
 use astra_turn_core::permission::path_sensitivity::{
-    PathSensitivity, append_shell_match_text, classify_path_sensitivity,
+    PathSensitivity, ToolPathResolver, append_shell_match_text, classify_path_sensitivity,
     sensitive_path_token_for_tool_args,
 };
 use astra_turn_core::tool_argument_hints::{
@@ -95,7 +97,9 @@ fn auto_mode_sensitive_path_denial_reason(tool_name: &str, path: &str) -> String
         append_shell_match_text(&mut reason, path);
         return reason;
     }
-    match classify_path_sensitivity(path) {
+    let resolved = expand_home_path_arg(path);
+    let resolved = resolved.as_deref().map(Path::to_string_lossy);
+    match classify_path_sensitivity(resolved.as_deref().unwrap_or(path)) {
         PathSensitivity::Sensitive => {
             format!(
                 "Sandbox: Path '{}' is blocked as a sensitive credential path. \
@@ -487,29 +491,6 @@ fn accept_edits_auto_allows_cloud_request(tool: &str, detail: Option<&str>) -> b
         }
         _ => false,
     }
-}
-
-fn stored_override_allows_sensitive_path(
-    stored: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
-) -> bool {
-    if let Some(command) = stored
-        .command_exact
-        .as_deref()
-        .or(stored.command_prefix.as_deref())
-    {
-        return sensitive_path_match(&serde_json::json!({ "command": command })).is_some();
-    }
-
-    let Some(path) = stored.path_pattern.as_deref() else {
-        return false;
-    };
-
-    sensitive_path_match_for_request(&stored.tool_name, &serde_json::json!({ "path": path }))
-        .is_some()
-}
-
-fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
-    sensitive_path_match_for_request("__unknown_mutating_tool__", args)
 }
 
 fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -> Option<String> {
@@ -1516,9 +1497,13 @@ impl PermissionManager {
         &self,
         fps: &[astra_turn_core::approval_fingerprint::ApprovalFingerprint],
         sensitive_path: bool,
+        resolve_path: Option<ToolPathResolver>,
     ) -> Option<bool> {
         let (stored, allowed) = self.matching_override_any(fps)?;
-        if !sensitive_path || !allowed || stored_override_allows_sensitive_path(stored) {
+        if !sensitive_path
+            || !allowed
+            || stored_override_allows_sensitive_path(stored, resolve_path)
+        {
             Some(allowed)
         } else {
             None
@@ -1809,7 +1794,7 @@ impl PermissionManager {
         let mut engine_requires_external_review = false;
 
         if let Some(args) = cloud_detail_permission_args(tool, detail) {
-            let envelope = self.evaluate_permission_envelope(tool, &args);
+            let envelope = evaluate_permission(tool, &args, &self.evaluation_context());
             match envelope.decision {
                 HardDecision::Allow
                     if !Self::cloud_approval_is_explicit(approval_kind)
@@ -1835,7 +1820,7 @@ impl PermissionManager {
         // re-ask regardless of `approval_kind` or `quiet`. This also
         // means silent sub-runs can honour `Always` instead of
         // auto-denying.
-        if let Some(allowed) = self.check_overrides_for_request(&fps, sensitive_path) {
+        if let Some(allowed) = self.check_overrides_for_request(&fps, sensitive_path, None) {
             return Some(if allowed {
                 ApprovalDecision::Allow
             } else {
@@ -1980,6 +1965,7 @@ impl PermissionManager {
         &self,
     ) -> astra_runtime::orchestration::PermissionSyncContext {
         self.evaluation_context()
+            .with_path_resolver(expand_home_path_arg)
     }
 
     pub(crate) fn subscribe_permission_policy(&self) -> PermissionPolicySubscription {
@@ -2045,8 +2031,7 @@ impl PermissionManager {
         name: &str,
         args: &serde_json::Value,
     ) -> DecisionEnvelope {
-        let ctx = self.evaluation_context();
-        astra_turn_core::permission::engine::evaluate_permission(name, args, &ctx)
+        evaluate_permission(name, args, &self.runtime_permission_context())
     }
 
     fn evaluate_permission_envelope_with_read_only_ceiling(
@@ -2054,9 +2039,9 @@ impl PermissionManager {
         name: &str,
         args: &serde_json::Value,
     ) -> DecisionEnvelope {
-        let mut ctx = self.evaluation_context();
+        let mut ctx = self.runtime_permission_context();
         ctx.inherited.read_only_execution = true;
-        astra_turn_core::permission::engine::evaluate_permission(name, args, &ctx)
+        evaluate_permission(name, args, &ctx)
     }
 
     fn format_tool_display(name: &str, args: &serde_json::Value) -> (String, Option<String>) {
@@ -2548,6 +2533,7 @@ impl PermissionManager {
             if let Some(allowed) = self.check_overrides_for_request(
                 &approval_lookup_fingerprint_candidates(name, args),
                 true,
+                Some(expand_home_path_arg),
             ) {
                 return if allowed {
                     GateOutcome::Allow
@@ -4888,21 +4874,21 @@ mod tests {
 
         let safe_exact = ApprovalFingerprint::file_op_exact("file_write", Some("src/lib.rs"));
         assert!(
-            !super::stored_override_allows_sensitive_path(&safe_exact),
+            !super::stored_override_allows_sensitive_path(&safe_exact, None),
             "exact non-sensitive path approval must not be treated as a sensitive-path override"
         );
 
         let skill_exact =
             ApprovalFingerprint::file_op_exact("file_write", Some(".astra/skills/rust/SKILL.md"));
         assert!(
-            !super::stored_override_allows_sensitive_path(&skill_exact),
+            !super::stored_override_allows_sensitive_path(&skill_exact, None),
             "skill content is intentionally normal file content, not sensitive app state"
         );
 
         let sensitive_exact =
             ApprovalFingerprint::file_op_exact("file_write", Some(".astra/config.toml"));
         assert!(
-            super::stored_override_allows_sensitive_path(&sensitive_exact),
+            super::stored_override_allows_sensitive_path(&sensitive_exact, None),
             "exact sensitive path approval should remain content-specific and reusable"
         );
     }

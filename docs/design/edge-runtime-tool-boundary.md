@@ -718,6 +718,8 @@ exception to protected-path checks. Workspace and shared path checks use the
 same shell word lexer. Expansion is recognized in the source word before
 joining quoted fragments. Operand resolution preserves literal filename
 characters and passes the resulting path to the shared sensitive-path check.
+Hosted typed file paths are checked as literal names. The CLI passes its
+local path shorthand resolver to permission admission on its execution host.
 The native provider projects the sandbox's path rules into its filesystem
 masks without consulting the Server filesystem. A provider's path-only mask
 may also hide a directory whose name matches a sensitive filename pattern.

@@ -83,6 +83,7 @@ use astra_tools::truncate_output;
 pub(crate) mod background_tasks;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
+pub(crate) use fs_tools::expand_home_path_arg;
 #[path = "edge_tools/lsp_stdio_session.rs"]
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]

@@ -16,15 +16,15 @@ fn is_unc_path(path: &str) -> bool {
     path.starts_with("\\\\") || path.starts_with("//")
 }
 
-fn expand_home_path_arg(path: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    if matches!(path, "~" | "$HOME" | "${HOME}") {
-        return Some(home);
-    }
-    path.strip_prefix("~/")
-        .or_else(|| path.strip_prefix("$HOME/"))
-        .or_else(|| path.strip_prefix("${HOME}/"))
-        .map(|suffix| home.join(suffix))
+pub(crate) fn expand_home_path_arg(path: &str) -> Option<PathBuf> {
+    let suffix = match path {
+        "~" | "$HOME" | "${HOME}" => "",
+        _ => path
+            .strip_prefix("~/")
+            .or_else(|| path.strip_prefix("$HOME/"))
+            .or_else(|| path.strip_prefix("${HOME}/"))?,
+    };
+    Some(dirs::home_dir()?.join(suffix))
 }
 
 fn is_blocked_device_read_path(path_str_lower: &str) -> bool {

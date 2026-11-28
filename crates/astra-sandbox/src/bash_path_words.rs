@@ -101,7 +101,9 @@ pub fn bash_path_tokens(input: &str, scan: BashPathScan) -> Vec<BashPathToken> {
                 plain_number = true;
             }
             _ => {
-                if quote.is_some() || ch == '~' && started {
+                if quote.is_some()
+                    || ch == '~' && (started || !unquoted_tilde_prefix(chars.clone()))
+                {
                     push_literal(&mut word, ch, path_expressions);
                 } else {
                     word.push(ch);
@@ -116,6 +118,20 @@ pub fn bash_path_tokens(input: &str, scan: BashPathScan) -> Vec<BashPathToken> {
         tokens.push(Word(word));
     }
     tokens
+}
+
+/// Bash expands a tilde only when the whole prefix before the first
+/// unquoted slash or word boundary is unquoted.
+fn unquoted_tilde_prefix(mut tail: Peekable<Chars<'_>>) -> bool {
+    loop {
+        skip_line_continuations(&mut tail);
+        match tail.next() {
+            None | Some('/' | '|' | '&' | ';' | '(' | ')' | '<' | '>') => return true,
+            Some(ch) if ch.is_whitespace() => return true,
+            Some('\'' | '"' | '\\') => return false,
+            Some(_) => {}
+        }
+    }
 }
 
 /// Consume a complete unbraced parameter before merging adjacent fragments.
@@ -308,8 +324,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn home_reference_depends_on_source_parameter_boundaries() {
+    fn home_reference_depends_on_source_syntax() {
         for (source, expected) in [
+            ("~", Some("")),
+            (r#"~/"fixture""#, Some("fixture")),
+            (r#"~"/fixture""#, None),
+            (r#"~\/fixture"#, None),
+            (r#"~""/fixture"#, None),
+            ("~\\\n/fixture", Some("fixture")),
             (r#""$HOME"/fixture"#, Some("fixture")),
             (r#""${HOME}/fixture""#, Some("fixture")),
             (r#""$"'HOME/fixture'"#, None),

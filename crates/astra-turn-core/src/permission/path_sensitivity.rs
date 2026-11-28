@@ -244,7 +244,7 @@ fn describe_bash_path_denial(
 
 pub fn classify_path_sensitivity(path: &str) -> PathSensitivity {
     PathSensitivityContext::new(None)
-        .classify(&resolve_path_hint(path))
+        .classify(Path::new(path))
         .0
 }
 
@@ -632,17 +632,6 @@ fn resolve_shell_operand<'a>(word: &str, literal: &'a str) -> Cow<'a, Path> {
     }
 }
 
-fn resolve_path_hint(path: &str) -> Cow<'_, Path> {
-    // File-tool hints support home-relative paths. Bare parameter names
-    // remain path labels here. Bash operands carry their own expansion syntax.
-    if (path == "~" || path.contains('/'))
-        && let Some(resolved) = bash_home_suffix(path).and_then(home_join)
-    {
-        return Cow::Owned(resolved);
-    }
-    Cow::Borrowed(Path::new(path))
-}
-
 fn canonicalize_existing_or_nearest(path: &Path) -> Option<PathBuf> {
     if let Ok(canonical) = path.canonicalize() {
         return Some(canonical);
@@ -672,7 +661,7 @@ fn canonicalize_existing_or_nearest(path: &Path) -> Option<PathBuf> {
 }
 
 pub fn path_requires_sensitive_gate(path: &str, access: PathAccess) -> Option<SensitivePathMatch> {
-    PathSensitivityContext::new(None).requires_gate(&resolve_path_hint(path), path, access)
+    PathSensitivityContext::new(None).requires_gate(Path::new(path), path, access)
 }
 
 /// Inspect tool arguments for a path-like field or shell path operand and decide
@@ -681,17 +670,32 @@ pub fn sensitive_path_match_for_tool_args(
     tool_name: &str,
     args: &Value,
 ) -> Option<SensitivePathMatch> {
-    let is_direct_read = is_read_only_tool_with_args(tool_name, Some(args));
+    sensitive_path_match_for_tool_args_with_resolver(tool_name, args, None)
+}
 
+/// Resolve shorthand only when the execution boundary defines it. Ordinary
+/// typed arguments are filenames, while Bash uses its own source syntax.
+pub type ToolPathResolver = fn(&str) -> Option<PathBuf>;
+
+pub(crate) fn sensitive_path_match_for_tool_args_with_resolver(
+    tool_name: &str,
+    args: &Value,
+    resolve_path: Option<ToolPathResolver>,
+) -> Option<SensitivePathMatch> {
     if let Some(path) = path_hint_from_args(args)
         && !path.is_empty()
     {
-        let access = if is_direct_read {
+        let access = if is_read_only_tool_with_args(tool_name, Some(args)) {
             direct_read_access(tool_name)
         } else {
             PathAccess::Write
         };
-        return path_requires_sensitive_gate(&path, access);
+        let resolved = resolve_path.and_then(|resolve| resolve(&path));
+        return PathSensitivityContext::new(None).requires_gate(
+            resolved.as_deref().unwrap_or_else(|| Path::new(&path)),
+            &path,
+            access,
+        );
     }
 
     if crate::tool::categories::registry().is_shell(tool_name)
@@ -2071,10 +2075,11 @@ mod tests {
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&home).unwrap();
         let _guard = EnvGuard::set("HOME", &home);
-        std::fs::create_dir_all(workspace.join("~")).unwrap();
-        let sources = ["$HOME", "${HOME}", "~/fixture"].map(String::from);
+        let sources = ["$HOME/note.txt", "${HOME}/note.txt", "~/note.txt"].map(String::from);
         for path in &sources {
-            std::fs::write(workspace.join(path), "ordinary fixture").unwrap();
+            let fixture = workspace.join(path);
+            std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+            std::fs::write(fixture, "ordinary fixture").unwrap();
         }
         assert!(
             bash_path_preflight(astra_tools::shell_ops::BashPreflightRequest::Command {
@@ -2086,13 +2091,38 @@ mod tests {
             })
             .is_none()
         );
-        for path in &sources[..2] {
-            assert!(
-                sensitive_path_match_for_tool_args("read_file", &serde_json::json!({"path": path}))
-                    .is_none(),
-                "{path}"
-            );
+
+        use crate::permission::{
+            engine::{HardDecision, evaluate_permission},
+            types::{PermissionMode, PermissionSyncContext},
+        };
+        let context = PermissionSyncContext::root(PermissionMode::Auto);
+        for path in &sources {
+            for spelling in [path.clone(), format!("./{path}")] {
+                let args = serde_json::json!({"path": spelling});
+                let decision = evaluate_permission("read_file", &args, &context);
+                assert!(
+                    matches!(decision.decision, HardDecision::Allow),
+                    "{decision:?}"
+                );
+                let result = astra_tools::fs_ops::read_file(&workspace, &args);
+                assert!(
+                    !result.is_error && result.output.contains("ordinary fixture"),
+                    "{result:?}"
+                );
+            }
         }
+
+        let context = context.with_path_resolver(|path| home_join(path.strip_prefix("~/")?));
+        let local = evaluate_permission(
+            "read_file",
+            &serde_json::json!({"path": "~/note.txt"}),
+            &context,
+        );
+        assert!(
+            matches!(local.decision, HardDecision::NeedExternal { .. }),
+            "{local:?}"
+        );
         assert!(bash_protected_path_denial_in_directory(r#"stat "$HOME""#, &workspace).is_some());
     }
 

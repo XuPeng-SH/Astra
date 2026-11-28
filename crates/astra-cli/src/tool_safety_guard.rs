@@ -36,7 +36,8 @@ impl ToolSafetyGuard {
             None => {
                 let mut context = astra_turn_core::permission::types::PermissionSyncContext::new(
                     astra_turn_core::permission::types::InheritedPermissions::auto_approve(),
-                );
+                )
+                .with_path_resolver(crate::edge_tools::expand_home_path_arg);
                 context.inherited.read_only_execution = true;
                 match astra_turn_core::permission::engine::evaluate_permission(name, args, &context)
                     .decision

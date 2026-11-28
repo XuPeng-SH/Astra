@@ -1053,6 +1053,7 @@ pub struct PermissionTelemetry {
 
 #[derive(Debug, Clone, Default)]
 pub struct PermissionSyncContext {
+    pub(crate) path_resolver: Option<super::path_sensitivity::ToolPathResolver>,
     /// Permissions inherited from parent agent.
     pub inherited: InheritedPermissions,
     /// Session-level overrides (approved/denied during this run).
@@ -1075,10 +1076,21 @@ impl PermissionSyncContext {
     pub fn new(inherited: InheritedPermissions) -> Self {
         Self {
             inherited,
+            path_resolver: None,
             session_allow: Vec::new(),
             session_deny: Vec::new(),
             telemetry: PermissionTelemetry::default(),
         }
+    }
+
+    /// Use the local executor's shorthand for typed path admission. This
+    /// is an execution-host dependency, outside the inherited permissions.
+    pub fn with_path_resolver(
+        mut self,
+        resolve: super::path_sensitivity::ToolPathResolver,
+    ) -> Self {
+        self.path_resolver = Some(resolve);
+        self
     }
 
     /// Create a shared runtime permission context from an explicit inherited

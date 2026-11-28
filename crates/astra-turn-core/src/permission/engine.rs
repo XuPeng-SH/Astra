@@ -51,7 +51,7 @@ use astra_tools::agent_tool_contract::{
     AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
 };
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::{cell::LazyCell, collections::BTreeSet};
 
 use crate::action_compensation::{explicit_approval_reason, primary_approval_reason};
 use crate::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
@@ -63,7 +63,10 @@ use crate::permission::match_target::{
     AllowMatchTarget, allow_rule_for_match_target, default_match_target,
 };
 use crate::permission::memory_profile::resolved_write_path;
-use crate::permission::path_sensitivity::sensitive_path_token_for_tool_args;
+use crate::permission::path_sensitivity::{
+    PathSensitivity, ToolPathResolver, sensitive_path_match_for_shell_command,
+    sensitive_path_match_for_tool_args, sensitive_path_match_for_tool_args_with_resolver,
+};
 use crate::permission::types::{ManualApprovalPolicy, PermissionMode, PermissionSyncContext};
 use crate::safety_middleware::{SafetyMiddlewareDecision, evaluate_tool_safety_request};
 use crate::tool::args::hints::{
@@ -527,7 +530,10 @@ fn evaluate_permission_once(
     approved_protected_write: bool,
 ) -> DecisionEnvelope {
     let mut trace = Vec::with_capacity(EVALUATION_ORDER.len());
-    let mut risk_tags = risk_tags_for_request(tool_name, args);
+    let sensitive_path = LazyCell::new(|| {
+        sensitive_path_match_for_tool_args_with_resolver(tool_name, args, ctx.path_resolver)
+    });
+    let mut risk_tags = collect_risk_tags(tool_name, args, || sensitive_path.is_some());
     if let Some(policy) = provider_policy {
         // The descriptor is the capability authority for dynamic tools. Drop
         // tags inferred only from the public alias or the static-tool
@@ -758,14 +764,10 @@ fn evaluate_permission_once(
         "no execute hard deny",
     );
 
-    if let Some(path) = sensitive_path_match(tool_name, args)
-        && !(approved_protected_write
-            && matches!(
-                crate::permission::path_sensitivity::classify_path_sensitivity(&path),
-                crate::permission::path_sensitivity::PathSensitivity::WriteSensitive
-            ))
+    if let Some(hit) = sensitive_path.as_ref()
+        && !(approved_protected_write && hit.sensitivity == PathSensitivity::WriteSensitive)
     {
-        match resolve_sensitive_path_guard(tool_name, args, ctx, &path, &risk_tags) {
+        match resolve_sensitive_path_guard(tool_name, args, ctx, &hit.token, &risk_tags) {
             GuardResolution::Continue(notes) => {
                 for note in notes {
                     push_skipped(&mut trace, EvaluationStep::SensitivePath, &note);
@@ -1452,10 +1454,6 @@ fn git_safety_violations_for_request(tool_name: &str, args: &Value) -> Vec<GitSa
     Vec::new()
 }
 
-fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
-    sensitive_path_token_for_tool_args(tool_name, args)
-}
-
 enum GuardResolution {
     Continue(Vec<String>),
     Return {
@@ -1569,7 +1567,7 @@ fn resolve_sensitive_path_guard(
     }
 
     if let Some((stored_override, allowed)) = fingerprinted_override_match(tool_name, args, ctx) {
-        if allowed && !stored_override_allows_sensitive_path(&stored_override) {
+        if allowed && !stored_override_allows_sensitive_path(&stored_override, ctx.path_resolver) {
             skipped_notes.push("broad session override cannot bypass sensitive path".to_string());
         } else if ctx.inherited.allowed_tools.is_some() {
             skipped_notes.push(
@@ -1719,20 +1717,28 @@ fn stored_override_allows_git_safety(stored: &ApprovalFingerprint) -> bool {
     stored.command_exact.is_some()
 }
 
-fn stored_override_allows_sensitive_path(stored: &ApprovalFingerprint) -> bool {
+pub fn stored_override_allows_sensitive_path(
+    stored: &ApprovalFingerprint,
+    resolve_path: Option<ToolPathResolver>,
+) -> bool {
     if let Some(command) = stored
         .command_exact
         .as_deref()
         .or(stored.command_prefix.as_deref())
     {
-        return sensitive_path_match("bash", &serde_json::json!({ "command": command })).is_some();
+        return sensitive_path_match_for_shell_command(command).is_some();
     }
 
     let Some(path) = stored.path_pattern.as_deref() else {
         return false;
     };
 
-    sensitive_path_match(&stored.tool_name, &serde_json::json!({ "path": path })).is_some()
+    sensitive_path_match_for_tool_args_with_resolver(
+        &stored.tool_name,
+        &serde_json::json!({ "path": path }),
+        resolve_path,
+    )
+    .is_some()
 }
 
 fn accept_edits_auto_allows(tool_name: &str, args: &Value) -> bool {
@@ -1893,6 +1899,16 @@ fn push_unique_fingerprint(
 
 #[must_use]
 pub fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
+    collect_risk_tags(tool_name, args, || {
+        sensitive_path_match_for_tool_args(tool_name, args).is_some()
+    })
+}
+
+fn collect_risk_tags(
+    tool_name: &str,
+    args: &Value,
+    sensitive_path: impl FnOnce() -> bool,
+) -> Vec<RiskTag> {
     let mut tags = Vec::new();
     let has_git_safety_violation = !git_safety_violations_for_request(tool_name, args).is_empty();
     if tool_name.starts_with("sandbox_expand:") {
@@ -1905,11 +1921,15 @@ pub fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
         Some(CloudGatedToolKind::Execute) => {
             push_risk_tag(&mut tags, RiskTag::BashExecute);
         }
-        Some(CloudGatedToolKind::Write) if sensitive_path_match(tool_name, args).is_some() => {
-            push_risk_tag(&mut tags, RiskTag::WritesSensitiveFile);
-        }
         Some(CloudGatedToolKind::Write) => {
-            push_risk_tag(&mut tags, RiskTag::WritesOutsidePackage);
+            push_risk_tag(
+                &mut tags,
+                if sensitive_path() {
+                    RiskTag::WritesSensitiveFile
+                } else {
+                    RiskTag::WritesOutsidePackage
+                },
+            );
         }
         None => {}
     }
@@ -3095,7 +3115,7 @@ mod tests {
         });
 
         assert_eq!(
-            sensitive_path_match("bash", &args),
+            crate::permission::path_sensitivity::sensitive_path_token_for_tool_args("bash", &args),
             None,
             "internal tool-result artifacts must not trigger the sensitive-path opt-in gate"
         );
