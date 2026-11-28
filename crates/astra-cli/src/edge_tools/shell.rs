@@ -1321,13 +1321,12 @@ fn expand_project_dir_reference(
     policy: &BashPathContext<'_>,
     arg: &str,
 ) -> Option<std::path::PathBuf> {
-    if matches!(arg, "$PWD" | "${PWD}" | "~+") {
-        return Some(policy.working_dir.to_path_buf());
-    }
-    let suffix = arg
-        .strip_prefix("$PWD/")
-        .or_else(|| arg.strip_prefix("${PWD}/"))
-        .or_else(|| arg.strip_prefix("~+/"))?;
+    let suffix = if arg == "~+" {
+        ""
+    } else {
+        arg.strip_prefix("~+/")
+            .or_else(|| astra_sandbox::bash_parameter_suffix(arg, "PWD"))?
+    };
     Some(
         policy
             .working_dir
@@ -1340,13 +1339,12 @@ fn expand_oldpwd_dir_reference(
     oldpwd: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     let oldpwd = oldpwd?;
-    if matches!(arg, "$OLDPWD" | "${OLDPWD}" | "~-") {
-        return Some(oldpwd.to_path_buf());
-    }
-    let suffix = arg
-        .strip_prefix("$OLDPWD/")
-        .or_else(|| arg.strip_prefix("${OLDPWD}/"))
-        .or_else(|| arg.strip_prefix("~-/"))?;
+    let suffix = if arg == "~-" {
+        ""
+    } else {
+        arg.strip_prefix("~-/")
+            .or_else(|| astra_sandbox::bash_parameter_suffix(arg, "OLDPWD"))?
+    };
     Some(oldpwd.join(astra_sandbox::decode_bash_path_word(suffix).as_ref()))
 }
 

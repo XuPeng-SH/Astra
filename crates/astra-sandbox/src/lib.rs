@@ -26,8 +26,8 @@ pub use bash_ast::{
     strip_benign_bash_redirects,
 };
 pub use bash_path_words::{
-    BashPathScan, BashPathToken, bash_home_suffix, bash_path_tokens, decode_bash_path_word,
-    mark_literal_bash_path_word,
+    BashPathScan, BashPathToken, bash_home_suffix, bash_parameter_suffix, bash_path_tokens,
+    decode_bash_path_word, mark_literal_bash_path_word, trim_bash_control_punctuation,
 };
 pub use command::{
     BashCommandPathOperands, CommandRisk, SandboxCommandError, analyze_command_risks,

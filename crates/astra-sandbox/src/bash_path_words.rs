@@ -51,15 +51,16 @@ pub fn bash_path_tokens(input: &str, scan: BashPathScan) -> Vec<BashPathToken> {
                 started = true;
                 plain_number = false;
             }
-            '$' if path_expressions && quote == Some('"') && chars.peek() == Some(&'{') => {
-                word.push_str("${");
-                chars.next();
-                // Keep simple parameter references recognizable. Complex
-                // expressions keep the parameter start so callers can treat
-                // the path as unresolved without guessing its expansion.
-                if let Some(len) = simple_parameter_len(chars.clone()) {
-                    word.extend(chars.by_ref().take(len));
-                }
+            '$' if quote != Some('\'') => {
+                push_parameter_or_dollar(&mut word, &mut chars, quote, path_expressions);
+                started = true;
+                plain_number = false;
+            }
+            '(' | ')' | ';' if !path_expressions && quote.is_none() => {
+                word.push(LITERAL);
+                word.push(ch);
+                started = true;
+                plain_number = false;
             }
             '>' | '<' if !path_expressions && quote.is_none() => {
                 let mut op = String::new();
@@ -100,7 +101,7 @@ pub fn bash_path_tokens(input: &str, scan: BashPathScan) -> Vec<BashPathToken> {
                 plain_number = true;
             }
             _ => {
-                if quote == Some('\'') || quote == Some('"') && ch != '$' || ch == '~' && started {
+                if quote.is_some() || ch == '~' && started {
                     push_literal(&mut word, ch, path_expressions);
                 } else {
                     word.push(ch);
@@ -115,6 +116,61 @@ pub fn bash_path_tokens(input: &str, scan: BashPathScan) -> Vec<BashPathToken> {
         tokens.push(Word(word));
     }
     tokens
+}
+
+/// Consume a complete unbraced parameter before merging adjacent fragments.
+/// A terminator keeps e.g. `$HO"ME"` distinct from `$HOME`.
+fn push_parameter_or_dollar(
+    word: &mut String,
+    chars: &mut Peekable<Chars<'_>>,
+    quote: Option<char>,
+    path_expressions: bool,
+) {
+    skip_line_continuations(chars);
+    match chars.peek().copied() {
+        Some(next) if next.is_ascii_alphabetic() || next == '_' => {
+            word.push('$');
+            while let Some(ch) = chars.next_if(|ch| ch.is_ascii_alphanumeric() || *ch == '_') {
+                word.push(ch);
+                skip_line_continuations(chars);
+            }
+            if matches!(chars.peek(), Some('"' | '\\'))
+                || quote.is_none() && chars.peek() == Some(&'\'')
+            {
+                word.push_str(PARAMETER_END);
+            }
+        }
+        Some(next)
+            if next.is_ascii_digit() || matches!(next, '$' | '?' | '#' | '-' | '!' | '*' | '@') =>
+        {
+            word.push('$');
+            word.push(next);
+            chars.next();
+        }
+        Some('{') if path_expressions && quote == Some('"') => {
+            word.push_str("${");
+            chars.next();
+            // Preserve simple braced references. Other expansions stay
+            // unresolved rather than acquiring a guessed path.
+            if let Some(len) = simple_parameter_len(chars.clone()) {
+                word.extend(chars.by_ref().take(len));
+            }
+        }
+        Some('{' | '(' | '[') => word.push('$'),
+        Some('\'' | '"') if quote.is_none() => word.push('$'),
+        _ => push_literal(word, '$', false),
+    }
+}
+
+fn skip_line_continuations(chars: &mut Peekable<Chars<'_>>) {
+    while chars.peek() == Some(&'\\') {
+        let mut rest = chars.clone();
+        rest.next();
+        if rest.next() != Some('\n') {
+            break;
+        }
+        *chars = rest;
+    }
 }
 
 fn simple_parameter_len(mut chars: Peekable<Chars<'_>>) -> Option<usize> {
@@ -136,6 +192,26 @@ fn simple_parameter_len(mut chars: Peekable<Chars<'_>>) -> Option<usize> {
 // NUL cannot occur in an executable shell word. The two-byte annotations
 // leave ordinary words unchanged and do not reserve any valid filename bytes.
 const LITERAL: char = '\0';
+const PARAMETER_END: &str = "\0v";
+
+/// Ignore shell control punctuation the lexer found at an operand's edges.
+/// Quoted or escaped punctuation is part of the filename.
+pub fn trim_bash_control_punctuation(mut word: &str) -> &str {
+    const CONTROLS: [&str; 3] = ["\0(", "\0)", "\0;"];
+    while let Some(rest) = CONTROLS
+        .iter()
+        .find_map(|control| word.strip_prefix(control))
+    {
+        word = rest;
+    }
+    while let Some(rest) = CONTROLS
+        .iter()
+        .find_map(|control| word.strip_suffix(control))
+    {
+        word = rest;
+    }
+    word
+}
 
 fn literal_tag(ch: char, path_expressions: bool) -> Option<char> {
     Some(match ch {
@@ -171,12 +247,26 @@ pub fn mark_literal_bash_path_word(word: &mut String) {
 /// The suffix of a recognized home-directory reference, before literal
 /// annotations are decoded. An empty suffix denotes the home itself.
 pub fn bash_home_suffix(word: &str) -> Option<&str> {
-    if matches!(word, "~" | "$HOME" | "${HOME}") {
-        Some("")
+    word.strip_prefix('~')
+        .and_then(directory_suffix)
+        .or_else(|| bash_parameter_suffix(word, "HOME"))
+}
+
+pub fn bash_parameter_suffix<'a>(word: &'a str, parameter: &str) -> Option<&'a str> {
+    let reference = word.strip_prefix('$')?;
+    let suffix = if let Some(braced) = reference.strip_prefix('{') {
+        braced.strip_prefix(parameter)?.strip_prefix('}')?
     } else {
-        word.strip_prefix("~/")
-            .or_else(|| word.strip_prefix("$HOME/"))
-            .or_else(|| word.strip_prefix("${HOME}/"))
+        let suffix = reference.strip_prefix(parameter)?;
+        suffix.strip_prefix(PARAMETER_END).unwrap_or(suffix)
+    };
+    directory_suffix(suffix)
+}
+
+fn directory_suffix(suffix: &str) -> Option<&str> {
+    match suffix {
+        "" => Some(""),
+        tail => tail.strip_prefix('/'),
     }
 }
 
@@ -190,6 +280,9 @@ pub fn decode_bash_path_word(word: &str) -> Cow<'_, str> {
     let mut decoded = String::with_capacity(word.len());
     let mut chars = word.chars().peekable();
     while let Some(ch) = chars.next() {
+        if ch == LITERAL && chars.next_if_eq(&'v').is_some() {
+            continue;
+        }
         if ch == LITERAL
             && let Some(literal) = match chars.peek() {
                 Some('t') => Some('~'),
@@ -197,6 +290,7 @@ pub fn decode_bash_path_word(word: &str) -> Cow<'_, str> {
                 Some('o') => Some('{'),
                 Some('c') => Some('}'),
                 Some('m') => Some(','),
+                Some(control @ ('(' | ')' | ';')) => Some(*control),
                 _ => None,
             }
         {
@@ -207,4 +301,30 @@ pub fn decode_bash_path_word(word: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(decoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_reference_depends_on_source_parameter_boundaries() {
+        for (source, expected) in [
+            (r#""$HOME"/fixture"#, Some("fixture")),
+            (r#""${HOME}/fixture""#, Some("fixture")),
+            (r#""$"'HOME/fixture'"#, None),
+            (r#"$HO"ME/fixture""#, None),
+            (r#"$HO\ME/fixture"#, None),
+            ("$HO\\\nME/fixture", Some("fixture")),
+            (r#""$$HOME/fixture""#, None),
+        ] {
+            for scan in [BashPathScan::PathExpressions, BashPathScan::CommandOperands] {
+                let tokens = bash_path_tokens(source, scan);
+                let [BashPathToken::Word(word)] = tokens.as_slice() else {
+                    panic!("expected one word for {source:?}");
+                };
+                assert_eq!(bash_home_suffix(word), expected, "{source:?}");
+            }
+        }
+    }
 }

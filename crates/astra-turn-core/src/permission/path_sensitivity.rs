@@ -11,14 +11,16 @@
 //! enforcement still owns full command validation.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
+    ffi::OsString,
     path::{Component, Path, PathBuf},
 };
 
 use astra_sandbox::{
     BashPathScan, BashPathToken, InternalPathKind, bash_home_suffix, bash_path_tokens,
     decode_bash_path_word, is_dangerous_file_path, is_sensitive_directory, is_sensitive_path,
-    mark_literal_bash_path_word,
+    mark_literal_bash_path_word, trim_bash_control_punctuation,
 };
 use astra_services::SessionArtifactStore;
 use serde_json::Value;
@@ -161,7 +163,10 @@ fn source_artifact_denial(workspace_root: &Path, paths: &[String]) -> Option<Str
     let mut context = PathSensitivityContext::new(Some(workspace_root));
     context.deny_tool_result_reads = true;
     for path in paths {
-        if context.requires_gate(path, PathAccess::Read).is_some() {
+        if context
+            .requires_gate(Path::new(path), path, PathAccess::Read)
+            .is_some()
+        {
             let token =
                 astra_text_utils::credential_redaction::redact_credentials_for_display_bounded(
                     path, 1024,
@@ -238,7 +243,9 @@ fn describe_bash_path_denial(
 }
 
 pub fn classify_path_sensitivity(path: &str) -> PathSensitivity {
-    PathSensitivityContext::new(None).classify(path).0
+    PathSensitivityContext::new(None)
+        .classify(&resolve_path_hint(path))
+        .0
 }
 
 /// Filesystem facts and classifications are reused only within one decision.
@@ -254,7 +261,7 @@ struct PathSensitivityContext {
     lexical_only: bool,
     sessions_root: Option<PathBuf>,
     deny_tool_result_reads: bool,
-    paths: HashMap<String, (PathSensitivity, Option<InternalPathKind>)>,
+    paths: HashMap<OsString, (PathSensitivity, Option<InternalPathKind>)>,
 }
 
 impl PathSensitivityContext {
@@ -262,8 +269,8 @@ impl PathSensitivityContext {
         Self {
             directory: directory.map(Path::to_path_buf),
             sensitive_directory: directory.is_some_and(|directory| {
-                let directory = directory.to_string_lossy();
-                is_read_sensitive_path(&directory) || is_write_sensitive_path(&directory)
+                is_read_sensitive_path(directory)
+                    || is_dangerous_file_path(&directory.to_string_lossy())
             }),
             system_aliases: directory
                 .into_iter()
@@ -309,11 +316,12 @@ impl PathSensitivityContext {
         }
     }
 
-    fn classify(&mut self, path: &str) -> (PathSensitivity, Option<InternalPathKind>) {
-        if let Some(result) = self.paths.get(path) {
+    fn classify(&mut self, path: &Path) -> (PathSensitivity, Option<InternalPathKind>) {
+        if let Some(result) = self.paths.get(path.as_os_str()) {
             return *result;
         }
-        if path.starts_with(
+        let label = path.to_string_lossy();
+        if label.starts_with(
             astra_services::session_artifact_store::SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX,
         ) {
             return (
@@ -321,12 +329,11 @@ impl PathSensitivityContext {
                 None,
             );
         }
-        let has_glob = contains_glob_meta(path);
-        let expanded = expand_home_path(path);
-        let relative_to_directory = expanded.is_relative() && self.directory.is_some();
+        let has_glob = contains_glob_meta(&label);
+        let relative_to_directory = path.is_relative() && self.directory.is_some();
         let resolved = match &self.directory {
-            Some(directory) if expanded.is_relative() => directory.join(&expanded),
-            _ => expanded,
+            Some(directory) if path.is_relative() => Cow::Owned(directory.join(path)),
+            _ => Cow::Borrowed(path),
         };
         let candidate = (!self.lexical_only
             && (self.directory.is_some() || self.sessions_root.is_some()))
@@ -348,9 +355,8 @@ impl PathSensitivityContext {
         });
         let mut read_sensitive = is_read_sensitive_path(path)
             || (self.directory.is_some() && self.local_sensitive_path(&lexical, false))
-            || local_candidate.is_some_and(|p| {
-                self.local_sensitive_path(p, false) || is_read_sensitive_path(&p.to_string_lossy())
-            });
+            || local_candidate
+                .is_some_and(|p| self.local_sensitive_path(p, false) || is_read_sensitive_path(p));
         if read_sensitive && !self.lexical_only && self.directory.is_some() && resolved.is_dir() {
             read_sensitive = self.local_sensitive_path(&lexical, true)
                 || local_candidate.is_some_and(|p| self.local_sensitive_path(p, true));
@@ -359,12 +365,12 @@ impl PathSensitivityContext {
             PathSensitivity::InternalArtifactReadOnly(kind)
         } else if read_sensitive {
             PathSensitivity::Sensitive
-        } else if ((is_write_sensitive_path(path)
-            || (self.lexical_only && is_write_sensitive_path(&lexical.to_string_lossy())))
+        } else if ((is_dangerous_file_path(&label)
+            || (self.lexical_only && is_dangerous_file_path(&lexical.to_string_lossy())))
             && !is_agent_skill_content_path(&lexical.to_string_lossy()))
             || local_candidate.is_some_and(|p| {
                 let resolved = p.to_string_lossy();
-                is_write_sensitive_path(&resolved) && !is_agent_skill_content_path(&resolved)
+                is_dangerous_file_path(&resolved) && !is_agent_skill_content_path(&resolved)
             })
         {
             PathSensitivity::WriteSensitive
@@ -372,7 +378,7 @@ impl PathSensitivityContext {
             PathSensitivity::Normal
         };
         let result = (sensitivity, session.filter(|_| has_glob));
-        self.paths.insert(path.to_owned(), result);
+        self.paths.insert(path.as_os_str().to_owned(), result);
         result
     }
 
@@ -392,12 +398,17 @@ impl PathSensitivityContext {
             })
     }
 
-    fn requires_gate(&mut self, path: &str, access: PathAccess) -> Option<SensitivePathMatch> {
+    fn requires_gate(
+        &mut self,
+        path: &Path,
+        token: &str,
+        access: PathAccess,
+    ) -> Option<SensitivePathMatch> {
         let (mut sensitivity, listing) = self.classify(path);
         if matches!(access, PathAccess::List)
             && (self.lexical_only || self.directory.is_none())
             && sensitivity == PathSensitivity::Sensitive
-            && !is_sensitive_directory(&expand_home_path(path))
+            && !is_sensitive_directory(path)
         {
             // The Server cannot tell whether a filename-like label is an
             // ordinary directory; its execution host will resolve the path.
@@ -412,11 +423,12 @@ impl PathSensitivityContext {
         {
             sensitivity = PathSensitivity::InternalArtifactReadOnly(kind);
         }
+        let has_glob = contains_glob_meta(&path.to_string_lossy());
         let gated = match (sensitivity, access) {
             (PathSensitivity::Normal, _) => false,
             (PathSensitivity::Sensitive, _) => true,
             (PathSensitivity::WriteSensitive, PathAccess::Write) => !self.ignore_write_sensitive,
-            (PathSensitivity::WriteSensitive, PathAccess::Read) if contains_glob_meta(path) => true,
+            (PathSensitivity::WriteSensitive, PathAccess::Read) if has_glob => true,
             (PathSensitivity::WriteSensitive, PathAccess::Read | PathAccess::List) => false,
             (PathSensitivity::InternalArtifactReadOnly(_), PathAccess::Write) => true,
             (
@@ -425,11 +437,22 @@ impl PathSensitivityContext {
             ) => self.deny_tool_result_reads && kind == InternalPathKind::SessionToolResult,
         };
         gated.then(|| SensitivePathMatch {
-            token: decode_bash_path_word(path).into_owned(),
+            token: token.to_owned(),
             sensitivity,
             access,
-            inferred: matches!(access, PathAccess::Read) && contains_glob_meta(path),
+            inferred: matches!(access, PathAccess::Read) && has_glob,
         })
+    }
+
+    /// Resolve a Bash operand before classifying it. Diagnostics and
+    /// approval checks still refer to the original operand spelling.
+    fn requires_shell_gate(
+        &mut self,
+        word: &str,
+        access: PathAccess,
+    ) -> Option<SensitivePathMatch> {
+        let literal = decode_bash_path_word(word);
+        self.requires_gate(&resolve_shell_operand(word, &literal), &literal, access)
     }
 
     fn approved_workspace_write(&self, path: &str) -> bool {
@@ -458,26 +481,13 @@ impl PathSensitivityContext {
     }
 }
 
-fn is_read_sensitive_path(path: &str) -> bool {
-    let expanded = expand_home_path(path);
-    is_sensitive_path(&expanded)
-        || matches_sensitive_path(&decode_bash_path_word(path))
-        || matches_sensitive_path(&expanded.to_string_lossy())
-}
-
-fn is_write_sensitive_path(path: &str) -> bool {
-    let expanded = expand_home_path(path);
-    is_dangerous_file_path(&decode_bash_path_word(path))
-        || is_dangerous_file_path(&expanded.to_string_lossy())
+fn is_read_sensitive_path(path: &Path) -> bool {
+    is_sensitive_path(path) || matches_sensitive_path(&path.to_string_lossy())
 }
 
 fn is_agent_skill_content_path(path: &str) -> bool {
-    if !path.contains(".astra") && !path.contains(".claude") {
-        return false;
-    }
-    let expanded = expand_home_path(path);
-    is_agent_skill_content_path_components(Path::new(path))
-        || is_agent_skill_content_path_components(&expanded)
+    (path.contains(".astra") || path.contains(".claude"))
+        && is_agent_skill_content_path_components(Path::new(path))
 }
 
 fn is_agent_skill_content_path_components(path: &Path) -> bool {
@@ -611,13 +621,26 @@ fn contains_glob_meta(path: &str) -> bool {
         .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
 }
 
-fn expand_home_path(path: &str) -> PathBuf {
-    if let Some(suffix) = bash_home_suffix(path)
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(decode_bash_path_word(suffix).as_ref());
+fn home_join(suffix: &str) -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(suffix))
+}
+
+fn resolve_shell_operand<'a>(word: &str, literal: &'a str) -> Cow<'a, Path> {
+    match bash_home_suffix(word).and_then(|suffix| home_join(&decode_bash_path_word(suffix))) {
+        Some(path) => Cow::Owned(path),
+        None => Cow::Borrowed(Path::new(literal)),
     }
-    PathBuf::from(decode_bash_path_word(path).as_ref())
+}
+
+fn resolve_path_hint(path: &str) -> Cow<'_, Path> {
+    // File-tool hints support home-relative paths. Bare parameter names
+    // remain path labels here. Bash operands carry their own expansion syntax.
+    if (path == "~" || path.contains('/'))
+        && let Some(resolved) = bash_home_suffix(path).and_then(home_join)
+    {
+        return Cow::Owned(resolved);
+    }
+    Cow::Borrowed(Path::new(path))
 }
 
 fn canonicalize_existing_or_nearest(path: &Path) -> Option<PathBuf> {
@@ -649,7 +672,7 @@ fn canonicalize_existing_or_nearest(path: &Path) -> Option<PathBuf> {
 }
 
 pub fn path_requires_sensitive_gate(path: &str, access: PathAccess) -> Option<SensitivePathMatch> {
-    PathSensitivityContext::new(None).requires_gate(path, access)
+    PathSensitivityContext::new(None).requires_gate(&resolve_path_hint(path), path, access)
 }
 
 /// Inspect tool arguments for a path-like field or shell path operand and decide
@@ -808,20 +831,20 @@ fn git_path_match(
         }
 
         if !arg.starts_with(':')
-            && let Some(hit) = context.requires_gate(arg, PathAccess::Read)
+            && let Some(hit) = context.requires_shell_gate(arg, PathAccess::Read)
         {
             return Some(Some(hit.with_inferred_access(!pathspec_only)));
         }
 
         if let Some(path) = git_literal_pathspec(arg) {
-            if let Some(hit) = context.requires_gate(path, PathAccess::Read) {
+            if let Some(hit) = context.requires_shell_gate(path, PathAccess::Read) {
                 return Some(Some(hit));
             }
             // A pathspec can select descendants in a historical tree.
             // Preserve the protected-state rule even for literal pathspecs.
             if !metadata_only {
                 protected_pathspec = protected_pathspec.or_else(|| {
-                    let mut hit = context.requires_gate(path, PathAccess::Write)?;
+                    let mut hit = context.requires_shell_gate(path, PathAccess::Write)?;
                     hit.access = PathAccess::Read;
                     Some(hit.with_inferred_access(true))
                 });
@@ -830,7 +853,7 @@ fn git_path_match(
         if !pathspec_only
             && !arg.starts_with(':')
             && let Some((_, path)) = arg.split_once(':')
-            && let Some(hit) = context.requires_gate(path, PathAccess::Read)
+            && let Some(hit) = context.requires_shell_gate(path, PathAccess::Read)
         {
             return Some(Some(hit));
         }
@@ -842,7 +865,7 @@ fn git_path_match(
                 [b'0'..=b'3', b':', ..] => &path[2..],
                 _ => path,
             };
-            if let Some(hit) = context.requires_gate(path, PathAccess::Read) {
+            if let Some(hit) = context.requires_shell_gate(path, PathAccess::Read) {
                 return Some(Some(hit));
             }
         }
@@ -1284,7 +1307,7 @@ fn redirection_sensitive_path_match(
             && shell_path_operand(token).is_some_and(|path| {
                 astra_sandbox::has_literal_bash_write_redirect(
                     segment,
-                    &decode_bash_path_word(&path),
+                    &decode_bash_path_word(path),
                 )
             });
         if context.known_shell_effects_only && access == PathAccess::Write && !proven_write {
@@ -1895,11 +1918,13 @@ fn is_find_file_starting_point(root: &str, context: &PathSensitivityContext) -> 
     {
         return false;
     }
-    let path = expand_home_path(root);
+    let literal = decode_bash_path_word(root);
+    let operand = resolve_shell_operand(root, &literal);
+    let path = operand.as_ref();
     let resolved = if path.is_absolute() {
-        path
+        Cow::Borrowed(path)
     } else {
-        directory.join(path)
+        Cow::Owned(directory.join(path))
     };
     resolved.is_file()
 }
@@ -1919,28 +1944,23 @@ fn shell_operand_sensitive_path_match(
     context: &mut PathSensitivityContext,
 ) -> Option<SensitivePathMatch> {
     let path = shell_path_operand(token)?;
-    let hit = context.requires_gate(&path, access)?;
+    let hit = context.requires_shell_gate(path, access)?;
     if access == PathAccess::Write
         && hit.sensitivity == PathSensitivity::WriteSensitive
-        && context.approved_workspace_write(&path)
+        && context.approved_workspace_write(path)
     {
         return None;
     }
     Some(hit.with_inferred_access(token.contains(['$', '`']) || contains_glob_meta(token)))
 }
 
-fn shell_path_operand(token: &str) -> Option<String> {
-    let trimmed = token
-        .trim_matches(|ch| matches!(ch, '"' | '\''))
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ',' | ';'));
-    if trimmed.is_empty()
-        || trimmed == "-"
-        || trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-    {
-        return None;
-    }
-    Some(trimmed.to_string())
+fn shell_path_operand(token: &str) -> Option<&str> {
+    let path = trim_bash_control_punctuation(token);
+    (!path.is_empty()
+        && path != "-"
+        && !path.starts_with("http://")
+        && !path.starts_with("https://"))
+    .then_some(path)
 }
 
 fn shell_basename(token: &str) -> &str {
@@ -2040,6 +2060,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(path_sensitivity_home)]
+    fn declared_sources_and_structured_names_are_literal() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".docker");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&home).unwrap();
+        let _guard = EnvGuard::set("HOME", &home);
+        std::fs::create_dir_all(workspace.join("~")).unwrap();
+        let sources = ["$HOME", "${HOME}", "~/fixture"].map(String::from);
+        for path in &sources {
+            std::fs::write(workspace.join(path), "ordinary fixture").unwrap();
+        }
+        assert!(
+            bash_path_preflight(astra_tools::shell_ops::BashPreflightRequest::Command {
+                command: "true",
+                directory: &workspace,
+                workspace_root: &workspace,
+                source_artifacts: Some(&sources),
+                workspace_write_admitted: false,
+            })
+            .is_none()
+        );
+        for path in &sources[..2] {
+            assert!(
+                sensitive_path_match_for_tool_args("read_file", &serde_json::json!({"path": path}))
+                    .is_none(),
+                "{path}"
+            );
+        }
+        assert!(bash_protected_path_denial_in_directory(r#"stat "$HOME""#, &workspace).is_some());
     }
 
     fn create_current_session_artifact() -> (

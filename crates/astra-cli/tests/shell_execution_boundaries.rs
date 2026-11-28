@@ -33,22 +33,29 @@ async fn quoted_shell_paths_resolve_the_same_way_with_and_without_the_workspace_
     let workdir = (1..levels).fold(root.to_path_buf(), |dir, _| dir.join("nested"));
     std::fs::create_dir_all(workdir.join("~")).unwrap();
     std::fs::create_dir_all(workdir.join("$HOME")).unwrap();
+    std::fs::create_dir_all(workdir.join("'/etc")).unwrap();
     std::fs::create_dir(root.join("etc")).unwrap();
     for path in [
         root.join("etc/fixture"),
         workdir.join("literal}.txt"),
         workdir.join("$HOME/fixture"),
+        workdir.join("'/etc/fixture"),
     ] {
         std::fs::write(path, "workspace fixture").unwrap();
     }
     std::fs::write(workdir.join(".env"), "synthetic fixture").unwrap();
 
     let executor = executor(root);
-    let tilde = format!("cat '~/{}etc/fixture'", "../".repeat(levels));
+    let parents = "../".repeat(levels);
+    let tilde = format!("cat '~/{parents}etc/fixture'");
+    let joined = format!(r#"cat "$"'HOME/{parents}etc/fixture'"#);
     for policy in [Some(SandboxPolicy::for_project(root)), None] {
         *executor.sandbox_policy.write().unwrap() = policy;
         for command in [
             tilde.as_str(),
+            joined.as_str(),
+            r#"cat "'/etc/fixture""#,
+            r#"cat "$PWD"'/literal}.txt'"#,
             r#"cat "literal}.txt""#,
             r#"cat "${PWD}/literal}.txt""#,
             r#"bash -c 'cat "\$HOME/fixture"'"#,
